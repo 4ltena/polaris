@@ -97,15 +97,15 @@ enum WireOperation {
 /// construct a contract, publish an artifact, or grant approval.
 pub(crate) fn parse(call: &polaris_provider::ToolCall) -> Result<WorkflowArtifactAction, String> {
     if call.name != "workflow_artifact" {
-        return Err("workflow_artifact以外のtoolは受け付けません".into());
+        return Err("Only workflow_artifact tools are accepted".into());
     }
     let encoded = serde_json::to_vec(&call.arguments)
-        .map_err(|_| "workflow_artifactの引数を正規化できません".to_string())?;
+        .map_err(|_| "Cannot canonicalize workflow_artifact arguments".to_string())?;
     if encoded.len() > MAX_ARGUMENT_BYTES {
-        return Err("workflow_artifactの引数が上限を超えました".into());
+        return Err("workflow_artifact arguments exceed the limit".into());
     }
     let operation: WireOperation = serde_json::from_value(call.arguments.clone())
-        .map_err(|_| "workflow_artifactの引数が不正です".to_string())?;
+        .map_err(|_| "Invalid workflow_artifact arguments".to_string())?;
     match operation {
         WireOperation::ProposeRoutineContract {
             expected_revision,
@@ -137,7 +137,7 @@ pub(crate) fn parse(call: &polaris_provider::ToolCall) -> Result<WorkflowArtifac
             };
             reference
                 .validate()
-                .map_err(|_| "workflow artifact参照が不正です".to_string())?;
+                .map_err(|_| "Invalid workflow artifact reference".to_string())?;
             Ok(WorkflowArtifactAction::ReadExact { kind, reference })
         }
     }
@@ -155,7 +155,7 @@ pub(crate) fn materialize_routine_contract(
     trusted_verification: &[VerificationCriterionV1],
 ) -> Result<ChangeContractV1, String> {
     if !proposal_matches_user_prompt(&proposal, previous_user_prompt) {
-        return Err("routine proposalが直前のuser promptに束縛されていません".into());
+        return Err("The routine proposal is not bound to the latest user prompt".into());
     }
     let eligibility = RoutineEligibilityV1 {
         affected_components: scope.affected_components.clone(),
@@ -169,9 +169,9 @@ pub(crate) fn materialize_routine_contract(
     };
     eligibility
         .validate()
-        .map_err(|_| "trusted routine change scopeが不正です".to_string())?;
+        .map_err(|_| "Invalid trusted routine change scope".to_string())?;
     if eligibility.blocker().is_some() {
-        return Err("routine changeはtrusted scopeまたはimpact factsにより許可されません".into());
+        return Err("The trusted scope or impact facts do not authorize a routine change".into());
     }
     let trusted_descriptions = trusted_verification
         .iter()
@@ -183,7 +183,7 @@ pub(crate) fn materialize_routine_contract(
         .map(String::as_str)
         .ne(trusted_descriptions.iter().copied())
     {
-        return Err("routine proposalの検証基準がhost authorityと一致しません".into());
+        return Err("Routine proposal verification criteria do not match host authority".into());
     }
     let component = eligibility
         .affected_components
@@ -205,7 +205,7 @@ pub(crate) fn materialize_routine_contract(
         proposal.expected_outcome,
         trusted_verification.to_vec(),
     )
-    .map_err(|_| "routine change contractの内容または上限が不正です".to_string())
+    .map_err(|_| "Invalid routine change contract content or limits".to_string())
 }
 
 fn proposal_matches_user_prompt(
@@ -252,7 +252,7 @@ pub(crate) fn event(
 
 fn stable_contract_id(identity: &RoutineContractIdentity<'_>) -> Result<String, String> {
     let body = serde_json::to_vec(identity)
-        .map_err(|_| "routine change contractを正規化できません".to_string())?;
+        .map_err(|_| "Cannot canonicalize the routine change contract".to_string())?;
     let mut digest = Sha256::new();
     digest.update(b"polaris.workflow.routine_contract_request.v1\0");
     digest.update(body);

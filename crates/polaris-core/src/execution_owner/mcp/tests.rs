@@ -58,7 +58,7 @@ fn decide(writer: &mut Writer, owner: &mut RunExecution, decision: ApprovalDecis
         .clone()
         .unwrap();
     // The card shows the exact hashed arguments.
-    assert!(pending.display.description.ends_with("\n引数: {}"));
+    assert!(pending.display.description.ends_with("\nArguments: {}"));
     writer
         .resolve_approval(
             &WireRequest {

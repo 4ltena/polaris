@@ -144,7 +144,7 @@ fn m3e_d13_helper_binds_actual_fixed_tier_and_refuses_missing_bindings() {
     assert!(
         f.call("roles current", KeyCode::Esc, false).unwrap()[0]
             .to_string()
-            .contains("無効")
+            .contains("disabled")
     );
     f.call("roles bind worker subgiant", KeyCode::Char('y'), false)
         .unwrap();

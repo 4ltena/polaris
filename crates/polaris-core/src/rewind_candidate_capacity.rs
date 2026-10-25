@@ -60,7 +60,7 @@ fn preflight_with_available_bytes(
     available_bytes: u64,
 ) -> io::Result<CandidateCapacity> {
     if project_id.is_empty() {
-        return Err(invalid("rewind候補のproject IDが不正です"));
+        return Err(invalid("Invalid rewind candidate project ID"));
     }
     let reservation_bytes =
         require_available_capacity(estimated_candidate_file_bytes, available_bytes)?;
@@ -73,9 +73,7 @@ fn preflight_with_available_bytes(
     let root = data_root.join("sessions-v2");
     let root_meta = fs::symlink_metadata(&root)?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
-        return Err(invalid(
-            "sessions-v2保存先が安全なディレクトリではありません",
-        ));
+        return Err(invalid("sessions-v2 storage is not a safe directory"));
     }
 
     let mut accounted_ids = BTreeSet::new();
@@ -85,20 +83,20 @@ fn preflight_with_available_bytes(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_symlink() || !file_type.is_dir() {
-            return Err(invalid("sessions-v2に安全でない項目があります"));
+            return Err(invalid("sessions-v2 contains an unsafe entry"));
         }
         let session_id = entry
             .file_name()
             .into_string()
-            .map_err(|_| invalid("セッションIDがUTF-8ではありません"))?;
+            .map_err(|_| invalid("Session ID is not UTF-8"))?;
         if !is_session_id(&session_id) {
-            return Err(invalid("セッションIDが不正です"));
+            return Err(invalid("Invalid session ID"));
         }
 
         let inspection = inspect_session(&root, &path, &session_id, project_id, &transaction_ids)?;
         if inspection.project_id != project_id {
             if transaction_ids.contains(&session_id) {
-                return Err(invalid("rewind transactionの候補projectが一致しません"));
+                return Err(invalid("Rewind transaction candidate project mismatch"));
             }
             continue;
         }
@@ -106,11 +104,11 @@ fn preflight_with_available_bytes(
             let mut scanned_entries = 0;
             let bytes = regular_file_bytes(&path, 0, &mut scanned_entries)?;
             if !accounted_ids.insert(session_id) {
-                return Err(invalid("rewind候補セッションが重複しています"));
+                return Err(invalid("Duplicate rewind candidate sessions"));
             }
             file_bytes = file_bytes
                 .checked_add(bytes)
-                .ok_or_else(|| invalid("rewind候補ファイル容量が上限です"))?;
+                .ok_or_else(|| invalid("Rewind candidate file capacity limit reached"))?;
         }
     }
 
@@ -125,16 +123,16 @@ fn preflight_with_available_bytes(
     if retained_candidates >= MAX_RETAINED_CANDIDATES_PER_PROJECT {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
-            "rewind候補数が上限です",
+            "Rewind candidate count limit reached",
         ));
     }
     let resulting_bytes = file_bytes
         .checked_add(reservation_bytes)
-        .ok_or_else(|| invalid("rewind候補ファイル容量が上限です"))?;
+        .ok_or_else(|| invalid("Rewind candidate file capacity limit reached"))?;
     if resulting_bytes > MAX_CANDIDATE_FILE_BYTES_PER_PROJECT {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
-            "rewind候補ファイル容量が上限です",
+            "Rewind candidate file capacity limit reached",
         ));
     }
     Ok(CandidateCapacity {
@@ -170,17 +168,17 @@ fn inspect_session(
         (Some(state), Some(metadata)) => {
             state.validate()?;
             if state.session_id != session_id {
-                return Err(invalid("rewind候補stateのsession IDが一致しません"));
+                return Err(invalid("Rewind candidate state session ID mismatch"));
             }
             if origin_project_id(root, metadata)? != state.project_id {
-                return Err(invalid("rewind候補の分岐元projectが一致しません"));
+                return Err(invalid("Rewind candidate source project mismatch"));
             }
             state.project_id
         }
         (Some(state), None) => {
             state.validate()?;
             if state.session_id != session_id {
-                return Err(invalid("セッションstateのsession IDが一致しません"));
+                return Err(invalid("Session state session ID mismatch"));
             }
             state.project_id
         }
@@ -190,7 +188,9 @@ fn inspect_session(
         (None, Some(metadata)) => origin_project_id(root, metadata)?,
         (None, None) if transaction_ids.contains(session_id) => current_project_id.into(),
         (None, None) => {
-            return Err(invalid("未完了または所属不明のセッションがあります"));
+            return Err(invalid(
+                "An incomplete session or a session with unknown ownership exists",
+            ));
         }
     };
     Ok(SessionInspection {
@@ -203,14 +203,12 @@ fn origin_project_id(root: &Path, metadata: &RewindBranchMetadataV1) -> io::Resu
     let origin = root.join(&metadata.origin_session_id);
     let origin_meta = fs::symlink_metadata(&origin)?;
     if origin_meta.file_type().is_symlink() || !origin_meta.is_dir() {
-        return Err(invalid(
-            "rewind候補の分岐元が安全なセッションではありません",
-        ));
+        return Err(invalid("The rewind candidate source is not a safe session"));
     }
     let origin_state = read_required_json::<ConversationStateV2>(&origin.join("state.json"))?;
     origin_state.validate()?;
     if origin_state.session_id != metadata.origin_session_id {
-        return Err(invalid("rewind候補の分岐元session IDが一致しません"));
+        return Err(invalid("Rewind candidate source session ID mismatch"));
     }
     Ok(origin_state.project_id)
 }
@@ -235,7 +233,7 @@ fn validate_candidate_metadata(metadata: &RewindBranchMetadataV1) -> io::Result<
             .len()
             != metadata.visible_memory_raw_object_ids.len()
     {
-        return Err(invalid("rewind候補metadataが不正です"));
+        return Err(invalid("Invalid rewind candidate metadata"));
     }
     Ok(())
 }
@@ -244,7 +242,7 @@ fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.is_file() || meta.nlink() != 1 {
-                return Err(invalid("rewind候補内に安全でないファイルがあります"));
+                return Err(invalid("The rewind candidate contains an unsafe file"));
             }
             Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
         }
@@ -254,7 +252,7 @@ fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result
 }
 
 fn read_required_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
-    read_optional_json(path)?.ok_or_else(|| invalid("rewind候補のstateがありません"))
+    read_optional_json(path)?.ok_or_else(|| invalid("Missing rewind candidate state"))
 }
 
 fn regular_file_bytes(
@@ -263,36 +261,38 @@ fn regular_file_bytes(
     scanned_entries: &mut usize,
 ) -> io::Result<u64> {
     if depth > MAX_SCAN_DEPTH {
-        return Err(invalid("rewind候補ディレクトリの深さが上限です"));
+        return Err(invalid("Rewind candidate directory depth limit reached"));
     }
     let mut total = 0_u64;
     for entry in fs::read_dir(directory)? {
         *scanned_entries = scanned_entries
             .checked_add(1)
-            .ok_or_else(|| invalid("rewind候補走査数が上限です"))?;
+            .ok_or_else(|| invalid("Rewind candidate scan count limit reached"))?;
         if *scanned_entries > MAX_SCAN_ENTRIES {
-            return Err(invalid("rewind候補走査数が上限です"));
+            return Err(invalid("Rewind candidate scan count limit reached"));
         }
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
-            return Err(invalid("rewind候補内のsymlinkは使用できません"));
+            return Err(invalid("Symlinks within rewind candidates are not allowed"));
         }
         if file_type.is_dir() {
             total = total
                 .checked_add(regular_file_bytes(&path, depth + 1, scanned_entries)?)
-                .ok_or_else(|| invalid("rewind候補ファイル容量が上限です"))?;
+                .ok_or_else(|| invalid("Rewind candidate file capacity limit reached"))?;
         } else if file_type.is_file() {
             let meta = fs::symlink_metadata(&path)?;
             if meta.nlink() != 1 {
-                return Err(invalid("rewind候補内のhard linkは使用できません"));
+                return Err(invalid(
+                    "Hardlinks within rewind candidates are not allowed",
+                ));
             }
             total = total
                 .checked_add(meta.len())
-                .ok_or_else(|| invalid("rewind候補ファイル容量が上限です"))?;
+                .ok_or_else(|| invalid("Rewind candidate file capacity limit reached"))?;
         } else {
-            return Err(invalid("rewind候補内に通常ファイル以外があります"));
+            return Err(invalid("The rewind candidate contains a non-regular file"));
         }
     }
     Ok(total)
@@ -304,14 +304,14 @@ fn require_available_capacity(
 ) -> io::Result<u64> {
     let reservation_bytes = estimated_candidate_file_bytes
         .checked_add(CANDIDATE_OVERHEAD_BYTES)
-        .ok_or_else(|| invalid("rewind候補の予約容量が上限です"))?;
+        .ok_or_else(|| invalid("Rewind candidate capacity reservation limit reached"))?;
     let required_free_bytes = reservation_bytes
         .checked_add(FREE_SPACE_RESERVE_BYTES)
-        .ok_or_else(|| invalid("rewind候補の空き容量予約が上限です"))?;
+        .ok_or_else(|| invalid("Rewind candidate free-space reservation limit reached"))?;
     if available_bytes < required_free_bytes {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
-            "rewind候補用の空き容量が不足しています",
+            "Insufficient free space for rewind candidates",
         ));
     }
     Ok(reservation_bytes)
@@ -319,7 +319,7 @@ fn require_available_capacity(
 
 fn filesystem_available_bytes(path: &Path) -> io::Result<u64> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| invalid("sessions-v2保存先が不正です"))?;
+        .map_err(|_| invalid("Invalid sessions-v2 storage location"))?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -334,7 +334,7 @@ fn filesystem_available_bytes(path: &Path) -> io::Result<u64> {
     let unit = u64::from(unit);
     blocks
         .checked_mul(unit)
-        .ok_or_else(|| invalid("sessions-v2空き容量が上限です"))
+        .ok_or_else(|| invalid("sessions-v2 free-space limit reached"))
 }
 
 fn is_session_id(id: &str) -> bool {

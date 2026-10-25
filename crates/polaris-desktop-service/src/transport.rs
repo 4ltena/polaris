@@ -16,17 +16,17 @@ pub(crate) const INPUT_REQUESTS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
-    #[error("通信I/Oに失敗しました")]
+    #[error("Communication I/O failed")]
     Io(#[from] io::Error),
-    #[error("通信フレームが不正です: {0}")]
+    #[error("Invalid communication frame: {0}")]
     Codec(#[from] codec::CodecError),
-    #[error("保存を確認できませんでした")]
+    #[error("Could not verify persistence")]
     Store(#[from] polaris_core::desktop_store::StoreError),
-    #[error("serviceの設定が不正です")]
+    #[error("Invalid service configuration")]
     Options,
-    #[error("送信queueの上限または送信期限に達しました")]
+    #[error("Send queue limit or deadline reached")]
     OutputClosed,
-    #[error("通信workerが終了しました")]
+    #[error("The communication worker ended")]
     Worker,
 }
 

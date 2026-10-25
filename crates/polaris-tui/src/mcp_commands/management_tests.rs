@@ -153,7 +153,7 @@ fn tui_mcp_secret_overflow_drains_queued_input_before_returning() {
             events.push_back(SecretInputEvent::Key(boundary));
             let mut reader = SecretEvents(events);
             let error = secret::read_value(&terminal, &mut reader).unwrap_err();
-            assert_eq!(error, "MCP秘密入力の上限を超えました");
+            assert_eq!(error, "MCP secret input exceeds the limit");
             assert!(
                 reader.0.is_empty(),
                 "secret tail and boundary must be consumed"
@@ -274,7 +274,7 @@ async fn tui_mcp_secret_lifecycle_is_masked_versioned_and_irreversible() {
     .await
     .unwrap();
     let text = saved.iter().map(ToString::to_string).collect::<String>();
-    assert!(text.contains("版 1"));
+    assert!(text.contains("revision 1"));
     assert!(!text.contains(secret));
     assert!(!screen(&terminal).contains(secret));
     drop(host);
@@ -289,7 +289,7 @@ async fn tui_mcp_secret_lifecycle_is_masked_versioned_and_irreversible() {
         .iter()
         .map(ToString::to_string)
         .collect::<String>();
-    assert!(listed.contains("認証情報の参照名: docs_token"));
+    assert!(listed.contains("Credential reference: docs_token"));
     assert!(!listed.contains(secret));
     let lease = workspace.try_mutation().unwrap();
     let through = ManagementEffectStoreV1::rewind_checkpoint_for_project_at_state_dir(
@@ -324,7 +324,7 @@ async fn tui_mcp_secret_lifecycle_is_masked_versioned_and_irreversible() {
     )
     .await
     .unwrap();
-    assert!(deleted[0].to_string().contains("版 2"));
+    assert!(deleted[0].to_string().contains("revision 2"));
     let secrets = host.store().unwrap().load_secrets().unwrap().unwrap();
     assert_eq!(secrets.revision(), 2);
     assert!(secrets.resolve("docs_token").is_err());
@@ -344,7 +344,7 @@ async fn tui_mcp_secret_lifecycle_is_masked_versioned_and_irreversible() {
         .await
         .unwrap()[0]
             .to_string(),
-        "MCP秘密入力を取り消しました"
+        "MCP secret input cancelled"
     );
     for request in ["secret set inline", "secret delete", "secret delete absent"] {
         let mut keys = Keys(VecDeque::new());
@@ -445,7 +445,7 @@ async fn tui_mcp_register_requires_ceiling_approval_and_fresh_credential_source(
         .await
         .unwrap()[0]
             .to_string()
-            .contains("取り消し")
+            .contains("cancelled")
     );
     assert!(!Store::exists(&home));
 
@@ -496,7 +496,7 @@ async fn tui_mcp_register_persists_server_and_bound_secret_after_confirmation() 
     )
     .await
     .unwrap();
-    assert!(output[0].to_string().contains("docs を登録しました"));
+    assert!(output[0].to_string().contains("Registered docs"));
     drop(host);
 
     let reopened = LocalHost::open_for_test(&project, &home, false).unwrap();
@@ -759,7 +759,7 @@ async fn tui_mcp_check_persists_catalog_and_denied_ceiling_never_connects() {
     )
     .await
     .unwrap();
-    assert!(output[0].to_string().contains("ツール1件"));
+    assert!(output[0].to_string().contains("1 tools"));
     assert!(requests.load(Ordering::SeqCst) > 0);
     let index = host.store().unwrap().load_catalog_index().unwrap().unwrap();
     assert_eq!(index.servers["docs"].tools[0].name, "lookup");

@@ -181,9 +181,11 @@ impl MaterialisePlan {
     /// before execution. Secret-bearing arguments are refused during prepare.
     pub fn description(&self) -> String {
         format!(
-            "package: {}\nversion: {}\ninterpreter: {}\n保存先: {}\nネットワークから1度だけ取得します。導入時のスクリプトは実行しません。\n登録はこの取得とは別に確認します。取得は巻き戻しでは取り消せません。",
+            "package: {}\nversion: {}\ninterpreter: {}\nStorage: {}\nDownloaded from the network once. Installation scripts are not executed.\nRegistration is confirmed separately. Rewind cannot undo this download.",
             self.package,
-            self.version.as_deref().unwrap_or("取得時に解決して固定"),
+            self.version
+                .as_deref()
+                .unwrap_or("Resolved and pinned during download"),
             self.runtime.display(),
             self.directory.display(),
         )

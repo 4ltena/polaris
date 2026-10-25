@@ -113,7 +113,9 @@ pub mod proposal {
         proposals: Vec<crate::similarity::Proposal>,
     ) -> std::io::Result<std::path::PathBuf> {
         if proposals.is_empty() {
-            return Err(std::io::Error::other("提案が空のため保存しません"));
+            return Err(std::io::Error::other(
+                "The proposal is empty; nothing was saved",
+            ));
         }
         let saved = Saved {
             schema_version: 1,

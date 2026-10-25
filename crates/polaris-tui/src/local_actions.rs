@@ -1,4 +1,4 @@
-//! Confirmed local actions share the project lease and management journal.
+//! User-triggered local actions share the project lease and management journal.
 use crate::{account, approver::KeyReader, slash::Action};
 use polaris_core::{management_effect::*, rewind_workspace::WorkspaceOwner, session::Session};
 use ratatui::{Terminal, backend::Backend, text::Line};
@@ -15,17 +15,19 @@ use std::{
 
 fn destination(path: &Path) -> Result<PathBuf, String> {
     if path.as_os_str().len() > 4096 {
-        return Err("保存先が長すぎます".into());
+        return Err("Storage path is too long".into());
     }
-    let name = path.file_name().ok_or("保存先のファイル名がありません")?;
+    let name = path
+        .file_name()
+        .ok_or("The storage destination has no filename")?;
     let parent = path
         .parent()
-        .ok_or("保存先の親がありません")?
+        .ok_or("The storage destination has no parent")?
         .canonicalize()
         .map_err(|e| e.to_string())?;
     let path = parent.join(name);
     if path.components().any(|p| p.as_os_str() == ".polaris") {
-        return Err("Polarisの状態領域へexportできません".into());
+        return Err("Cannot export into Polaris state storage".into());
     }
     polaris_auth::protection::with_protected_paths(|protected| {
         if protected
@@ -33,33 +35,35 @@ fn destination(path: &Path) -> Result<PathBuf, String> {
             .iter()
             .any(|saved| path == *saved || path.starts_with(saved))
         {
-            Err("認証の保護対象へ保存できません".into())
+            Err("Cannot save to an authentication-protected target".into())
         } else {
             Ok(path)
         }
     })
-    .map_err(|_| "認証保護を確認できません".to_string())?
+    .map_err(|_| "Cannot verify authentication protection".to_string())?
 }
 fn write_new(path: &Path, body: &str) -> Result<(), String> {
     polaris_auth::protection::with_protected_paths(|protected| {
-        let parent = path.parent().ok_or("保存先の親がありません")?;
+        let parent = path
+            .parent()
+            .ok_or("The storage destination has no parent")?;
         let directory = polaris_core::project_mutation::open_directory_nofollow(parent)
             .map_err(|e| e.to_string())?;
         let expected = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
         let actual = directory.metadata().map_err(|e| e.to_string())?;
         if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
-            return Err("保存先が変更されました".into());
+            return Err("The storage destination changed".into());
         }
         if protected
             .identities()
             .iter()
             .any(|id| id.dev == actual.dev() && id.ino == actual.ino())
         {
-            return Err("保存先のdirectoryは認証の保護対象です".into());
+            return Err("The destination directory is authentication-protected".into());
         }
         let name = std::ffi::CString::new(
             path.file_name()
-                .ok_or("保存先の名前がありません")?
+                .ok_or("The storage destination has no name")?
                 .as_bytes(),
         )
         .map_err(|e| e.to_string())?;
@@ -81,7 +85,9 @@ fn write_new(path: &Path, body: &str) -> Result<(), String> {
             .iter()
             .any(|id| id.dev == created.dev() && id.ino == created.ino())
         {
-            return Err("新しいfile inodeが認証の保護対象と衝突しました".into());
+            return Err(
+                "The new file inode conflicts with an authentication-protected target".into(),
+            );
         }
         file.write_all(body.as_bytes())
             .and_then(|_| file.sync_all())
@@ -99,11 +105,11 @@ fn write_new(path: &Path, body: &str) -> Result<(), String> {
             || named.nlink() != 1
             || (named.dev(), named.ino()) != (created.dev(), created.ino())
         {
-            return Err("保存後のfile identityまたは本文を確認できません".into());
+            return Err("Cannot verify the saved file identity or content".into());
         }
         Ok(())
     })
-    .map_err(|_| "認証保護を確認できません".to_string())?
+    .map_err(|_| "Cannot verify authentication protection".to_string())?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,18 +152,18 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
     copy: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<Vec<Line<'static>>, String> {
     if has_pending {
-        return Err("送信待ちの入力があるため管理操作を実行できません".into());
+        return Err("Cannot perform management operations while input is queued".into());
     }
     session.check_persistence().map_err(|e| e.to_string())?;
     let saved = session
         .persistence
         .clone()
-        .ok_or("保存されたv2会話が必要です")?;
+        .ok_or("A saved v2 conversation is required")?;
     let before = saved.snapshot().map_err(|e| e.to_string())?;
     if ManagementEffectHashV1::digest(before.state.project_id.as_bytes())
         != effects.project_scope_hash()
     {
-        return Err("会話のprojectが一致しません".into());
+        return Err("Conversation project mismatch".into());
     }
     let (inventory, permission, target, body) = match action {
         Action::Clear => ("T08", ManagementPermissionScopeV1::LocalSession, None, None),
@@ -194,23 +200,23 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
             Some(
                 selected
                     .or_else(|| crate::clipboard::last_agent_message_text(session))
-                    .ok_or("コピーできる返答がありません")?
+                    .ok_or("No reply to copy")?
                     .to_owned(),
             ),
         ),
-        _ => return Err("この管理操作は対象外です".into()),
+        _ => return Err("This management operation is out of scope".into()),
     };
     if body
         .as_ref()
         .is_some_and(|body| body.len() > 16 * 1024 * 1024)
     {
-        return Err("保存内容が16MiBを超えています".into());
+        return Err("Saved content exceeds 16 MiB".into());
     }
     if target
         .as_ref()
         .is_some_and(|path| std::fs::symlink_metadata(path).is_ok())
     {
-        return Err("保存先が既に存在します。別の名前を指定してください".into());
+        return Err("The destination already exists. Specify a different name".into());
     }
     let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
     workspace
@@ -224,15 +230,15 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
     .map_err(|error| error.to_string())?;
     let detail = match action {
         Action::Clear => format!(
-            "{}原文の現在epochをclearします。過去の証拠は保持されます。",
+            "{}Clear the current source epoch. Historical evidence is retained.",
             before.events.len()
         ),
         Action::Copy => format!(
-            "{} bytesをclipboardへ渡します。取り消せない効果です。",
+            "Copy {} bytes to the clipboard. This effect cannot be undone.",
             body.as_ref().expect("copy body").len()
         ),
         _ => format!(
-            "保存先: {}\n{} bytes。既存ファイルは上書きしません。",
+            "Destination: {}\n{} bytes. Existing files are not overwritten.",
             target.as_ref().expect("file target").display(),
             body.as_ref().expect("body").len()
         ),
@@ -269,26 +275,31 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
         )
         .map_err(|e| e.to_string())?;
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = outcome else {
-        return Err("既存の管理操作を再実行しません".into());
+        return Err("Existing management operations will not be rerun".into());
     };
-    if !account::confirm(
-        terminal,
-        reader,
-        inventory,
-        &before.state.session_id,
-        &detail,
-    ) {
+    // Completing a drag selection already identifies and authorizes the exact
+    // clipboard payload. Other management actions still use their confirmation.
+    let selection_copy = matches!(action, Action::Copy) && selected.is_some();
+    if !selection_copy
+        && !account::confirm(
+            terminal,
+            reader,
+            inventory,
+            &before.state.session_id,
+            &detail,
+        )
+    {
         effects
             .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
             .map_err(|e| e.to_string())?;
-        return Ok(vec![Line::from("操作を取り消しました")]);
+        return Ok(vec![Line::from("Operation cancelled")]);
     }
     let current = saved.snapshot().map_err(|e| e.to_string())?;
     if current.state != before.state || current.raw_hash != before.raw_hash {
         effects
             .deny(&lease, &prepared, ManagementDenialReasonV1::StaleRequest)
             .map_err(|e| e.to_string())?;
-        return Err("確認後に会話が変更されました".into());
+        return Err("The conversation changed after confirmation".into());
     }
     let started = effects
         .start(&lease, &prepared)
@@ -310,19 +321,103 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
             )
             .map_err(|e| e.to_string())?;
         return Err(format!(
-            "操作結果は不明です。再実行せず確認してください: {error}"
+            "Operation outcome is unknown. Do not rerun; inspect it first: {error}"
         ));
     }
     effects
         .complete_started(&lease, &started, ManagementEffectHashV1::digest(&payload))
         .map_err(|e| e.to_string())?;
     Ok(vec![Line::from(format!(
-        "{inventory} 完了{}",
+        "{inventory} complete{}",
         target
             .as_ref()
             .map(|p| format!(": {}", p.display()))
             .unwrap_or_default()
     ))])
+}
+
+#[cfg(test)]
+mod selection_copy_tests {
+    use super::*;
+    use polaris_core::conversation_state::HistoryMode;
+    use polaris_core::session_store::PersistedSession;
+    use ratatui::backend::TestBackend;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct NoConfirmation;
+    impl KeyReader for NoConfirmation {
+        fn read_key(&mut self) -> std::io::Result<ratatui::crossterm::event::KeyCode> {
+            panic!("a completed selection must not open another confirmation");
+        }
+    }
+
+    #[test]
+    fn selected_copy_skips_extra_prompt_and_preserves_journal() {
+        for succeeds in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            let project = root.join("project");
+            let state = root.join("state");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let workspace = WorkspaceOwner::open(
+                &project,
+                &state.join("rewind-workspace"),
+                Default::default(),
+            )
+            .unwrap();
+            let lease = workspace.try_mutation().unwrap();
+            let effects =
+                ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+            drop(lease);
+            let saved = PersistedSession::create(
+                &root,
+                &state.join("memory.sqlite3"),
+                project.to_str().unwrap(),
+                HistoryMode::Legacy,
+                None,
+            )
+            .unwrap();
+            let mut session = Session::new();
+            session.attach(saved.clone()).unwrap();
+            session.push_user("synthetic request");
+            session.push_assistant("whole reply must not be copied", Vec::new());
+            let before = saved.snapshot().unwrap();
+            let terminal = RefCell::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+            let selected = "選択した範囲だけ\nsecond line";
+            let mut copied = None;
+            let result = handle_with_selection(
+                &Action::Copy,
+                &terminal,
+                &mut NoConfirmation,
+                &mut session,
+                &workspace,
+                &effects,
+                &project,
+                false,
+                Some(selected),
+                |text| {
+                    copied = Some(text.to_owned());
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err("synthetic clipboard failure".into())
+                    }
+                },
+            );
+            assert_eq!(copied.as_deref(), Some(selected));
+            assert_eq!(saved.snapshot().unwrap().raw_hash, before.raw_hash);
+            assert_eq!(effects.effects().unwrap().len(), 1);
+            if succeeds {
+                assert!(result.unwrap()[0].to_string().contains("T19 complete"));
+                assert!(effects.blocker().unwrap().is_none());
+            } else {
+                assert!(result.unwrap_err().contains("Operation outcome is unknown"));
+                assert!(effects.blocker().unwrap().is_some());
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,17 +434,20 @@ pub(crate) async fn compact<B: Backend, R: KeyReader>(
     has_pending: bool,
 ) -> Result<bool, String> {
     if has_pending {
-        return Err("送信待ちの入力があるためcompactできません".into());
+        return Err("Cannot compact while input is queued".into());
     }
     session.check_persistence().map_err(|e| e.to_string())?;
-    let saved = session.persistence.clone().ok_or("v2保存会話が必要です")?;
+    let saved = session
+        .persistence
+        .clone()
+        .ok_or("A saved v2 conversation is required")?;
     let before = saved.snapshot().map_err(|e| e.to_string())?;
     if ManagementEffectHashV1::digest(before.state.project_id.as_bytes())
         != effects.project_scope_hash()
     {
-        return Err("compactのprojectが一致しません".into());
+        return Err("Compaction project mismatch".into());
     }
-    let model = provider.model().ok_or("現在のmodelを確認できません")?;
+    let model = provider.model().ok_or("Cannot verify the current model")?;
     let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
     workspace
         .require_quiescent_with_lease(&lease)
@@ -390,21 +488,21 @@ pub(crate) async fn compact<B: Backend, R: KeyReader>(
         )
         .map_err(|e| e.to_string())?;
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
-        return Err("既存のcompactを再送しません".into());
+        return Err("Existing compaction will not be resent".into());
     };
     if !account::confirm(
         terminal,
         reader,
-        "会話をcompact",
+        "Compact conversation",
         &before.state.session_id,
         &format!(
-            "model: {model}\n現在の会話を既存providerへ送信して要約します。原文を保持し、送信は巻き戻せません。"
+            "model: {model}\nSend the current conversation to the existing provider for summarization. Original text is retained; rewind cannot undo the send."
         ),
     ) {
         effects
             .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
             .map_err(|e| e.to_string())?;
-        *status = crate::Status::Notice("compactを取り消しました".into());
+        *status = crate::Status::Notice("Compaction cancelled".into());
         return Ok(false);
     }
     let current = saved.snapshot().map_err(|e| e.to_string())?;
@@ -412,7 +510,7 @@ pub(crate) async fn compact<B: Backend, R: KeyReader>(
         effects
             .deny(&lease, &prepared, ManagementDenialReasonV1::StaleRequest)
             .map_err(|e| e.to_string())?;
-        return Err("確認後に会話が変更されました".into());
+        return Err("The conversation changed after confirmation".into());
     }
     let started = effects
         .start(&lease, &prepared)
@@ -433,7 +531,7 @@ pub(crate) async fn compact<B: Backend, R: KeyReader>(
                 ManagementUnknownReasonV1::InterruptedAfterStart,
             )
             .map_err(|e| e.to_string())?;
-        return Err("compact結果を確認できません。原文を保ち、再送せず復旧してください".into());
+        return Err("Cannot verify the compaction result. Retain the original text and recover without resending".into());
     }
     effects
         .complete_started(&lease, &started, ManagementEffectHashV1::digest(&payload))

@@ -96,8 +96,12 @@ fn windows_read_only_loop_displays_commands_without_creating_state() {
             .iter()
             .any(|line| line == "/workflow — show workflow availability (read-only)")
     );
-    assert!(lines.iter().any(|line| line.contains("会話・保存: 未開始")));
-    assert!(lines.iter().any(|line| line.contains("記録はありません")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("conversation, storage: not started"))
+    );
+    assert!(lines.iter().any(|line| line.contains("No records")));
     assert!(lines.iter().any(|line| line.contains("folder1")));
     assert_eq!(contents(root.path()), before);
 }
@@ -177,7 +181,10 @@ fn windows_read_only_popup_and_resize_keep_read_only_presentation() {
         assert!(!text.contains("/model to change"));
         assert!(!text.contains('\u{1b}'));
         if width >= 80 {
-            assert!(text.contains("Windows 閲覧専用"), "width={width}: {text:?}");
+            assert!(
+                text.contains("Windows browsing only"),
+                "width={width}: {text:?}"
+            );
             assert!(text.contains("C:\\project\\line\\n\\t"));
         }
     }
@@ -350,7 +357,7 @@ fn windows_read_only_status_echo_renders_windows_paths_and_controls() {
         assert_eq!(view.cursor, 0);
         assert_eq!(view.lines[0].line.to_string(), expected, "{command:?}");
         assert!(view.lines[0].shaded);
-        assert_eq!(view.lines[1].line.to_string(), "Windows 閲覧専用");
+        assert_eq!(view.lines[1].line.to_string(), "Windows browsing only");
 
         let mut terminal = ratatui::Terminal::new(TestBackend::new(160, 32)).unwrap();
         view.draw(&mut terminal).unwrap();

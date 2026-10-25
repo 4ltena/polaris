@@ -3,8 +3,8 @@
 
 #[cfg(unix)]
 use polaris_core::recipe::{
-    self, Manager, Plan, Refusal,
-    confirm::{Postcondition, Verdict, confirm, postcondition},
+    self,
+    confirm::Verdict,
     git::{GitPlan, GitRefusal, Head, Placement},
     ignore_rules::{Withheld, WithheldReason},
 };
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// 対象プロジェクト。既定は現在のディレクトリ。
+    /// Target project; defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
     #[command(subcommand)]
@@ -22,13 +22,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Next.jsの検出・導入・設定・検証。実導入は`--install`で確認する。
-    Nextjs {
-        /// パッケージの実導入を確認する。付けない場合は導入の手前で止まる。
-        #[arg(long)]
-        install: bool,
-    },
-    /// Gitの検出と、不足する`.gitignore`規則の追加。
+    /// Detect Git and add missing .gitignore rules.
     Git,
 }
 
@@ -38,7 +32,6 @@ pub fn run(args: Args) -> ExitCode {
         .project
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let result = match args.command {
-        Command::Nextjs { install } => nextjs(&cwd, install),
         Command::Git => git(&cwd),
     };
     match result {
@@ -51,131 +44,27 @@ pub fn run(args: Args) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn refusal(reason: Refusal) -> &'static str {
-    match reason {
-        Refusal::NoManifest => "package.json がないため、この手順は当てはまりません。",
-        Refusal::MixedManagers => {
-            "lockfile が複数あります。どれを使うか決まらないため何もしません。"
-        }
-        Refusal::AlreadyComplete => "すべての工程が完了済みです。",
-        Refusal::InstallNotConfirmed => {
-            "導入の確認がないため、ここで止まります。`--install` を付けて実行してください。"
-        }
-    }
-}
-
-#[cfg(unix)]
-fn manager_name(manager: Manager) -> &'static str {
-    manager.program()
-}
-
-/// 台帳を読み、残りの工程と、各工程の事後条件を表示する。実行そのものは
-/// M7c-3d（起動確認のprocess所有）まで未実装なので、確認待ちとして示す。
-#[cfg(unix)]
-fn nextjs(cwd: &std::path::Path, install: bool) -> Result<(), String> {
-    let (writer, ..) =
-        recipe::session::open(cwd).map_err(|e| recipe::session::refusal(&e).to_owned())?;
-    let root = polaris_core::project::resolve_root(cwd);
-    // The manager decides which lockfile the ledger compares, so it is
-    // settled before anything is read back as finished.
-    let looked = recipe::observe(&root, &recipe::NEXT_JS, Vec::new(), install);
-    let manager = match recipe::manager_for(&looked) {
-        Ok(manager) => manager,
-        Err(reason) => {
-            println!("{}", refusal(reason));
-            return Ok(());
-        }
-    };
-    let completed = recipe::reusable_steps_for(&writer, &recipe::NEXT_JS, &root, manager);
-    let observed = recipe::observe(&root, &recipe::NEXT_JS, completed.clone(), install);
-    if !completed.is_empty() {
-        println!("完了済み（再実行しません）: {}", completed.join(", "));
-    }
-    match recipe::plan(&recipe::NEXT_JS, &observed) {
-        Plan::NotApplicable { reason } => {
-            println!("{}", refusal(reason));
-            Ok(())
-        }
-        Plan::Run { manager, steps } => {
-            println!("管理ツール: {}", manager_name(manager));
-            for step in &steps {
-                let command = recipe::command(&recipe::NEXT_JS, step, manager)
-                    .map(|(program, args)| format!("{program} {}", args.join(" ")))
-                    .unwrap_or_else(|| "（hostが設定を書きます）".into());
-                let state = match postcondition(&recipe::NEXT_JS, step) {
-                    Some(condition) => state_of(&root, &condition),
-                    None => "確認方法が未定義".into(),
-                };
-                println!("  {step}\t{command}\t{state}");
-            }
-            if steps.contains(&"configure") {
-                let (write, skip) = recipe::template::plan(&root, recipe::template::NEXT_JS);
-                for (path, why) in &skip {
-                    println!("  設定 {path}\t{}", skipped_reason(why));
-                }
-                if !write.is_empty() {
-                    println!(
-                        "  設定 書き込む雛形: {}",
-                        write
-                            .iter()
-                            .map(|held| held.path)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-            }
-            println!(
-                "パッケージの導入と起動確認は未実装です（M7c-3d 待ち）。ここまでが検出と計画です。"
-            );
-            Ok(())
-        }
-    }
-}
-
-/// 事後条件が今の時点で満たされているかを、実行前の状態として示す。
-#[cfg(unix)]
-fn state_of(root: &std::path::Path, condition: &Postcondition) -> String {
-    // 検出工程は管理ツールの応答が答えなので、実行前には判定できない。
-    if matches!(condition, Postcondition::ManagerAnswered) {
-        return "未実行".into();
-    }
-    match confirm(root, condition, "") {
-        Verdict::Met { evidence } => format!("充足済み: {evidence}"),
-        Verdict::NotMet { missing } => format!("未達: {missing}"),
-        Verdict::Unknown { reason } => format!("判定不能: {reason}"),
-    }
-}
-
-#[cfg(unix)]
-fn skipped_reason(why: &recipe::template::Skipped) -> &'static str {
-    match why {
-        recipe::template::Skipped::AlreadyPresent => "既にあるので触りません",
-        recipe::template::Skipped::NotAPlainFile => "通常のファイルではないので触りません",
-    }
-}
-
-#[cfg(unix)]
 fn git_refusal(reason: &GitRefusal) -> String {
     match reason {
         GitRefusal::NoRepository => {
-            "Git リポジトリがありません。作成するかどうかは利用者の判断です。".into()
+            "No Git repository. Creating one is the user's decision.".into()
         }
         GitRefusal::InsideAnother { top_level } => {
             format!(
-                "このディレクトリは {top_level} のリポジトリに属します。ここには何も作りません。"
+                "This directory belongs to the repository at {top_level}. Nothing will be created here."
             )
         }
-        GitRefusal::BareRepository => "bare リポジトリには作業ツリーがありません。".into(),
-        GitRefusal::Unreadable => "Git の状態を読めませんでした。".into(),
+        GitRefusal::BareRepository => "A bare repository has no working tree.".into(),
+        GitRefusal::Unreadable => "Could not read Git status.".into(),
     }
 }
 
 #[cfg(unix)]
 fn withheld_reason(held: &Withheld) -> String {
     match &held.reason {
-        WithheldReason::AlreadyPresent => format!("  {}\t既にあります", held.rule),
+        WithheldReason::AlreadyPresent => format!("  {}\talready exists", held.rule),
         WithheldReason::ContradictsNegation { line } => {
-            format!("  {}\t{line} と衝突するため保留", held.rule)
+            format!("  {}\tdeferred due to conflict with {line}", held.rule)
         }
     }
 }
@@ -187,24 +76,27 @@ const NEXT_JS_IGNORES: &[&str] = &[".next/", "node_modules/", "coverage/"];
 #[cfg(unix)]
 fn placement_text(found: &Placement) -> String {
     let committed = |head: &Head| match head {
-        Head::Committed => "コミットあり",
-        Head::Unborn => "コミットなし",
+        Head::Committed => "has commits",
+        Head::Unborn => "no commits",
     };
     match found {
-        Placement::None => "リポジトリはありません".into(),
-        Placement::Own { head } => format!("このディレクトリが最上位です（{}）", committed(head)),
+        Placement::None => "No repository".into(),
+        Placement::Own { head } => format!(
+            "This directory is the repository root ({})",
+            committed(head)
+        ),
         Placement::Worktree { head } => {
-            format!("リンクされた作業ツリーです（{}）", committed(head))
+            format!("Linked worktree ({})", committed(head))
         }
-        Placement::Inside { top_level } => format!("{top_level} のリポジトリの内側です"),
-        Placement::Bare => "bare リポジトリです".into(),
+        Placement::Inside { top_level } => format!("Inside the repository at {top_level}"),
+        Placement::Bare => "Bare repository".into(),
     }
 }
 
 #[cfg(unix)]
 fn git(cwd: &std::path::Path) -> Result<(), String> {
     let root = polaris_core::project::resolve_root(cwd);
-    let opened = std::fs::File::open(&root).map_err(|_| "対象を開けません。".to_owned())?;
+    let opened = std::fs::File::open(&root).map_err(|_| "Cannot open the target.".to_owned())?;
     let placement = recipe::git::placement(&opened);
     if let Ok(found) = &placement {
         println!("Git: {}", placement_text(found));
@@ -228,7 +120,7 @@ fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
         println!("{}", withheld_reason(held));
     }
     if add.is_empty() {
-        println!(".gitignore に足すものはありません。");
+        println!("No additions needed in .gitignore.");
         return Ok(());
     }
 
@@ -263,7 +155,7 @@ fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
     let after = std::fs::read_to_string(root.join(".gitignore"));
     let verdict = match (&written, &after) {
         (Err(_), _) | (_, Err(_)) => Verdict::Unknown {
-            reason: ".gitignore を読み書きできませんでした".into(),
+            reason: "Could not read or write .gitignore".into(),
         },
         (Ok(()), Ok(body)) => {
             let missing: Vec<&str> = add
@@ -277,7 +169,7 @@ fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
                 }
             } else {
                 Verdict::NotMet {
-                    missing: format!(".gitignore に無い規則: {}", missing.join(", ")),
+                    missing: format!("Rules missing from .gitignore: {}", missing.join(", ")),
                 }
             }
         }
@@ -297,11 +189,11 @@ fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
         .map_err(fail)?;
     match verdict {
         Verdict::Met { evidence } => {
-            println!("追加しました: {evidence}");
+            println!("Added: {evidence}");
             Ok(())
         }
         Verdict::NotMet { missing } | Verdict::Unknown { reason: missing } => {
-            Err(format!("{missing}（記録: {outcome:?}）"))
+            Err(format!("{missing} (recorded outcome: {outcome:?})"))
         }
     }
 }
@@ -317,6 +209,8 @@ fn now_id() -> u128 {
 
 #[cfg(not(unix))]
 pub fn run(_args: Args) -> ExitCode {
-    eprintln!("このプラットフォームでは設定の変更に必要な保護機構が未対応です。変更していません。");
+    eprintln!(
+        "This platform lacks the protections required for configuration changes. No changes were made."
+    );
     ExitCode::FAILURE
 }

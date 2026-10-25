@@ -72,7 +72,7 @@ fn require_handle(
         || admission.payload.text != instruction.text
         || admission.payload.route != DestinationMode::Current
     {
-        return Err("指示のID・本文・保存先が受理時と一致しません".into());
+        return Err("Instruction ID, body, or destination differs from admission".into());
     }
     Ok(admission)
 }
@@ -108,7 +108,10 @@ fn prepare_effect(
         )
         .map_err(|e| e.to_string())?;
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
-        return Err("この指示操作は既に保存されています。自動再実行しません".into());
+        return Err(
+            "This instruction operation is already saved. It will not be rerun automatically"
+                .into(),
+        );
     };
     effects
         .start_runtime(activity, &prepared)
@@ -162,7 +165,7 @@ pub fn receive(
         || text.contains('\0')
         || crate::is_secret_command(text)
     {
-        return Err("指示は秘密コマンドを含まない1〜4096 bytesの本文です".into());
+        return Err("An instruction must contain 1–4096 bytes and no secret commands".into());
     }
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     let current = SessionId::new(snapshot.state.session_id.clone()).map_err(|e| e.to_string())?;
@@ -173,12 +176,14 @@ pub fn receive(
             || existing.payload.text != text
             || existing.payload.route != DestinationMode::Current
         {
-            return Err("同じ指示IDが別の本文・会話に使われています".into());
+            return Err(
+                "The same instruction ID is used for a different body or conversation".into(),
+            );
         }
         let effect = effects
             .effect(operation)
             .map_err(|e| e.to_string())?
-            .ok_or("指示の管理効果を確認できません")?;
+            .ok_or("Cannot verify the instruction management effect")?;
         if !matches!(effect.state, ManagementEffectStateV1::Completed { .. })
             || effect.request.inventory.encoded() != "D21"
             || effect.request.scope.session
@@ -187,7 +192,7 @@ pub fn receive(
                 != ManagementEffectHashV1::digest(existing.payload_hash.as_bytes())
             || !matches!(existing.state, AdmissionState::Reserved)
         {
-            return Err("この指示は処理済みか受付結果が不明です。自動再実行しません".into());
+            return Err("This instruction is processed or its acceptance outcome is unknown. It will not be rerun automatically".into());
         }
         return Ok(handle(existing));
     }
@@ -248,7 +253,7 @@ pub fn receive(
             )
             .map_err(|e| e.to_string())?;
         return Err(format!(
-            "指示の受付結果は不明です。再送せず保存状態を確認してください: {error}"
+            "Instruction acceptance outcome is unknown. Do not resend; inspect saved state: {error}"
         ));
     }
     *manager = next;
@@ -269,7 +274,7 @@ pub fn receive(
             ManagementUnknownReasonV1::ReceiptPersistenceFailed,
         );
         return Err(format!(
-            "指示の受付receiptを完了できません。再送しません: {error}"
+            "Cannot complete the instruction acceptance receipt. It will not be resent: {error}"
         ));
     }
     Ok(handle(&admission))
@@ -298,14 +303,16 @@ pub fn preflight(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("指示の適用にはv2会話が必要です")?;
+        .ok_or("Applying instructions requires a v2 conversation")?;
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     if snapshot.state.session_id != instruction.parent_session.as_str() {
-        return Err("指示を別の会話へ適用できません".into());
+        return Err("Cannot apply an instruction to a different conversation".into());
     }
     let admission = require_handle(manager, instruction)?;
     if !matches!(admission.state, AdmissionState::Reserved) {
-        return Err("この指示は適用済みか復旧が必要です。再送しません".into());
+        return Err(
+            "This instruction is applied or requires recovery. It will not be resent".into(),
+        );
     }
     if manager.queue.first() != Some(&instruction.admission_id)
         || manager
@@ -316,7 +323,7 @@ pub fn preflight(
             .outcome_unknown_blocker(&instruction.parent_session)
             .is_some()
     {
-        return Err("先行入力・実行中run・結果不明の処理後に指示を適用してください".into());
+        return Err("Apply instructions after preceding input, active runs, and unknown outcomes are resolved".into());
     }
     Ok(())
 }
@@ -331,14 +338,16 @@ pub fn apply(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("指示の適用にはv2会話が必要です")?;
+        .ok_or("Applying instructions requires a v2 conversation")?;
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     if snapshot.state.session_id != instruction.parent_session.as_str() {
-        return Err("指示を別の会話へ適用できません".into());
+        return Err("Cannot apply an instruction to a different conversation".into());
     }
     let admission = require_handle(manager, &instruction)?;
     if !matches!(admission.state, AdmissionState::Reserved) {
-        return Err("この指示は適用済みか復旧が必要です。再送しません".into());
+        return Err(
+            "This instruction is applied or requires recovery. It will not be resent".into(),
+        );
     }
     if manager.queue.first() != Some(&instruction.admission_id)
         || manager
@@ -349,7 +358,7 @@ pub fn apply(
             .outcome_unknown_blocker(&instruction.parent_session)
             .is_some()
     {
-        return Err("先行入力・実行中run・結果不明の処理後に指示を適用してください".into());
+        return Err("Apply instructions after preceding input, active runs, and unknown outcomes are resolved".into());
     }
     let goal_revision = snapshot
         .state
@@ -404,7 +413,10 @@ pub fn apply(
         )
         .map_err(|e| e.to_string())?;
     if !appended {
-        return Err("指示は原文へ既に保存されています。再送しません".into());
+        return Err(
+            "The instruction is already saved in the original transcript. It will not be resent"
+                .into(),
+        );
     }
     let mut next = manager.clone();
     let applied = next
@@ -427,10 +439,10 @@ pub fn apply(
         run_id,
     } = next.start_next(next.revision).map_err(|e| e.to_string())?
     else {
-        return Err("指示のrunを予約できません".into());
+        return Err("Cannot reserve an instruction run".into());
     };
     if admission_id != instruction.admission_id || session_id != instruction.parent_session {
-        return Err("指示と予約runのidentityが一致しません".into());
+        return Err("Instruction and reserved run identity mismatch".into());
     }
     persist_transition(store, manager, next)?;
     Ok(AppliedInstructionV1 {
@@ -451,11 +463,11 @@ pub fn cancel_queue(
 ) -> Result<(), String> {
     let admission = require_handle(manager, &instruction)?;
     if !matches!(admission.state, AdmissionState::Reserved) {
-        return Err("実行・適用済みの指示はqueued取消の対象外です".into());
+        return Err("Running or applied instructions cannot be cancelled as queued input".into());
     }
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     if snapshot.state.session_id != instruction.parent_session.as_str() {
-        return Err("取消対象の会話が一致しません".into());
+        return Err("Cancellation target conversation mismatch".into());
     }
     let mut next = manager.clone();
     next.cancel(&admission.id, next.revision, admission.revision)

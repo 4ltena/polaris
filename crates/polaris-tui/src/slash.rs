@@ -1,27 +1,14 @@
 //! Slash commands: local, client-side commands recognized when the input
-//! buffer starts with `/`. Almost all are handled entirely inside
-//! `polaris-tui` — never sent to the model, never added to
-//! `session.messages`, never persisted to the session file. `Review` is
-//! the one exception: it's a prompt expansion, not a local command — the
-//! caller in `lib.rs` recognizes it before dispatch and lets it fall
-//! through to a normal model turn instead.
+//! buffer starts with `/`. Most dispatch to local owners rather than becoming
+//! conversation messages. `Review` expands into a normal model turn; compact
+//! and input-admission commands can also request model work through their
+//! owners. Local configuration and management commands may persist state.
 //!
-//! Mirrors the *shape* of `codex`'s own in-session slash commands (an
-//! autocomplete popup while typing, local execution on submit). codex's
-//! real command set, read from its `slash_command.rs`, is ~65 entries —
-//! most depend on a subsystem polaris doesn't have (MCP client, IDE
-//! integration, multi-agent orchestration, background terminals,
-//! terminal pets, ...) and stay out for that reason: `/apps`,
-//! `/plugins`, `/vim`, `/keymap`, `/hooks`, `/import`,
-//! `/memories`, `/theme`, `/pets`, `/ide`, `/plan`, `/goal`, `/agents`,
-//! `/subagents`, `/side`, `/btw`, `/ps`, `/stop`, `/title`,
-//! `/statusline`, `/feedback`, `/personality`, `/experimental`,
-//! `/approve`, `/mention`, `/usage` (duplicates `/status`'s
-//! token display), `/rename` and `/archive`/`/delete` (need a title/
-//! lifecycle concept `/resume`'s picker doesn't have yet). `/model` now
-//! does switch the model mid-session — `polaris_provider::Provider`
-//! grew a `set_model(&self, ...)` method using interior mutability, so
-//! it can be called through the same shared provider reference. The
+//! Typing opens an autocomplete popup and submission dispatches the selected
+//! command. `COMMANDS` owns the visible catalog; `parse` also accepts the
+//! documented aliases. Commands with arguments route to the owner of their
+//! session, runtime, workspace, account, memory, or MCP state. `/model`
+//! switches the model through `Provider::set_model` on the shared provider. The
 //! interactive picker deliberately leaves reasoning effort to automatic
 //! routing; fixed noninteractive measurements can still use `--effort`.
 
@@ -32,12 +19,12 @@ pub struct SlashCommand {
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
-        name: "setting",
-        description: "inspect Next.js plan or confirm Git ignore recipe",
+        name: "env",
+        description: "plan or provision a fixed development environment",
     },
     SlashCommand {
-        name: "handoff",
-        description: "render a bounded handoff from actual project evidence",
+        name: "setting",
+        description: "inspect or confirm Git ignore configuration",
     },
     SlashCommand {
         name: "session",
@@ -64,26 +51,6 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "configure tool-result retention and loopback embedding",
     },
     SlashCommand {
-        name: "remember",
-        description: "configure saved conversation memory",
-    },
-    SlashCommand {
-        name: "browse",
-        description: "inspect project files locally",
-    },
-    SlashCommand {
-        name: "attachment",
-        description: "preview bounded text without sending it",
-    },
-    SlashCommand {
-        name: "recipe",
-        description: "inspect built-in recipe definitions",
-    },
-    SlashCommand {
-        name: "models",
-        description: "inspect available models",
-    },
-    SlashCommand {
         name: "subagents",
         description: "inspect or wait for an exact child attempt",
     },
@@ -105,23 +72,15 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "status",
-        description: "show provider, model, and token usage",
-    },
-    SlashCommand {
-        name: "web-search",
-        description: "inspect hosted search availability",
+        description: "show login status, conversation ID, model, and usage",
     },
     SlashCommand {
         name: "doctor",
         description: "inspect local configuration and runtime availability",
     },
     SlashCommand {
-        name: "account",
-        description: "list, register, reauthenticate, unlink, label, or bind an account",
-    },
-    SlashCommand {
         name: "login",
-        description: "register an account without changing the current binding",
+        description: "register, reauthenticate, select, or label a login",
     },
     SlashCommand {
         name: "memory",
@@ -234,9 +193,9 @@ pub fn matching(prefix: &str) -> Vec<&'static SlashCommand> {
 }
 
 pub enum Action {
+    Environment(String),
     Help,
     Status,
-    WebSearch(String),
     Doctor,
     Account(String),
     Memory(String),
@@ -324,7 +283,6 @@ impl Action {
         match self {
             Self::Help
             | Self::Status
-            | Self::WebSearch(_)
             | Self::Doctor
             | Self::Skills
             | Self::Pwd
@@ -348,10 +306,6 @@ impl Action {
                     | "goal"
                     | "goal current"
                     | "history"
-            ),
-            Self::WorkspaceControl(value) => matches!(
-                value.as_str(),
-                "browse" | "browse list" | "recipe" | "recipe list" | "setting nextjs"
             ),
             Self::RuntimeControl(value) => matches!(
                 value.as_str(),
@@ -445,38 +399,34 @@ pub fn action_for(name: &str) -> Action {
 /// normal instruction to send to the model, unchanged from today.
 ///
 /// Only the first whitespace-separated word is matched against a command
-/// name; everything after it is trailing text. Every current command
-/// ignores that trailing text except `/review`, which carries it as
-/// custom instructions — but accepting (and ignoring) it uniformly means
-/// `/status now`, say, still resolves to `Status` instead of `Unknown`.
+/// name; everything after it is trailing text. Argument-bearing commands
+/// preserve it for their owner. Simple actions ignore it, so `/status now`,
+/// for example, still resolves to `Status` instead of `Unknown`.
 pub fn parse(line: &str) -> Option<Action> {
-    let rest = line.strip_prefix('/')?;
+    let rest = line
+        .strip_prefix('/')
+        .or_else(|| (line == "env" || line.starts_with("env ")).then_some(line))?;
     let trimmed = rest.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").to_ascii_lowercase();
     let extra = parts.next().unwrap_or("").trim().to_string();
     Some(match name.as_str() {
+        "env" => Action::Environment(extra),
         "" | "help" => Action::Help,
         "status" => Action::Status,
-        "web-search" => Action::WebSearch(extra),
         "doctor" => Action::Doctor,
-        "account" => Action::Account(extra),
-        "login" => Action::Account(format!("login {extra}").trim_end().to_owned()),
+        "login" => Action::Account(login_request(&extra)),
         "memory" if extra.starts_with("configure ") => {
             Action::SessionControl(format!("memory {extra}"))
         }
         "memory" => Action::Memory(extra),
-        "session" | "goal" | "history" | "tool-memory" | "remember" => {
+        "session" | "goal" | "history" | "tool-memory" => {
             Action::SessionControl(format!("{name} {extra}").trim_end().to_owned())
         }
         "input" | "instruction" | "subagents" | "roles" | "run" | "sandbox" => {
             Action::RuntimeControl(format!("{name} {extra}").trim_end().to_owned())
         }
-        #[cfg(not(target_os = "linux"))]
-        "models" if extra.is_empty() || extra == "list" => Action::Model,
-        "browse" | "attachment" | "recipe" | "models" | "setting" | "handoff" => {
-            Action::WorkspaceControl(format!("{name} {extra}").trim_end().to_owned())
-        }
+        "setting" => Action::WorkspaceControl(format!("{name} {extra}").trim_end().to_owned()),
         "decided" => Action::Decided(extra),
         "compare" => Action::Compare(extra),
         "sync" => Action::Sync(extra),
@@ -502,10 +452,21 @@ pub fn parse(line: &str) -> Option<Action> {
         "export" => Action::Export(extra),
         "pwd" => Action::Pwd,
         "copy" => Action::Copy,
-        "logout" => Action::Logout,
+        "logout" if extra.is_empty() => Action::Logout,
+        "logout" => Action::Account(format!("unlink {extra}")),
         "quit" | "exit" | "q" => Action::Quit,
         _ => Action::Unknown(trimmed.to_ascii_lowercase()),
     })
+}
+
+fn login_request(extra: &str) -> String {
+    let (command, arguments) = extra.split_once(char::is_whitespace).unwrap_or((extra, ""));
+    match command {
+        "reauth" | "bind" | "label" => extra.to_owned(),
+        "use" => format!("bind {arguments}"),
+        "new" => format!("login {arguments}").trim_end().to_owned(),
+        _ => format!("login {extra}").trim_end().to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -531,24 +492,57 @@ mod tests {
             "/session current",
             "/goal",
             "/history 20",
-            "/browse read src/main.rs",
-            "/attachment notes.txt",
             "/input status input-id",
             "/subagents wait child attempt",
             "/run details",
         ] {
             assert!(!parse(command).unwrap().needs_management_clearance());
         }
-        #[cfg(not(target_os = "linux"))]
-        assert!(matches!(parse("/models"), Some(Action::Model)));
-        #[cfg(target_os = "linux")]
+        assert!(matches!(parse("/model"), Some(Action::Model)));
+    }
+
+    #[test]
+    fn removed_commands_are_unknown_and_absent_from_completion() {
+        for name in [
+            "web-search",
+            "models",
+            "browse",
+            "attachment",
+            "recipe",
+            "handoff",
+            "remember",
+            "account",
+        ] {
+            assert!(matching(name).is_empty());
+            for arguments in ["", " list", " read src/main.rs", " live"] {
+                assert!(matches!(
+                    parse(&format!("/{name}{arguments}")),
+                    Some(Action::Unknown(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn login_and_logout_keep_the_existing_account_operations() {
+        for (text, expected) in [
+            ("/login", "login"),
+            ("/login new label", "login label"),
+            ("/login reauth registration", "reauth registration"),
+            ("/login use registration", "bind registration"),
+            (
+                "/login label registration new name",
+                "label registration new name",
+            ),
+            ("/logout registration", "unlink registration"),
+        ] {
+            assert!(matches!(parse(text), Some(Action::Account(value)) if value == expected));
+            assert!(parse(text).unwrap().needs_management_clearance());
+        }
+        assert!(matches!(parse("/logout"), Some(Action::Logout)));
         assert!(
-            matches!(parse("/models"), Some(Action::WorkspaceControl(value)) if value == "models")
+            matches!(parse("/memory configure on"), Some(Action::SessionControl(value)) if value == "memory configure on")
         );
-        assert!(matches!(
-            parse("/models install x"),
-            Some(Action::WorkspaceControl(_))
-        ));
     }
 
     #[test]
@@ -597,7 +591,7 @@ mod tests {
         assert!(matches!(parse("/help"), Some(Action::Help)));
         assert!(matches!(parse("/status"), Some(Action::Status)));
         assert!(matches!(parse("/doctor"), Some(Action::Doctor)));
-        assert!(matches!(parse("/account list"), Some(Action::Account(value)) if value == "list"));
+        assert!(matches!(parse("/account list"), Some(Action::Unknown(_))));
         assert!(
             matches!(parse("/memory search a"), Some(Action::Memory(value)) if value == "search a")
         );

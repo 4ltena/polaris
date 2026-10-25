@@ -24,7 +24,7 @@ impl Journal<'_> {
     ) -> Result<PreparedManagementEffectV1, String> {
         let request = PrepareManagementEffectV1 {
             operation_id: ManagementOperationIdV1::random()
-                .map_err(|_| "MCP管理操作IDを作成できません")?,
+                .map_err(|_| "Cannot create an MCP management operation ID")?,
             inventory: ManagementInventoryIdV1::parse(inventory).map_err(|e| e.to_string())?,
             scope: ManagementEffectScopeV1 {
                 project: self.effects.project_scope_hash(),
@@ -49,7 +49,7 @@ impl Journal<'_> {
         {
             PrepareManagementEffectOutcomeV1::Prepared(prepared) => Ok(prepared),
             PrepareManagementEffectOutcomeV1::Existing(_) => {
-                Err("MCP管理操作が既に存在します".into())
+                Err("MCP management operation already exists".into())
             }
         }
     }
@@ -85,7 +85,9 @@ impl Journal<'_> {
                 started,
                 ManagementUnknownReasonV1::ReceiptPersistenceFailed,
             );
-            return Err("MCP操作の管理receiptを保存できません。結果の照合が必要です".into());
+            return Err(
+                "Cannot save the MCP management receipt. Outcome reconciliation is required".into(),
+            );
         }
         Ok(())
     }
@@ -96,6 +98,6 @@ impl Journal<'_> {
             started,
             ManagementUnknownReasonV1::UnclassifiedEffect,
         );
-        "MCP操作の結果を確認できません。再実行せず管理状態を照合してください".into()
+        "Cannot verify the MCP operation outcome. Do not rerun; reconcile management state".into()
     }
 }

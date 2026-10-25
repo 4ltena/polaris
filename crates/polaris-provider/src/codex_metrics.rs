@@ -58,7 +58,7 @@ pub(super) fn apply_namespace(
         !s.is_empty() && s.len() <= 64
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     }).ok_or_else(|| ProviderError::Decode(
-        "POLARIS_CACHE_NAMESPACE は1〜64文字の英数字・ピリオド・下線・ハイフンで指定してください".into()
+        "POLARIS_CACHE_NAMESPACE must contain 1–64 alphanumeric characters, periods, underscores, or hyphens".into()
     ))?;
     let original = body["prompt_cache_key"].as_str().unwrap_or_default();
     body["prompt_cache_key"] = json!(format!("{original}-{}", hash(namespace.as_bytes())));
@@ -76,14 +76,12 @@ pub(super) fn apply_cache_mode(
         .to_str()
         .filter(|mode| matches!(*mode, "implicit" | "explicit"))
         .ok_or_else(|| {
-            ProviderError::Decode(
-                "POLARIS_CACHE_MODE は implicit または explicit を指定してください".into(),
-            )
+            ProviderError::Decode("Set POLARIS_CACHE_MODE to implicit or explicit".into())
         })?;
     let model = body["model"].as_str().unwrap_or_default();
-    if model != "gpt-6" && !model.starts_with("gpt-6-") {
+    if model != "gpt-6" && !model.starts_with("gpt-6-") && model != "gpt-6.1-sol" {
         return Err(ProviderError::Decode(
-            "POLARIS_CACHE_MODE は実験用のGPT-6モデル限定設定です".into(),
+            "POLARIS_CACHE_MODE is an experimental setting for GPT-6 models only".into(),
         ));
     }
     body["prompt_cache_options"] = json!({"mode": mode});
@@ -235,7 +233,7 @@ impl TokenUsage {
 // No paths or underlying error strings are surfaced: either may contain secrets.
 fn metrics_error() -> ProviderError {
     ProviderError::Decode(
-        "POLARIS_METRICS_PATH の診断ファイルを安全に開けません（通常ファイル・権限0600が必要）"
+        "Cannot safely open the POLARIS_METRICS_PATH diagnostic file (a regular file with mode 0600 is required)"
             .into(),
     )
 }
@@ -463,7 +461,9 @@ impl RequestMetric {
 impl Drop for RequestMetric {
     fn drop(&mut self) {
         if self.dispatched && self.write().is_err() {
-            eprintln!("Polaris: 診断ログの保存に失敗しました。今回の計測には欠測があります。");
+            eprintln!(
+                "Polaris: failed to save diagnostic logs. This measurement has missing data."
+            );
         }
     }
 }
@@ -592,6 +592,37 @@ mod tests {
     }
 
     #[test]
+    fn cache_mode_supports_the_recommended_sol_without_changing_default_requests() {
+        for mode in ["implicit", "explicit"] {
+            let mut request = body();
+            request["model"] = json!("gpt-6.1-sol");
+            let original = request.clone();
+            apply_cache_mode(&mut request, None).unwrap();
+            assert_eq!(request, original);
+
+            apply_cache_mode(&mut request, Some(OsStr::new(mode))).unwrap();
+            assert_eq!(request["prompt_cache_options"], json!({"mode": mode}));
+            assert_eq!(request["model"], original["model"]);
+            assert_eq!(request["instructions"], original["instructions"]);
+            assert_eq!(request["tools"], original["tools"]);
+            assert_eq!(request["reasoning"], original["reasoning"]);
+            assert_eq!(request["prompt_cache_key"], original["prompt_cache_key"]);
+            if mode == "implicit" {
+                request
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("prompt_cache_options");
+                assert_eq!(request, original);
+            } else {
+                assert_eq!(
+                    request["input"][0]["content"][0]["prompt_cache_breakpoint"],
+                    json!({"mode": "explicit"})
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cache_mode_explicit_preserves_past_boundaries_across_appends() {
         let mut request = body();
         apply_cache_mode(&mut request, Some(OsStr::new("explicit"))).unwrap();
@@ -657,11 +688,18 @@ mod tests {
             assert!(!error.to_string().contains("SECRET"));
             assert_eq!(request, before);
         }
-        let mut request = body();
-        request["model"] = json!("gpt-5.6-sol");
-        let before = request.clone();
-        assert!(apply_cache_mode(&mut request, Some(OsStr::new("explicit"))).is_err());
-        assert_eq!(request, before);
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-6.1-sol-preview",
+            "gpt-6.1-terra",
+            "gpt-6.1-sol-extra",
+        ] {
+            let mut request = body();
+            request["model"] = json!(model);
+            let before = request.clone();
+            assert!(apply_cache_mode(&mut request, Some(OsStr::new("explicit"))).is_err());
+            assert_eq!(request, before);
+        }
     }
 
     #[test]

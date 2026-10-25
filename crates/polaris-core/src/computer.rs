@@ -183,11 +183,11 @@ impl ComputerTool {
     ) -> Result<String, String> {
         let candidates = self.driver.candidates(app)?;
         let shown = candidates.iter().take(max_steps.max(1));
-        let mut out = format!("{app}: {} 件の候補。目標「{goal}」\n", candidates.len());
+        let mut out = format!("{app}: {} candidates. Goal: {goal}\n", candidates.len());
         for candidate in shown {
             let mark = match refusal_for(&candidate.label) {
-                Some(refusal) => format!("拒否({})", refusal.as_str()),
-                None => "可".to_owned(),
+                Some(refusal) => format!("denied ({})", refusal.as_str()),
+                None => "allowed".to_owned(),
             };
             out.push_str(&format!(
                 "  [{}] {} — {mark}\n",
@@ -195,9 +195,9 @@ impl ComputerTool {
             ));
         }
         out.push_str(if apply {
-            "適用しなかった。要素の選択は型付き判定器の担当で、まだ配線されていない。"
+            "Not applied. Element selection requires a typed decider, which is not connected yet."
         } else {
-            "報告のみ。適用するには apply を立てる。"
+            "Report only. Set apply to perform the operation."
         });
         Ok(out)
     }

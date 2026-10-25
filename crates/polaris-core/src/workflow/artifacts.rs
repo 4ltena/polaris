@@ -65,7 +65,7 @@ impl ProjectPrincipleV1 {
             || self.feature_ids.len() > MAX_PRINCIPLE_SELECTORS
             || self.task_ids.len() > MAX_PRINCIPLE_SELECTORS
         {
-            return Err("project principleの内容または適用範囲が不正です".into());
+            return Err("Invalid project principle content or scope".into());
         }
         for id in self.feature_ids.iter().chain(&self.task_ids) {
             validate_artifact_id(id)?;
@@ -146,7 +146,7 @@ impl ProjectPrinciplesV1 {
     pub fn validate(&self) -> Result<(), String> {
         validate_common_artifact(self.schema_version, &self.header)?;
         if self.principles.is_empty() || self.principles.len() > MAX_PROJECT_PRINCIPLES {
-            return Err("project principlesの件数が不正です".into());
+            return Err("Invalid project principle count".into());
         }
         for principle in &self.principles {
             principle.validate()?;
@@ -156,7 +156,7 @@ impl ProjectPrinciplesV1 {
             "project principle",
         )?;
         if self.header.content_hash != self.canonical_hash()? {
-            return Err("project principlesのcontent hashが一致しません".into());
+            return Err("Project principles content hash mismatch".into());
         }
         validate_body_size(self)
     }
@@ -271,7 +271,7 @@ impl IdeaDecisionV1 {
             })
             || (self.decision == IdeaDecisionOutcomeV1::Clarify && self.unresolved.is_empty())
         {
-            return Err("idea decisionの内容、未解決事項または上限が不正です".into());
+            return Err("Invalid idea decision content, unresolved items, or limits".into());
         }
         reject_duplicate_ids(
             self.alternatives.iter().map(|item| item.id.as_str()),
@@ -282,7 +282,7 @@ impl IdeaDecisionV1 {
             "unresolved decision",
         )?;
         if self.header.content_hash != self.canonical_hash()? {
-            return Err("idea decisionのcontent hashが一致しません".into());
+            return Err("Idea decision content hash mismatch".into());
         }
         validate_body_size(self)
     }
@@ -305,7 +305,7 @@ impl RequirementV1 {
     fn validate(&self) -> Result<(), String> {
         validate_artifact_id(&self.id)?;
         if !valid_text(&self.description, 4096) {
-            return Err("requirementの説明が不正です".into());
+            return Err("Invalid requirement description".into());
         }
         Ok(())
     }
@@ -405,19 +405,19 @@ impl VerificationCriterionV1 {
     pub(crate) fn validate(&self) -> Result<(), String> {
         validate_artifact_id(&self.id)?;
         if !valid_text(&self.description, 4096) {
-            return Err("verification criterionの説明が不正です".into());
+            return Err("Invalid verification criterion description".into());
         }
         match (&self.observable_failure, self.evidence_kinds.is_empty()) {
             (None, true) => {}
             (Some(observable_failure), false) if valid_text(observable_failure, 4096) => {}
             (Some(_), true) => {
-                return Err("typed verification criterionにはevidence kindが必要です".into());
+                return Err("A typed verification criterion requires an evidence kind".into());
             }
             (None, false) => {
-                return Err("typed verification criterionにはobservable failureが必要です".into());
+                return Err("A typed verification criterion requires an observable failure".into());
             }
             (Some(_), false) => {
-                return Err("verification criterionのobservable failureが不正です".into());
+                return Err("Invalid verification criterion observable failure".into());
             }
         }
         Ok(())
@@ -436,7 +436,7 @@ impl ArtifactRefV1 {
     pub fn validate(&self) -> Result<(), String> {
         validate_artifact_id(&self.id)?;
         if self.revision == 0 {
-            return Err("artifact revisionは1以上である必要があります".into());
+            return Err("Artifact revision must be at least 1".into());
         }
         validate_hash(&self.content_hash)
     }
@@ -467,19 +467,19 @@ impl ArtifactHeaderV1 {
     fn validate(&self) -> Result<(), String> {
         self.reference().validate()?;
         if self.created_from.len() > 32 {
-            return Err("artifactの出典参照が上限を超えました".into());
+            return Err("Artifact source references exceed the limit".into());
         }
         let mut seen = BTreeSet::new();
         for source in &self.created_from {
             source.validate()?;
             if !seen.insert(source) {
-                return Err("artifactの出典参照が重複しています".into());
+                return Err("Duplicate artifact source references".into());
             }
         }
         if let Some(previous) = &self.supersedes {
             previous.validate()?;
             if previous.id != self.id || previous.revision >= self.revision {
-                return Err("artifactの置換元revisionが不正です".into());
+                return Err("Invalid replaced artifact revision".into());
             }
         }
         Ok(())
@@ -530,11 +530,11 @@ impl RoutineEligibilityV1 {
                 .iter()
                 .any(|component| !valid_text(component, 256))
         {
-            return Err("routine変更のcomponent範囲が不正です".into());
+            return Err("Invalid routine change component scope".into());
         }
         let unique = self.affected_components.iter().collect::<BTreeSet<_>>();
         if unique.len() != self.affected_components.len() {
-            return Err("routine変更のcomponentが重複しています".into());
+            return Err("Duplicate routine change components".into());
         }
         Ok(())
     }
@@ -672,7 +672,7 @@ impl ChangeContractV1 {
             .header
             .revision
             .checked_add(1)
-            .ok_or("artifact revisionが上限に達しました")?;
+            .ok_or("Artifact revision limit reached")?;
         next.header.supersedes = Some(self.header.reference());
         next.header.status = status;
         next.verification_wire = VerificationWireV1::Typed;
@@ -691,7 +691,8 @@ impl ChangeContractV1 {
         canonical.header.content_hash.clear();
         let mut bytes = b"polaris.workflow.change_contract.v1\0".to_vec();
         bytes.extend(
-            serde_json::to_vec(&canonical).map_err(|_| "change contractを正規化できません")?,
+            serde_json::to_vec(&canonical)
+                .map_err(|_| "Cannot canonicalize the change contract")?,
         );
         Ok(bytes)
     }
@@ -702,7 +703,7 @@ impl ChangeContractV1 {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != WORKFLOW_ARTIFACT_SCHEMA_VERSION {
-            return Err("未対応のchange contract保存形式です".into());
+            return Err("Unsupported change contract storage format".into());
         }
         self.header.validate()?;
         self.eligibility.validate()?;
@@ -716,13 +717,13 @@ impl ChangeContractV1 {
                 .iter()
                 .any(|criterion| criterion.validate().is_err())
         {
-            return Err("change contractの必須内容または上限が不正です".into());
+            return Err("Invalid change contract required content or limits".into());
         }
         reject_duplicate_ids(
             self.verification
                 .iter()
                 .map(|criterion| criterion.id.as_str()),
-            "change contractのcriterion",
+            "Change contract criterion",
         )?;
         let canonical_hash = self.canonical_hash()?;
         let uses_current_hash = self.header.content_hash == canonical_hash;
@@ -730,11 +731,11 @@ impl ChangeContractV1 {
             && self.legacy_criteria_are_exact()?
             && self.header.content_hash == self.legacy_canonical_hash()?;
         if !uses_current_hash && !uses_legacy_hash {
-            return Err("change contractのcontent hashが一致しません".into());
+            return Err("Change contract content hash mismatch".into());
         }
-        let bytes = serde_json::to_vec(self).map_err(|_| "change contractを保存できません")?;
+        let bytes = serde_json::to_vec(self).map_err(|_| "Cannot save the change contract")?;
         if bytes.len() > MAX_WORKFLOW_ARTIFACT_BODY_BYTES {
-            return Err("change contract本文が上限を超えました".into());
+            return Err("Change contract body exceeds the limit".into());
         }
         Ok(())
     }
@@ -767,7 +768,8 @@ impl ChangeContractV1 {
         };
         let mut bytes = b"polaris.workflow.change_contract.v1\0".to_vec();
         bytes.extend(
-            serde_json::to_vec(&legacy).map_err(|_| "legacy change contractを正規化できません")?,
+            serde_json::to_vec(&legacy)
+                .map_err(|_| "Cannot canonicalize the legacy change contract")?,
         );
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
@@ -935,7 +937,7 @@ impl FeatureSpecV1 {
                 .iter()
                 .any(|item| !valid_text(item, 4096))
         {
-            return Err("feature specの必須内容または上限が不正です".into());
+            return Err("Invalid feature spec required content or limits".into());
         }
         for requirement in &self.requirements {
             requirement.validate()?;
@@ -945,20 +947,20 @@ impl FeatureSpecV1 {
         }
         reject_duplicate_ids(
             self.requirements.iter().map(|item| item.id.as_str()),
-            "feature specのrequirement",
+            "Feature spec requirement",
         )?;
         reject_duplicate_ids(
             self.acceptance_criteria.iter().map(|item| item.id.as_str()),
-            "feature specのcriterion",
+            "Feature spec criterion",
         )?;
         reject_duplicate_ids(
             self.required_clarifications
                 .iter()
                 .map(|item| item.id.as_str()),
-            "feature specのrequired clarification",
+            "Feature spec required clarification",
         )?;
         if self.header.content_hash != self.canonical_hash()? {
-            return Err("feature specのcontent hashが一致しません".into());
+            return Err("Feature spec content hash mismatch".into());
         }
         validate_body_size(self)
     }
@@ -1028,13 +1030,13 @@ impl ImplementationPlanV1 {
             || self.scope.len() > MAX_TASK_SCOPE_ITEMS
             || self.scope.iter().any(|scope| !valid_text(scope, 2048))
         {
-            return Err("implementation planの必須内容または上限が不正です".into());
+            return Err("Invalid implementation plan required content or limits".into());
         }
         if !self.header.created_from.contains(&self.feature_spec) {
-            return Err("implementation planのfeature spec出典がありません".into());
+            return Err("The implementation plan lacks a feature spec source".into());
         }
         if self.header.content_hash != self.canonical_hash()? {
-            return Err("implementation planのcontent hashが一致しません".into());
+            return Err("Implementation plan content hash mismatch".into());
         }
         validate_body_size(self)
     }
@@ -1078,7 +1080,7 @@ impl TaskDefinitionV1 {
             || self.scope.iter().any(|item| !valid_text(item, 2048))
             || self.dependencies.len() > MAX_TASK_DEPENDENCIES
         {
-            return Err("task definitionの必須内容または上限が不正です".into());
+            return Err("Invalid task definition required content or limits".into());
         }
         for id in self
             .requirement_ids
@@ -1090,15 +1092,15 @@ impl TaskDefinitionV1 {
         }
         reject_duplicate_ids(
             self.requirement_ids.iter().map(String::as_str),
-            "taskのrequirement参照",
+            "Task requirement reference",
         )?;
         reject_duplicate_ids(
             self.criterion_ids.iter().map(String::as_str),
-            "taskのcriterion参照",
+            "Task criterion reference",
         )?;
         reject_duplicate_ids(
             self.dependencies.iter().map(String::as_str),
-            "taskのdependency",
+            "Task dependency",
         )
     }
 }
@@ -1117,9 +1119,9 @@ impl TaskRuntimeV1 {
         validate_artifact_id(&self.task_id)?;
         match (self.state, self.blocker.as_deref()) {
             (TaskStateV1::Blocked, Some(blocker)) if valid_text(blocker, 4096) => Ok(()),
-            (TaskStateV1::Blocked, _) => Err("blocked taskにはblockerが必要です".into()),
+            (TaskStateV1::Blocked, _) => Err("A blocked task requires a blocker".into()),
             (_, None) => Ok(()),
-            (_, Some(_)) => Err("blocked以外のtaskにblockerは設定できません".into()),
+            (_, Some(_)) => Err("Only blocked tasks can have blockers".into()),
         }
     }
 }
@@ -1159,7 +1161,9 @@ impl ActiveTaskRefV1 {
             || self.definition_hash != graph.definition_hash
             || graph.task(&self.task_id).is_none()
         {
-            return Err("active task参照がtask graphのexact revisionと一致しません".into());
+            return Err(
+                "The active task reference does not match the exact task graph revision".into(),
+            );
         }
         Ok(())
     }
@@ -1233,7 +1237,7 @@ impl TaskGraphV1 {
             || self.implementation_plan != plan.reference()
             || plan.feature_spec != feature.reference()
         {
-            return Err("task graphのfeature/plan参照が一致しません".into());
+            return Err("Task graph feature or plan reference mismatch".into());
         }
         let requirements = feature
             .requirements
@@ -1255,7 +1259,9 @@ impl TaskGraphV1 {
                     .iter()
                     .any(|id| !criteria.contains(id.as_str()))
             {
-                return Err("task graphにdangling requirement/criterion参照があります".into());
+                return Err(
+                    "The task graph contains dangling requirement or criterion references".into(),
+                );
             }
         }
         Ok(())
@@ -1296,7 +1302,7 @@ impl TaskGraphV1 {
             || self.tasks.len() > MAX_TASKS
             || self.tasks.len() != self.runtime.len()
         {
-            return Err("task graphのtask数が不正です".into());
+            return Err("Invalid task graph task count".into());
         }
         for task in &self.tasks {
             task.validate()?;
@@ -1319,7 +1325,7 @@ impl TaskGraphV1 {
             .iter()
             .any(|runtime| !tasks.contains_key(runtime.task_id.as_str()))
         {
-            return Err("task runtimeにdangling task参照があります".into());
+            return Err("The task runtime contains a dangling task reference".into());
         }
         for task in &self.tasks {
             if task.dependencies.contains(&task.id)
@@ -1328,22 +1334,22 @@ impl TaskGraphV1 {
                     .iter()
                     .any(|dependency| !tasks.contains_key(dependency.as_str()))
             {
-                return Err("task dependencyが不正です".into());
+                return Err("Invalid task dependency".into());
             }
         }
         ensure_task_graph_acyclic(&tasks)?;
         if !self.header.created_from.contains(&self.feature_spec)
             || !self.header.created_from.contains(&self.implementation_plan)
         {
-            return Err("task graphの必須出典がありません".into());
+            return Err("Missing required task graph source".into());
         }
         if self.definition_hash != self.definition_hash_value()?
             || self.runtime_state_hash != self.runtime_hash_value()?
         {
-            return Err("task graphのdefinition/runtime hashが一致しません".into());
+            return Err("Task graph definition or runtime hash mismatch".into());
         }
         if self.header.content_hash != self.canonical_hash()? {
-            return Err("task graphのcontent hashが一致しません".into());
+            return Err("Task graph content hash mismatch".into());
         }
         validate_body_size(self)
     }
@@ -1408,9 +1414,9 @@ impl WorkflowArtifactMetadataV1 {
         match (self.kind, self.definition_hash.as_deref()) {
             (WorkflowArtifactKindV1::TaskGraph, Some(hash)) => validate_hash(hash)?,
             (WorkflowArtifactKindV1::TaskGraph, None) => {
-                return Err("task graph metadataにdefinition hashがありません".into());
+                return Err("Task graph metadata lacks a definition hash".into());
             }
-            (_, Some(_)) => return Err("task graph以外にdefinition hashは設定できません".into()),
+            (_, Some(_)) => return Err("Only task graphs can have a definition hash".into()),
             (_, None) => {}
         }
         Ok(())
@@ -1448,38 +1454,41 @@ impl Default for WorkflowArtifactGraphV1 {
 impl WorkflowArtifactGraphV1 {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != WORKFLOW_ARTIFACT_SCHEMA_VERSION {
-            return Err("未対応のworkflow artifact graphです".into());
+            return Err("Unsupported workflow artifact graph".into());
         }
         if self.artifacts.len() > MAX_WORKFLOW_ARTIFACTS {
-            return Err("workflow artifact数が上限を超えました".into());
+            return Err("Workflow artifact count exceeds the limit".into());
         }
         let mut keys = BTreeSet::new();
         for artifact in &self.artifacts {
             artifact.validate()?;
             if !keys.insert((artifact.header.id.as_str(), artifact.header.revision)) {
-                return Err("workflow artifactのIDとrevisionが重複しています".into());
+                return Err("Duplicate workflow artifact ID and revision".into());
             }
             if let Some(previous) = &artifact.header.supersedes
                 && !self.contains(previous)
             {
-                return Err("workflow artifactの置換元がgraphにありません".into());
+                return Err("The replaced workflow artifact is missing from the graph".into());
             }
             for source in &artifact.header.created_from {
                 if source == &artifact.reference() || !self.contains(source) {
-                    return Err("workflow artifactの出典がdanglingまたは自己参照です".into());
+                    return Err(
+                        "The workflow artifact source is dangling or self-referencing".into(),
+                    );
                 }
             }
         }
         self.ensure_acyclic()?;
         if self.revision < self.artifacts.len() as u64 {
-            return Err("workflow artifact graph revisionが不正です".into());
+            return Err("Invalid workflow artifact graph revision".into());
         }
         Ok(())
     }
 
     pub fn basis_hash(&self) -> Result<String, String> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| "artifact graphを正規化できません")?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| "Cannot canonicalize the artifact graph")?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
@@ -1509,7 +1518,9 @@ impl WorkflowArtifactGraphV1 {
                 || self.latest(&reference.id).map(|item| item.reference())
                     != Some(reference.clone())
         }) {
-            return Err("active featureがexact feature spec revisionを参照していません".into());
+            return Err(
+                "The active feature does not reference an exact feature spec revision".into(),
+            );
         }
         Ok(())
     }
@@ -1518,7 +1529,7 @@ impl WorkflowArtifactGraphV1 {
         reference.validate()?;
         let metadata = self
             .metadata(&reference.task_graph)
-            .ok_or("active taskのtask graphがartifact graphにありません")?;
+            .ok_or("The active task's task graph is missing from the artifact graph")?;
         if metadata.kind != WorkflowArtifactKindV1::TaskGraph
             || metadata.definition_hash.as_deref() != Some(reference.definition_hash.as_str())
             || self
@@ -1527,7 +1538,8 @@ impl WorkflowArtifactGraphV1 {
                 != Some(reference.task_graph.clone())
         {
             return Err(
-                "active taskのdefinition hashがexact task graph revisionと一致しません".into(),
+                "The active task definition hash does not match the exact task graph revision"
+                    .into(),
             );
         }
         Ok(())
@@ -1572,7 +1584,7 @@ impl WorkflowArtifactGraphV1 {
         self.validate()?;
         let upstream_metadata = self
             .metadata(upstream)
-            .ok_or("stale元artifactがgraphにありません")?;
+            .ok_or("The stale source artifact is missing from the graph")?;
         let _ = upstream_metadata;
         let mut stale = BTreeSet::new();
         let mut frontier = BTreeSet::from([upstream.clone()]);
@@ -1608,7 +1620,7 @@ impl WorkflowArtifactGraphV1 {
             .header
             .supersedes
             .as_ref()
-            .ok_or("初版project principlesにはstale元がありません")?;
+            .ok_or("Initial project principles have no stale source")?;
         self.stale_dependents_of(previous)
     }
 
@@ -1622,15 +1634,15 @@ impl WorkflowArtifactGraphV1 {
         self.validate()?;
         let metadata = self
             .metadata(replacement)
-            .ok_or("replacement artifactがgraphにありません")?;
+            .ok_or("The replacement artifact is missing from the graph")?;
         if self.latest(&replacement.id).map(|item| item.reference()) != Some(replacement.clone()) {
-            return Err("replacement artifactは現行revisionではありません".into());
+            return Err("The replacement artifact is not the current revision".into());
         }
         let superseded = metadata
             .header
             .supersedes
             .clone()
-            .ok_or("初版artifactにはstale伝播がありません")?;
+            .ok_or("Initial artifacts have no stale propagation")?;
         Ok(RevisionStaleImpactV1 {
             replacement: replacement.clone(),
             superseded: superseded.clone(),
@@ -1647,9 +1659,9 @@ impl WorkflowArtifactGraphV1 {
         artifact.validate()?;
         let source = self
             .metadata(&artifact.feature_spec)
-            .ok_or("implementation planのfeature specがgraphにありません")?;
+            .ok_or("The implementation plan's feature spec is missing from the graph")?;
         if source.kind != WorkflowArtifactKindV1::FeatureSpec {
-            return Err("implementation planの参照先はfeature specではありません".into());
+            return Err("The implementation plan does not reference a feature spec".into());
         }
         self.insert_metadata(WorkflowArtifactMetadataV1::from_header(
             WorkflowArtifactKindV1::ImplementationPlan,
@@ -1666,7 +1678,7 @@ impl WorkflowArtifactGraphV1 {
                 .metadata(&artifact.implementation_plan)
                 .is_none_or(|item| item.kind != WorkflowArtifactKindV1::ImplementationPlan)
         {
-            return Err("task graphのfeature specまたはplanがgraphにありません".into());
+            return Err("The task graph feature spec or plan is missing from the graph".into());
         }
         self.insert_metadata(WorkflowArtifactMetadataV1::from_task_graph(artifact))
     }
@@ -1678,31 +1690,31 @@ impl WorkflowArtifactGraphV1 {
             return if existing == &metadata {
                 Ok(false)
             } else {
-                Err("同じartifact参照のmetadataが異なります".into())
+                Err("Different metadata for the same artifact reference".into())
             };
         }
         match self.latest(&reference.id) {
             None if reference.revision != 1 || metadata.header.supersedes.is_some() => {
-                return Err("最初のartifact revisionが不正です".into());
+                return Err("Invalid initial artifact revision".into());
             }
             Some(previous)
                 if reference.revision != previous.header.revision.saturating_add(1)
                     || metadata.header.supersedes.as_ref() != Some(&previous.reference()) =>
             {
-                return Err("artifact revisionまたは置換元が連続していません".into());
+                return Err("Artifact revision or replacement chain is not contiguous".into());
             }
             _ => {}
         }
         for source in &metadata.header.created_from {
             if !self.contains(source) {
-                return Err("workflow artifactの出典がgraphにありません".into());
+                return Err("The workflow artifact source is missing from the graph".into());
             }
         }
         self.artifacts.push(metadata);
         self.revision = self
             .revision
             .checked_add(1)
-            .ok_or("artifact graph revisionが上限に達しました")?;
+            .ok_or("Artifact graph revision limit reached")?;
         self.validate()?;
         Ok(true)
     }
@@ -1723,11 +1735,11 @@ impl WorkflowArtifactGraphV1 {
                 return Ok(());
             }
             if !visiting.insert(reference.clone()) {
-                return Err("workflow artifact graphにcycleがあります".into());
+                return Err("The workflow artifact graph contains a cycle".into());
             }
             let item = entries
                 .get(reference)
-                .ok_or("workflow artifact graphにdangling参照があります")?;
+                .ok_or("The workflow artifact graph contains a dangling reference")?;
             for source in item
                 .header
                 .created_from
@@ -1755,17 +1767,19 @@ impl WorkflowArtifactGraphV1 {
         reference.validate()?;
         let artifact = self
             .metadata(reference)
-            .ok_or("active change contractがartifact graphにありません")?;
+            .ok_or("The active change contract is missing from the artifact graph")?;
         if self.latest(&reference.id).map(|item| item.reference()) != Some(reference.clone()) {
-            return Err("active change contractは現行revisionではありません".into());
+            return Err("The active change contract is not the current revision".into());
         }
         if artifact.kind != WorkflowArtifactKindV1::ChangeContract
             || artifact.header.status != ArtifactStatusV1::Approved
         {
-            return Err("active change contractは承認済みではありません".into());
+            return Err("The active change contract is not approved".into());
         }
         if let Some(reason) = artifact.eligibility.blocker() {
-            return Err(format!("change contractは完全仕様経路が必要です: {reason}"));
+            return Err(format!(
+                "The change contract requires the full-spec path: {reason}"
+            ));
         }
         Ok(artifact)
     }
@@ -1787,7 +1801,7 @@ fn revise_header(header: &mut ArtifactHeaderV1, status: ArtifactStatusV1) -> Res
     header.revision = header
         .revision
         .checked_add(1)
-        .ok_or("artifact revisionが上限に達しました")?;
+        .ok_or("Artifact revision limit reached")?;
     header.supersedes = Some(previous);
     header.status = status;
     header.content_hash.clear();
@@ -1796,17 +1810,17 @@ fn revise_header(header: &mut ArtifactHeaderV1, status: ArtifactStatusV1) -> Res
 
 fn validate_common_artifact(version: u32, header: &ArtifactHeaderV1) -> Result<(), String> {
     if version != WORKFLOW_ARTIFACT_SCHEMA_VERSION {
-        return Err("未対応のworkflow artifact保存形式です".into());
+        return Err("Unsupported workflow artifact storage format".into());
     }
     header.validate()
 }
 
 fn canonical_artifact_hash<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
-    let mut value = serde_json::to_value(value).map_err(|_| "artifactを正規化できません")?;
+    let mut value = serde_json::to_value(value).map_err(|_| "Cannot canonicalize the artifact")?;
     value
         .get_mut("header")
         .and_then(serde_json::Value::as_object_mut)
-        .ok_or("artifact headerを正規化できません")?
+        .ok_or("Cannot canonicalize the artifact header")?
         .insert(
             "content_hash".into(),
             serde_json::Value::String(String::new()),
@@ -1815,14 +1829,14 @@ fn canonical_artifact_hash<T: Serialize>(domain: &str, value: &T) -> Result<Stri
 }
 
 fn hash_serialized<T: Serialize>(value: &T) -> Result<String, String> {
-    let bytes = serde_json::to_vec(value).map_err(|_| "artifactを正規化できません")?;
+    let bytes = serde_json::to_vec(value).map_err(|_| "Cannot canonicalize the artifact")?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn validate_body_size<T: Serialize>(value: &T) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map_err(|_| "workflow artifactを保存できません")?;
+    let bytes = serde_json::to_vec(value).map_err(|_| "Cannot save the workflow artifact")?;
     if bytes.len() > MAX_WORKFLOW_ARTIFACT_BODY_BYTES {
-        Err("workflow artifact本文が上限を超えました".into())
+        Err("Workflow artifact body exceeds the limit".into())
     } else {
         Ok(())
     }
@@ -1830,7 +1844,7 @@ fn validate_body_size<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn stable_record_id(prefix: &str, seed: &str) -> Result<String, String> {
     if !valid_text(seed, MAX_CONTRACT_FIELD_BYTES) {
-        return Err("stable IDのseedが不正です".into());
+        return Err("Invalid stable ID seed".into());
     }
     let normalized = seed.split_whitespace().collect::<Vec<_>>().join(" ");
     let digest = format!("{:x}", Sha256::digest(normalized.as_bytes()));
@@ -1841,7 +1855,7 @@ fn reject_duplicate_ids<'a>(ids: impl Iterator<Item = &'a str>, label: &str) -> 
     let mut seen = BTreeSet::new();
     for id in ids {
         if !seen.insert(id) {
-            return Err(format!("{label} IDが重複しています"));
+            return Err(format!("Duplicate {label} ID"));
         }
     }
     Ok(())
@@ -1858,7 +1872,7 @@ fn ensure_task_graph_acyclic(tasks: &BTreeMap<&str, &TaskDefinitionV1>) -> Resul
             return Ok(());
         }
         if !visiting.insert(id) {
-            return Err("task graphにdependency cycleがあります".into());
+            return Err("The task graph contains a dependency cycle".into());
         }
         for dependency in &tasks.get(id).expect("validated task").dependencies {
             visit(dependency, tasks, visiting, visited)?;
@@ -1879,7 +1893,7 @@ pub fn validate_hash(hash: &str) -> Result<(), String> {
     if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err("artifact hashが不正です".into())
+        Err("Invalid artifact hash".into())
     }
 }
 
@@ -1890,7 +1904,7 @@ fn validate_artifact_id(id: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return Err("artifact IDが不正です".into());
+        return Err("Invalid artifact ID".into());
     }
     Ok(())
 }

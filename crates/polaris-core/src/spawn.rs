@@ -412,9 +412,9 @@ pub(crate) async fn resolved_type(
     // which case saying so keeps the judge from picking that same wrong
     // name back out of a description that happens to echo it.
     let instructions = match named {
-        None => format!("この依頼を任せるのに合う型はどれか。\n依頼: {task}"),
+        None => format!("Which type is appropriate for delegating this request?\nRequest: {task}"),
         Some(named) => format!(
-            "この依頼を任せるのに合う型はどれか。指定された型名 {named:?} はこの一覧に無い。\n依頼: {task}"
+            "Which type is appropriate for delegating this request? The specified type {named:?} is not in this list.\nRequest: {task}"
         ),
     };
     let questions = BTreeMap::from([(
@@ -425,7 +425,7 @@ pub(crate) async fn resolved_type(
         },
     )]);
     let state = serde_json::json!({
-        "purpose": "依頼に合う型を一覧から選ぶ",
+        "purpose": "Select an appropriate type from the list for this request",
     });
     let counted = crate::budget::count_tokens(&state.to_string())
         + questions

@@ -98,21 +98,21 @@ impl BoundFile {
         let metadata = self
             .file
             .metadata()
-            .map_err(|_| "保持したsource descriptorを確認できません")?;
+            .map_err(|_| "Cannot verify the retained source descriptor")?;
         let named = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&self.path)
-            .map_err(|_| "保持したsource pathを再確認できません")?;
+            .map_err(|_| "Cannot reverify the retained source path")?;
         if Stamp::of(&metadata) != self.stamp
             || Stamp::of(
                 &named
                     .metadata()
-                    .map_err(|_| "source pathを確認できません")?,
+                    .map_err(|_| "Cannot verify the source path")?,
             ) != self.stamp
             || hash_file(&self.file, metadata.len())? != self.sha256
         {
-            return Err("確認中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during confirmation".into());
         }
         Ok(())
     }
@@ -152,16 +152,14 @@ impl UnitySourceBinding {
                 .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
             || source
                 .canonicalize()
-                .map_err(|_| "Unity sourceを確認できません")?
+                .map_err(|_| "Cannot verify Unity source")?
                 != source
         {
-            return Err("Unity sourceはcanonicalな絶対directoryで指定してください".into());
+            return Err("Specify Unity source as a canonical absolute directory".into());
         }
         let (root, ancestors) = tree_admission::open_root_with_ancestors(source)
-            .map_err(|_| "Unity sourceをdescriptorで開けません")?;
-        let root_metadata = root
-            .metadata()
-            .map_err(|_| "Unity sourceを確認できません")?;
+            .map_err(|_| "Cannot open Unity source by descriptor")?;
+        let root_metadata = root.metadata().map_err(|_| "Cannot verify Unity source")?;
         require_owned(&root_metadata, true)?;
         let protection = Protection::capture(source)?;
         protection.check(source, &root_metadata)?;
@@ -178,29 +176,33 @@ impl UnitySourceBinding {
                 script_sha256,
                 ..
             } => (command, args, executable_sha256, script, script_sha256),
-            _ => return Err("Unity presetは既存stdio登録だけを更新できます".into()),
+            _ => {
+                return Err(
+                    "The Unity preset can update only an existing stdio registration".into(),
+                );
+            }
         };
         if args.len() != 1 || Path::new(&args[0]) != entry_path {
-            return Err("既存Unity登録のsource/entry bindingが一致しません".into());
+            return Err("Existing Unity registration source or entry binding mismatch".into());
         }
         if script.as_deref().is_some_and(|script| script != entry_path)
             || script.is_some() != script_sha256.is_some()
         {
-            return Err("既存Unity登録のentry pinが一致しません".into());
+            return Err("Existing Unity registration entry pin mismatch".into());
         }
         let node_expected = executable_sha256
             .as_deref()
-            .ok_or("既存Unity登録にnode digestがありません")?;
+            .ok_or("Existing Unity registration has no node digest")?;
         let node = inspect_external(command, true, &protection)?;
         if node.sha256 != node_expected {
-            return Err("既存Unity登録のnode digestが一致しません".into());
+            return Err("Existing Unity registration node digest mismatch".into());
         }
         let entry_digest = entry_digest(&scan.manifest)?;
         if script_sha256
             .as_deref()
             .is_some_and(|entry_expected| entry_digest != entry_expected)
         {
-            return Err("既存Unity登録のentry digestが一致しません".into());
+            return Err("Existing Unity registration entry digest mismatch".into());
         }
 
         let mut retained = vec![PathBuf::from(PACKAGE), PathBuf::from(ENTRY)];
@@ -287,13 +289,13 @@ impl UnitySourceBinding {
             ..
         } = &mut server.transport
         else {
-            return Err("Unity presetは既存stdio登録だけを更新できます".into());
+            return Err("The Unity preset can update only an existing stdio registration".into());
         };
         self.node.verify()?;
         let new_entry = destination.join(ENTRY);
         let new_entry_argument = new_entry
             .to_str()
-            .ok_or("Unity runtime entry pathを文字列として表現できません")?
+            .ok_or("Cannot represent the Unity runtime entry path as a string")?
             .to_owned();
         *args = vec![new_entry_argument];
         *cwd = destination.to_owned();
@@ -305,7 +307,7 @@ impl UnitySourceBinding {
         server.protocol_profile = ProtocolProfile::Auto2024Compat;
         server
             .validate()
-            .map_err(|_| "Unity MCPの更新内容が無効です".into())
+            .map_err(|_| "Invalid Unity MCP update".into())
     }
 
     pub(super) fn revalidate(&self) -> Result<(), String> {
@@ -317,21 +319,21 @@ impl UnitySourceBinding {
                 .node
                 .file
                 .metadata()
-                .map_err(|_| "nodeを確認できません")?,
+                .map_err(|_| "Cannot verify node")?,
         )?;
         for file in &self.held {
             file.verify()?;
         }
         let (_, current) = tree_admission::open_root_with_ancestors(&self.source)
-            .map_err(|_| "Unity sourceのnamespaceを再確認できません")?;
+            .map_err(|_| "Cannot reverify the Unity source namespace")?;
         if current != self.ancestors {
-            return Err("確認中にUnity sourceのnamespaceが変更されました".into());
+            return Err("Unity source namespace changed during confirmation".into());
         }
         let current = scan(&self.source, &self.root, &protection)?;
         if current.manifest != self.manifest
             || manifest_hash(&current.manifest)? != self.manifest_sha256
         {
-            return Err("確認中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during confirmation".into());
         }
         Ok(())
     }
@@ -344,11 +346,11 @@ impl UnitySourceBinding {
         let mut current = self
             .root
             .try_clone()
-            .map_err(|_| "source descriptorを複製できません")?;
+            .map_err(|_| "Cannot duplicate the source descriptor")?;
         let components: Vec<_> = relative.components().collect();
         for (index, component) in components.iter().enumerate() {
             let Component::Normal(name) = component else {
-                return Err("source relative pathが無効です".into());
+                return Err("Invalid source relative path".into());
             };
             current = tree_admission::open_at(
                 &current,
@@ -356,7 +358,7 @@ impl UnitySourceBinding {
                 index + 1 != components.len(),
                 &self.source.join(relative),
             )
-            .map_err(|_| "source fileを再度開けません")?;
+            .map_err(|_| "Cannot reopen the source file")?;
         }
         Ok(current)
     }
@@ -373,14 +375,14 @@ impl Protection {
         let (paths, identities) = polaris_auth::protection::with_protected_paths(|snapshot| {
             (snapshot.paths().clone(), snapshot.identities().clone())
         })
-        .map_err(|_| "保護対象を確認できません")?;
+        .map_err(|_| "Cannot verify protected resources")?;
         let value = Self { paths, identities };
         if value
             .paths
             .iter()
             .any(|path| path.starts_with(root) || root.starts_with(path))
         {
-            return Err("Unity sourceが保護対象と重なっています".into());
+            return Err("Unity source overlaps protected resources".into());
         }
         Ok(value)
     }
@@ -398,16 +400,14 @@ impl Protection {
                     ino: metadata.ino(),
                 })
         {
-            return Err("Unity sourceに保護対象が含まれています".into());
+            return Err("Unity source contains protected resources".into());
         }
         Ok(())
     }
 }
 
 pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Result<Scan, String> {
-    let root_metadata = root
-        .metadata()
-        .map_err(|_| "Unity sourceを確認できません")?;
+    let root_metadata = root.metadata().map_err(|_| "Cannot verify Unity source")?;
     require_owned(&root_metadata, true)?;
     protection.check(root_path, &root_metadata)?;
     let names = directory_names(root, MAX_ENTRIES)?;
@@ -422,7 +422,7 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
         OsStr::new("node_modules"),
     ] {
         if !names.iter().any(|name| name == required) {
-            return Err("Unity sourceに必要なpackage/build/node_modulesがありません".into());
+            return Err("Unity source lacks required package/build/node_modules content".into());
         }
     }
     let mut state = WalkState {
@@ -451,7 +451,7 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
             .entries
             .iter()
             .find(|entry| entry.relative == path)
-            .ok_or_else(|| "Unity sourceのesbuild pairが不足しています".to_owned())
+            .ok_or_else(|| "Unity source is missing the esbuild pair".to_owned())
     });
     let [left, right] = pair_entries;
     let left = left?;
@@ -466,15 +466,14 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
         || right.stamp.bytes != ESBUILD_BYTES
         || left.sha256 != right.sha256
     {
-        return Err("Unity sourceのesbuild hardlink pairが承認条件と一致しません".into());
+        return Err(
+            "Unity source esbuild hardlink pair does not meet the approved conditions".into(),
+        );
     }
-    if Stamp::of(
-        &root
-            .metadata()
-            .map_err(|_| "Unity sourceを確認できません")?,
-    ) != Stamp::of(&root_metadata)
+    if Stamp::of(&root.metadata().map_err(|_| "Cannot verify Unity source")?)
+        != Stamp::of(&root_metadata)
     {
-        return Err("scan中にUnity source rootが変更されました".into());
+        return Err("Unity source root changed during scanning".into());
     }
     let manifest = SourceManifest {
         root: Stamp::of(&root_metadata),
@@ -486,7 +485,7 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
         fixed_exclusions: state.fixed_exclusions.into_iter().collect(),
     };
     if entry_digest(&manifest).is_err() {
-        return Err("Unity sourceにbuild/index.jsがありません".into());
+        return Err("Unity source has no build/index.js".into());
     }
     Ok(Scan {
         manifest,
@@ -515,7 +514,7 @@ impl WalkState<'_> {
         depth: usize,
     ) -> Result<(), String> {
         if self.count >= MAX_ENTRIES || depth > MAX_DEPTH {
-            return Err("Unity sourceがscan上限を超えています".into());
+            return Err("Unity source exceeds scan limits".into());
         }
         self.count += 1;
         let relative = relative_parent.join(name);
@@ -526,34 +525,32 @@ impl WalkState<'_> {
         {
             let metadata = lstat_at(parent, name)?;
             if metadata.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
-                return Err("node_modules/.binがdirectoryではありません".into());
+                return Err("node_modules/.bin is not a directory".into());
             }
             self.fixed_exclusions.insert(relative_bytes);
             return Ok(());
         }
         let path = self.root_path.join(&relative);
         if path_policy::is_denied(&path) || tree_admission::is_repository_metadata(&path) {
-            return Err("Unity sourceに秘密名またはrepository metadataがあります".into());
+            return Err("Unity source contains secret names or repository metadata".into());
         }
         let classified = lstat_at(parent, name)?;
         let kind = classified.mode & libc::S_IFMT as u32;
         if kind != libc::S_IFREG as u32 && kind != libc::S_IFDIR as u32 {
-            return Err("Unity sourceにlinkまたは特殊fileがあります".into());
+            return Err("Unity source contains links or special files".into());
         }
         let directory = kind == libc::S_IFDIR as u32;
         let mut file = tree_admission::open_at(parent, name, directory, &path)
-            .map_err(|_| "Unity sourceをdescriptorで開けません")?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "Unity sourceを確認できません")?;
+            .map_err(|_| "Cannot open Unity source by descriptor")?;
+        let metadata = file.metadata().map_err(|_| "Cannot verify Unity source")?;
         if !classified.matches(&metadata) {
-            return Err("scan中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during scanning".into());
         }
         require_owned(&metadata, directory)?;
         self.protection.check(&path, &metadata)?;
         let exact_pair = PAIR.iter().any(|pair| relative == Path::new(pair));
         if !directory && metadata.nlink() != if exact_pair { 2 } else { 1 } {
-            return Err("Unity sourceに許可されていないhardlinkがあります".into());
+            return Err("Unity source contains an unauthorized hardlink".into());
         }
         if let Some(first) = self
             .identities
@@ -562,7 +559,7 @@ impl WalkState<'_> {
             let valid_pair = PAIR.iter().any(|pair| first == pair.as_bytes())
                 && PAIR.iter().any(|pair| relative_bytes == pair.as_bytes());
             if !valid_pair {
-                return Err("Unity sourceに重複inodeがあります".into());
+                return Err("Unity source contains duplicate inodes".into());
             }
         }
         if directory {
@@ -570,13 +567,10 @@ impl WalkState<'_> {
             for child in names {
                 self.walk_named(&file, &relative, &child, depth + 1)?;
             }
-            if Stamp::of(
-                &file
-                    .metadata()
-                    .map_err(|_| "Unity sourceを確認できません")?,
-            ) != Stamp::of(&metadata)
+            if Stamp::of(&file.metadata().map_err(|_| "Cannot verify Unity source")?)
+                != Stamp::of(&metadata)
             {
-                return Err("scan中にUnity sourceが変更されました".into());
+                return Err("Unity source changed during scanning".into());
             }
             self.entries.push(ManifestEntry {
                 relative: relative_bytes,
@@ -589,16 +583,13 @@ impl WalkState<'_> {
                 || metadata.len() > MAX_FILE_BYTES
                 || metadata.len() > MAX_TOTAL_BYTES.saturating_sub(self.bytes)
             {
-                return Err("Unity sourceがcopy上限を超えています".into());
+                return Err("Unity source exceeds copy limits".into());
             }
             let sha256 = hash_reader(&mut file, metadata.len())?;
-            if Stamp::of(
-                &file
-                    .metadata()
-                    .map_err(|_| "Unity sourceを確認できません")?,
-            ) != Stamp::of(&metadata)
+            if Stamp::of(&file.metadata().map_err(|_| "Cannot verify Unity source")?)
+                != Stamp::of(&metadata)
             {
-                return Err("scan中にUnity sourceが変更されました".into());
+                return Err("Unity source changed during scanning".into());
             }
             self.files += 1;
             self.bytes += metadata.len();
@@ -618,16 +609,15 @@ fn inspect_external(
     executable: bool,
     protection: &Protection,
 ) -> Result<BoundFile, String> {
-    if !path.is_absolute() || path.canonicalize().map_err(|_| "nodeを確認できません")? != path
-    {
-        return Err("nodeはcanonicalな絶対fileである必要があります".into());
+    if !path.is_absolute() || path.canonicalize().map_err(|_| "Cannot verify node")? != path {
+        return Err("node must be a canonical absolute file".into());
     }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|_| "nodeをdescriptorで開けません")?;
-    let metadata = file.metadata().map_err(|_| "nodeを確認できません")?;
+        .map_err(|_| "Cannot open node by descriptor")?;
+    let metadata = file.metadata().map_err(|_| "Cannot verify node")?;
     protection.check(path, &metadata)?;
     let owner = unsafe { libc::geteuid() };
     if !metadata.is_file()
@@ -638,7 +628,7 @@ fn inspect_external(
         || metadata.len() == 0
         || metadata.len() > 256 * 1024 * 1024
     {
-        return Err("nodeの所有・permission・種別が無効です".into());
+        return Err("Invalid node ownership, permissions, or type".into());
     }
     let sha256 = hash_file(&file, metadata.len())?;
     Ok(BoundFile {
@@ -657,11 +647,11 @@ fn bind_relative(
 ) -> Result<BoundFile, String> {
     let mut current = root
         .try_clone()
-        .map_err(|_| "source descriptorを複製できません")?;
+        .map_err(|_| "Cannot duplicate the source descriptor")?;
     let components: Vec<_> = relative.components().collect();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
-            return Err("source relative pathが無効です".into());
+            return Err("Invalid source relative path".into());
         };
         current = tree_admission::open_at(
             &current,
@@ -669,20 +659,20 @@ fn bind_relative(
             index + 1 != components.len(),
             &root_path.join(relative),
         )
-        .map_err(|_| "source descriptorを保持できません")?;
+        .map_err(|_| "Cannot retain the source descriptor")?;
     }
     let relative_bytes = relative.as_os_str().as_bytes();
     let evidence = manifest
         .entries
         .iter()
         .find(|entry| entry.relative == relative_bytes && !entry.directory)
-        .ok_or("source manifestに必要fileがありません")?;
+        .ok_or("The source manifest lacks a required file")?;
     let metadata = current
         .metadata()
-        .map_err(|_| "source fileを確認できません")?;
+        .map_err(|_| "Cannot verify the source file")?;
     let sha256 = hash_file(&current, metadata.len())?;
     if Stamp::of(&metadata) != evidence.stamp || evidence.sha256.as_deref() != Some(&sha256) {
-        return Err("source fileがscan結果と一致しません".into());
+        return Err("The source file does not match scan results".into());
     }
     Ok(BoundFile {
         path: root_path.join(relative),
@@ -698,7 +688,7 @@ fn require_owned(metadata: &Metadata, directory: bool) -> Result<(), String> {
         || (directory && !metadata.is_dir())
         || (!directory && !metadata.is_file())
     {
-        return Err("Unity sourceの所有・permission・種別が無効です".into());
+        return Err("Invalid Unity source ownership, permissions, or type".into());
     }
     Ok(())
 }
@@ -725,7 +715,7 @@ impl Classified {
 }
 
 fn lstat_at(parent: &File, name: &OsStr) -> Result<Classified, String> {
-    let name = CString::new(name.as_bytes()).map_err(|_| "source pathが無効です")?;
+    let name = CString::new(name.as_bytes()).map_err(|_| "Invalid source path")?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
         libc::fstatat(
@@ -736,7 +726,7 @@ fn lstat_at(parent: &File, name: &OsStr) -> Result<Classified, String> {
         )
     } != 0
     {
-        return Err("Unity sourceを確認できません".into());
+        return Err("Cannot verify Unity source".into());
     }
     let stat = unsafe { stat.assume_init() };
     #[cfg(target_os = "linux")]
@@ -762,12 +752,12 @@ fn directory_names(directory: &File, limit: usize) -> Result<Vec<OsString>, Stri
         )
     };
     if fd < 0 {
-        return Err("Unity source directoryを開けません".into());
+        return Err("Cannot open the Unity source directory".into());
     }
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         unsafe { libc::close(fd) };
-        return Err("Unity source directoryを列挙できません".into());
+        return Err("Cannot enumerate the Unity source directory".into());
     }
     struct Dir(*mut libc::DIR);
     impl Drop for Dir {
@@ -781,7 +771,7 @@ fn directory_names(directory: &File, limit: usize) -> Result<Vec<OsString>, Stri
         let mut entry = std::mem::MaybeUninit::<libc::dirent>::uninit();
         let mut found = std::ptr::null_mut();
         if unsafe { libc::readdir_r(stream.0, entry.as_mut_ptr(), &mut found) } != 0 {
-            return Err("Unity source directoryを列挙できません".into());
+            return Err("Cannot enumerate the Unity source directory".into());
         }
         if found.is_null() {
             break;
@@ -791,7 +781,7 @@ fn directory_names(directory: &File, limit: usize) -> Result<Vec<OsString>, Stri
             continue;
         }
         if result.len() >= limit {
-            return Err("Unity sourceがscan上限を超えています".into());
+            return Err("Unity source exceeds scan limits".into());
         }
         result.push(OsString::from_vec(name.to_vec()));
     }
@@ -802,7 +792,7 @@ fn directory_names(directory: &File, limit: usize) -> Result<Vec<OsString>, Stri
 fn hash_file(file: &File, expected: u64) -> Result<String, String> {
     let mut reader = file
         .try_clone()
-        .map_err(|_| "file descriptorを複製できません")?;
+        .map_err(|_| "Cannot duplicate the file descriptor")?;
     hash_reader(&mut reader, expected)
 }
 
@@ -810,31 +800,31 @@ fn hash_reader(reader: &mut File, expected: u64) -> Result<String, String> {
     use std::io::{Seek, SeekFrom};
     reader
         .seek(SeekFrom::Start(0))
-        .map_err(|_| "fileを読めません")?;
+        .map_err(|_| "Cannot read the file")?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
-        let count = reader.read(&mut buffer).map_err(|_| "fileを読めません")?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| "Cannot read the file")?;
         if count == 0 {
             break;
         }
-        total = total
-            .checked_add(count as u64)
-            .ok_or("file sizeが無効です")?;
+        total = total.checked_add(count as u64).ok_or("Invalid file size")?;
         if total > expected {
-            return Err("読取り中にfileが変更されました".into());
+            return Err("The file changed during reading".into());
         }
         hash.update(&buffer[..count]);
     }
     if total != expected {
-        return Err("読取り中にfileが変更されました".into());
+        return Err("The file changed during reading".into());
     }
     Ok(format!("{:x}", hash.finalize()))
 }
 
 fn manifest_hash(manifest: &SourceManifest) -> Result<String, String> {
-    let bytes = serde_json::to_vec(manifest).map_err(|_| "source manifestを作成できません")?;
+    let bytes = serde_json::to_vec(manifest).map_err(|_| "Cannot create the source manifest")?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -844,7 +834,7 @@ fn entry_digest(manifest: &SourceManifest) -> Result<&str, String> {
         .iter()
         .find(|entry| entry.relative == ENTRY.as_bytes() && !entry.directory)
         .and_then(|entry| entry.sha256.as_deref())
-        .ok_or_else(|| "Unity entryを確認できません".into())
+        .ok_or_else(|| "Cannot verify the Unity entry".into())
 }
 
 fn hardlink_pair_digest(manifest: &SourceManifest) -> Result<&str, String> {
@@ -853,5 +843,5 @@ fn hardlink_pair_digest(manifest: &SourceManifest) -> Result<&str, String> {
         .iter()
         .find(|entry| entry.relative == PAIR[0].as_bytes() && !entry.directory)
         .and_then(|entry| entry.sha256.as_deref())
-        .ok_or_else(|| "Unity sourceにesbuild pairがありません".into())
+        .ok_or_else(|| "Unity source has no esbuild pair".into())
 }

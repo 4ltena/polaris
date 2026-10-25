@@ -257,8 +257,8 @@ async fn the_question_asks_what_is_useful_rather_than_what_finishes_the_job() {
     let Question::Noul { instructions } = question("依頼", "skill", "名前", "説明") else {
         panic!("candidates are asked about with a Noul");
     };
-    assert!(instructions.contains("役に立つか"), "{instructions}");
-    assert!(!instructions.contains("達成するか"), "{instructions}");
+    assert!(instructions.contains("helpful"), "{instructions}");
+    assert!(!instructions.contains("achieve"), "{instructions}");
     assert!(
         instructions.contains("skill"),
         "the kind names what is judged"

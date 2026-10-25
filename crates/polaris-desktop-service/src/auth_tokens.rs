@@ -83,7 +83,7 @@ impl TokenSource for UnboundAccountTokens {
 
 fn auth_error() -> ProviderError {
     ProviderError::Auth(
-        "Polarisの認証情報を確認できません。設定から接続を確認してください。".into(),
+        "Cannot verify Polaris credentials. Check the connection in Settings.".into(),
     )
 }
 

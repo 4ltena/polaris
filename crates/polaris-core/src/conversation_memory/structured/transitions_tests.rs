@@ -204,7 +204,7 @@ fn structured_summary_only_intent_preserves_targets_but_rejects_new_rows() {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "構造化候補のsourceが抽出範囲外です",
+            "The structured candidate source is outside the extraction range",
             "{key}"
         );
     }
@@ -600,7 +600,10 @@ fn structured_cross_kind_relationships_require_explicit_resolved_user_evidence()
     let error =
         validate_response_with_resolver(&covered, 1, &empty, &relation_only.to_string(), &resolver)
             .unwrap_err();
-    assert_eq!(error.to_string(), "構造化候補のsourceが抽出範囲外です");
+    assert_eq!(
+        error.to_string(),
+        "The structured candidate source is outside the extraction range"
+    );
     for relation in ["owns", "belongs_to", "distinct_from", "execute"] {
         let mut delta = result.delta.clone();
         delta.relations[0].relation = relation.into();

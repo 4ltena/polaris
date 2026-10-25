@@ -93,7 +93,7 @@ fn near_miss(body: &str) -> String {
     let mut named: Vec<String> = found;
     named.sort();
     named.dedup();
-    format!("\n{missing} は無いが、{} はある。", named.join("、"))
+    format!("\n{missing} is missing, but {} exists.", named.join("、"))
 }
 
 /// When the output exceeds the cap, cut it at a character boundary and state
@@ -274,7 +274,7 @@ mod near_miss_tests {
             said.contains("python3"),
             "python3 is on PATH here: {said:?}"
         );
-        assert!(said.contains("python は無いが"));
+        assert!(said.contains("python is missing"));
     }
 
     /// Nothing is said unless a real entry on PATH starts with the missing

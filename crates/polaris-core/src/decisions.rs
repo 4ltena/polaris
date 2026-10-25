@@ -42,7 +42,7 @@ pub const SECTION_LIMIT: usize = 192;
 pub const PATH: &str = ".polaris/decisions.csv";
 
 /// The heading the matches are put under.
-pub const HEADING: &str = "## 既に決めたかもしれないこと";
+pub const HEADING: &str = "## Possibly settled decisions";
 
 /// One settled question.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +138,7 @@ pub fn append(root: &Path, at: &str, what: &str) -> std::io::Result<()> {
     if what.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "決めたことが空です",
+            "The decision is empty",
         ));
     }
     #[cfg(unix)]
@@ -154,13 +154,13 @@ pub fn append(root: &Path, at: &str, what: &str) -> std::io::Result<()> {
         if what.len() > 8192 || at.len() > 64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "決定事項が上限を超えています",
+                "Decisions exceed the limit",
             ));
         }
         let denied = || {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "決定台帳を安全に開けません",
+                "Cannot safely open the decision ledger",
             )
         };
         let root = std::fs::canonicalize(root)?;
@@ -245,7 +245,7 @@ pub fn append(root: &Path, at: &str, what: &str) -> std::io::Result<()> {
             if file.metadata()?.len().saturating_add(record.len() as u64) > 1024 * 1024 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "決定台帳が1MiBを超えます",
+                    "The decision ledger exceeds 1 MiB",
                 ));
             }
             // Verify every named binding immediately before mutation and after
@@ -320,8 +320,7 @@ pub fn section(matched: &[&Entry]) -> Option<String> {
 fn question(query: &str, entry: &Entry) -> polaris_provider::decision::Question {
     polaris_provider::decision::Question::Noul {
         instructions: format!(
-            "いま始めようとしている検討は、過去に決めたこの件と同じ問いか。\
-             いま: {query} / 過去（{}）: {}",
+            "Is the question being considered now the same as this past decision? Current: {query} / past ({}): {}",
             entry.at, entry.what
         ),
     }

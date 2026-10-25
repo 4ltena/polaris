@@ -50,58 +50,58 @@ macro_rules! axis {
     };
 }
 
-axis!(Utterance, "utterance", "この発話は何をしているか", {
-    Instruction => "instruction", "やることを指示している",
-    Proposal => "proposal", "案を出していて、採否はまだ決まっていない",
-    Question => "question", "答えを求めていて、作業は求めていない",
-    Correction => "correction", "直前の理解や成果の誤りを正している",
-    Approval => "approval", "示した案や計画を承認している",
-    Feedback => "feedback", "評価や感想で、次の行動を指定していない",
-    StatusRequest => "status_request", "今どうなっているかを訊いている",
-    Pause => "pause", "止めるよう求めている",
-    Resume => "resume", "再開するよう求めている",
-    Cancel => "cancel", "取り消すよう求めている",
+axis!(Utterance, "utterance", "What is this utterance doing?", {
+    Instruction => "instruction", "Directing work to be done",
+    Proposal => "proposal", "Proposing an option whose adoption is undecided",
+    Question => "question", "Seeking an answer without requesting work",
+    Correction => "correction", "Correcting an error in the previous understanding or result",
+    Approval => "approval", "Approving a presented proposal or plan",
+    Feedback => "feedback", "Giving feedback without specifying the next action",
+    StatusRequest => "status_request", "Asking about current status",
+    Pause => "pause", "Requesting a stop",
+    Resume => "resume", "Requesting a resumption",
+    Cancel => "cancel", "Requesting cancellation",
 });
 
-axis!(Work, "work", "どの種類の作業か", {
-    BugFix => "bug_fix", "壊れている振る舞いを直す",
-    FeatureAdd => "feature_add", "無かった機能を足す",
-    FeatureChange => "feature_change", "ある機能の振る舞いを変える",
-    Refactor => "refactor", "振る舞いを変えずに構造を直す",
-    Investigation => "investigation", "調べて事実を出す",
-    Verification => "verification", "既にあるものを確かめる",
-    Documentation => "documentation", "文書を書く",
-    Release => "release", "公開の工程",
-    Configuration => "configuration", "設定を変える",
-    Operation => "operation", "運用上の操作",
+axis!(Work, "work", "What kind of work is this?", {
+    BugFix => "bug_fix", "Fix broken behavior",
+    FeatureAdd => "feature_add", "Add a new capability",
+    FeatureChange => "feature_change", "Change existing behavior",
+    Refactor => "refactor", "Restructure without changing behavior",
+    Investigation => "investigation", "Investigate and report facts",
+    Verification => "verification", "Verify existing work",
+    Documentation => "documentation", "Write documentation",
+    Release => "release", "Perform release work",
+    Configuration => "configuration", "Change configuration",
+    Operation => "operation", "Perform an operational action",
 });
 
-axis!(Clarity, "clarity", "何をすべきかが決まるか", {
-    Clear => "clear", "そのまま実行できる",
-    Inferable => "inferable", "既存のコードと決定から一意に決まる",
-    MateriallyAmbiguous => "materially_ambiguous", "同等に妥当な選択肢が複数あり、決めないと違う完成形になる",
-    Conflicting => "conflicting", "現在有効な決定と衝突している",
+axis!(Clarity, "clarity", "Is the required action determined?", {
+    Clear => "clear", "Executable as stated",
+    Inferable => "inferable", "Uniquely determined by existing code and decisions",
+    MateriallyAmbiguous => "materially_ambiguous", "Multiple equally valid choices produce different outcomes; a decision is required",
+    Conflicting => "conflicting", "Conflicts with a currently valid decision",
 });
 
-axis!(Relation, "relation", "今の作業との関係", {
-    Continue => "continue", "今の作業の続き",
-    ScopeExpand => "scope_expand", "今の作業の範囲を広げる",
-    Replace => "replace", "今の作業を別のものへ置き換える",
-    SideTopic => "side_topic", "別の話題",
+axis!(Relation, "relation", "Relationship to current work", {
+    Continue => "continue", "Continue current work",
+    ScopeExpand => "scope_expand", "Expand the scope of current work",
+    Replace => "replace", "Replace current work with different work",
+    SideTopic => "side_topic", "A separate topic",
 });
 
-axis!(Approach, "approach", "利用者が期待している進め方", {
-    ExecuteNow => "execute_now", "すぐ実行してよい",
-    DesignFirst => "design_first", "先に設計や計画を示す",
-    AnswerOnly => "answer_only", "答えるだけでよい",
-    AwaitUser => "await_user", "利用者の回答を待つ",
+axis!(Approach, "approach", "The user's expected approach", {
+    ExecuteNow => "execute_now", "Proceed immediately",
+    DesignFirst => "design_first", "Present a design or plan first",
+    AnswerOnly => "answer_only", "Answer only",
+    AwaitUser => "await_user", "Wait for the user's response",
 });
 
-axis!(Effort, "effort", "このturnの作業に必要な推論量", {
-    Low => "low", "機械的または局所的で、手順と正解がほぼ決まっている",
-    Medium => "medium", "通常の調査や数fileの実装と、焦点を絞った検証が必要",
-    High => "high", "複数componentの整合、難しい原因分析、または慎重な設計判断が必要",
-    XHigh => "xhigh", "広範囲で相互依存が強く、失敗影響も大きい複数段階の推論が必要",
+axis!(Effort, "effort", "Reasoning required for this turn", {
+    Low => "low", "Mechanical or local; the steps and answer are largely determined",
+    Medium => "medium", "Requires ordinary investigation or implementation across a few files, with focused verification",
+    High => "high", "Requires cross-component consistency, difficult diagnosis, or careful design decisions",
+    XHigh => "xhigh", "Requires broad, strongly interdependent, multistage reasoning with significant failure impact",
 });
 
 /// Where the turn goes. Chosen by [`route_for`], never asked for.

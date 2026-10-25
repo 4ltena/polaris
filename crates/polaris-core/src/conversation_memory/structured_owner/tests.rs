@@ -120,7 +120,7 @@ fn intent_is_durable_once_and_saved_result_resumes_without_advancing_generation(
     let mut sends = usize::from(first.newly_started);
     let reopened = ConversationStore::open(temp.path(), "project", ID).unwrap();
     let unknown = begin_structured_summary(&reopened, &db, &source, 1).unwrap_err();
-    assert!(unknown.to_string().contains("再送しません"));
+    assert!(unknown.to_string().contains("will not be resent"));
     let response = response(&first);
     save_structured_summary_response(&reopened, &db, &source, 1, &response).unwrap();
     let saved_bytes = fs::read(receipt(&store, 0, 1)).unwrap();
@@ -207,7 +207,12 @@ fn intent_failures_never_return_dispatch_and_rename_without_sync_stays_unknown()
         );
         let retry = begin_structured_summary(&store, &db, &source, 1);
         if has_receipt {
-            assert!(retry.unwrap_err().to_string().contains("再送しません"));
+            assert!(
+                retry
+                    .unwrap_err()
+                    .to_string()
+                    .contains("will not be resent")
+            );
         } else {
             assert!(retry.unwrap().newly_started);
         }

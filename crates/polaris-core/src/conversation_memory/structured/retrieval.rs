@@ -28,7 +28,7 @@ pub fn retrieve_state_evidence(
     let evidence = selected
         .evidence
         .as_mut()
-        .ok_or_else(|| io::Error::other("構造化記憶の識別根拠がありません"))?;
+        .ok_or_else(|| io::Error::other("Missing structured memory identity evidence"))?;
     if unknown_state_anchor(evidence, related, &selected.matched_aliases, query)? {
         selected.selection = IdentitySelection::NotFound;
         selected.evidence = None;
@@ -117,7 +117,9 @@ fn explicit_identifiers(text: &str) -> io::Result<BTreeSet<String>> {
         }
     }
     if result.len() > 128 {
-        return Err(io::Error::other("構造化問合せの識別子が上限を超えました"));
+        return Err(io::Error::other(
+            "Structured query identifiers exceed the limit",
+        ));
     }
     Ok(result)
 }
@@ -197,7 +199,9 @@ fn filter_and_rank(
             }
         }
         if facts.len() > 64 || entities.len() > 64 {
-            return Err(io::Error::other("構造化記憶の関連状態が上限を超えました"));
+            return Err(io::Error::other(
+                "Structured memory related state exceeds the limit",
+            ));
         }
         if before == facts.len() {
             break;
@@ -205,14 +209,18 @@ fn filter_and_rank(
     }
     evidence.facts.retain(|f| facts.contains(&f.row.fact_id));
     if evidence.facts.len() != facts.len() {
-        return Err(io::Error::other("構造化記憶の依存状態がありません"));
+        return Err(io::Error::other(
+            "Missing structured memory dependency state",
+        ));
     }
     entities.extend(evidence.facts.iter().map(|f| f.row.entity_id.clone()));
     evidence
         .entities
         .retain(|e| entities.contains(&e.row.revision.entity_id));
     if entities.len() > 64 || evidence.entities.len() != entities.len() {
-        return Err(io::Error::other("構造化記憶の関連辞書がありません"));
+        return Err(io::Error::other(
+            "Missing structured memory related dictionary",
+        ));
     }
     evidence
         .aliases
@@ -244,7 +252,9 @@ fn filter_and_rank(
         .iter()
         .any(|f| scope_rank(&f.publication) == usize::MAX)
     {
-        return Err(io::Error::other("構造化記憶の状態が許可scope外です"));
+        return Err(io::Error::other(
+            "Structured memory state is outside the allowed scope",
+        ));
     }
     evidence.facts.sort_by(|a, b| {
         let key =

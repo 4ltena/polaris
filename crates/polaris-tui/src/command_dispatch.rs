@@ -61,6 +61,29 @@ pub(super) async fn dispatch<B: Backend, R: KeyReader>(
     let (workspace, effects) = management;
     let (cwd, state_dir) = paths;
     match action {
+        slash::Action::Environment(request) => {
+            #[cfg(target_os = "macos")]
+            let result = crate::environment_commands::handle(
+                request,
+                cwd,
+                terminal,
+                reader,
+                workspace,
+                effects,
+                mcp.1,
+                has_pending,
+            )
+            .await;
+            #[cfg(not(target_os = "macos"))]
+            let result: Result<Vec<Line<'static>>, String> = {
+                let _ = request;
+                Err("Environment setup currently supports macOS arm64".into())
+            };
+            Some(match result {
+                Ok(lines) => CommandDispatchResult::success(lines, "Environment result displayed"),
+                Err(error) => CommandDispatchResult::error(error),
+            })
+        }
         slash::Action::SessionControl(request) => Some(
             match session_commands::handle(
                 request,
@@ -76,7 +99,7 @@ pub(super) async fn dispatch<B: Backend, R: KeyReader>(
             ) {
                 Ok(result) => CommandDispatchResult {
                     lines: result.lines,
-                    status: Status::Notice("セッション操作の結果を表示しました".into()),
+                    status: Status::Notice("Session operation result displayed".into()),
                     settings_changed: result.settings_changed,
                     invalidate_mcp_prompt: false,
                 },
@@ -104,7 +127,7 @@ pub(super) async fn dispatch<B: Backend, R: KeyReader>(
                 .await
                 {
                     Ok(lines) => {
-                        CommandDispatchResult::success(lines, "メモリ操作の結果を表示しました")
+                        CommandDispatchResult::success(lines, "Memory operation result displayed")
                     }
                     Err(error) => CommandDispatchResult::error(error),
                 },
@@ -124,7 +147,7 @@ pub(super) async fn dispatch<B: Backend, R: KeyReader>(
             {
                 Ok(lines) => {
                     let mut result =
-                        CommandDispatchResult::success(lines, "MCP操作の結果を表示しました");
+                        CommandDispatchResult::success(lines, "MCP operation result displayed");
                     result.invalidate_mcp_prompt = matches!(
                         request.split_whitespace().next(),
                         Some(

@@ -51,13 +51,13 @@ pub struct CorpusTask {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorpusError {
-    #[error("コーパスを読めません: {0}")]
+    #[error("Cannot read the corpus: {0}")]
     Io(#[from] std::io::Error),
-    #[error("コーパスの形が違います: {0}")]
+    #[error("Invalid corpus structure: {0}")]
     Malformed(#[from] serde_json::Error),
-    #[error("コーパスのschema_versionが{0}です。1しか読めません")]
+    #[error("Corpus schema_version is {0}; only 1 is supported")]
     UnsupportedVersion(u32),
-    #[error("課題{task}の正解{tool}がカタログにありません")]
+    #[error("Task {task} references answer {tool}, which is missing from the catalog")]
     UnknownLabel { task: String, tool: String },
 }
 

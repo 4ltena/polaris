@@ -28,7 +28,7 @@ pub const NEXT_JS: &[Template] = &[
     },
     Template {
         path: "app/page.tsx",
-        body: "export default function Page() {\n  return <main>準備ができました。</main>;\n}\n",
+        body: "export default function Page() {\n  return <main>Ready.</main>;\n}\n",
     },
 ];
 

@@ -111,7 +111,9 @@ impl ReadOnlyView {
             buffer: String::new(),
             cursor: 0,
             history: input::History::new(),
-            status: Status::Notice("閲覧専用です。/help で利用できる操作を確認できます".into()),
+            status: Status::Notice(
+                "Browsing only. Use /help to inspect available operations".into(),
+            ),
             scroll: 0,
             selected: 0,
             exit: ExitConfirmation { armed: false },
@@ -133,8 +135,8 @@ impl ReadOnlyView {
     fn draw<B: Backend>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<(), String> {
         let cwd = display_text(&self.cwd.display().to_string());
         let header = render::HeaderInfo {
-            provider_name: "未接続",
-            model_name: "未選択",
+            provider_name: "disconnected",
+            model_name: "not selected",
             effort_name: "",
             usage: polaris_provider::Usage::default(),
             cwd: &cwd,
@@ -176,7 +178,8 @@ impl ReadOnlyView {
                 self.selected = 0;
                 if redact_inline_secret_value(&mut self.buffer, &mut self.cursor, &mut self.history)
                 {
-                    self.status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+                    self.status =
+                        Status::Error("Secrets cannot be entered in the normal input field".into());
                 }
                 false
             }
@@ -202,14 +205,15 @@ impl ReadOnlyView {
             return false;
         }
         if secret_value_key_is_blocked(&self.buffer, &key) {
-            self.status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+            self.status =
+                Status::Error("Secrets cannot be entered in the normal input field".into());
             return false;
         }
         if key.code == KeyCode::Enter && is_secret_command(&self.buffer) {
             self.buffer.zeroize();
             self.cursor = 0;
             self.history.clear_draft();
-            self.status = Status::Error("このTUIでは秘密情報の設定を受け付けていません".into());
+            self.status = Status::Error("This TUI does not accept secret configuration".into());
             return false;
         }
         let suggestions = self.suggestions();
@@ -259,8 +263,9 @@ impl ReadOnlyView {
                             &mut self.cursor,
                             &mut self.history,
                         ) {
-                            self.status =
-                                Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+                            self.status = Status::Error(
+                                "Secrets cannot be entered in the normal input field".into(),
+                            );
                         }
                     }
                     Err(error) => self.status = Status::Error(error.into()),
@@ -278,7 +283,7 @@ impl ReadOnlyView {
         if matches!(action, slash::Action::Quit) {
             if self.history.has_hidden_draft() {
                 self.status = Status::Error(
-                    "履歴の背後に下書きがあります。戻してから終了してください".into(),
+                    "A draft is behind the history view. Restore it before exiting".into(),
                 );
                 return false;
             }
@@ -302,7 +307,7 @@ impl ReadOnlyView {
                     }));
                 self.wrap_cache.invalidate();
                 self.status =
-                    Status::Notice("閲覧結果を表示しました。保存・送信は行っていません".into());
+                    Status::Notice("Browsing result displayed. Nothing was saved or sent".into());
             }
             Err(error) => self.status = Status::Error(error),
         }
@@ -319,7 +324,6 @@ fn supported(action: &slash::Action) -> bool {
             | slash::Action::Pwd
             | slash::Action::Compare(_)
             | slash::Action::Quit
-            | slash::Action::WebSearch(_)
             | slash::Action::Phase(_)
             | slash::Action::Workflow(_)
             | slash::Action::Decided(_)
@@ -351,11 +355,11 @@ fn command_lines(action: &slash::Action, cwd: &Path) -> Result<Vec<String>, Stri
             .map(|command| format!("/{} — {}", command.name, command.description))
             .collect(),
         slash::Action::Status | slash::Action::Doctor => vec![
-            "Windows 閲覧専用".into(),
-            "モデル接続・会話・保存: 未開始".into(),
-            "認証・MCP・保存済みセッション: 未読込 (Windowsの保護機構は未対応)".into(),
-            "通常入力・変更・子プロセス実行: 未対応のため拒否".into(),
-            "この画面では保存・送信・外部コマンド実行を行いません".into(),
+            "Windows browsing only".into(),
+            "Model connection, conversation, storage: not started".into(),
+            "Authentication, MCP, saved sessions: not loaded (Windows protection mechanisms unsupported)".into(),
+            "Normal input, changes, subprocess execution: denied as unsupported".into(),
+            "This screen does not save, send, or run external commands".into(),
         ],
         slash::Action::Pwd => vec![
             polaris_core::project::resolve_root(cwd)
@@ -371,10 +375,7 @@ fn command_lines(action: &slash::Action, cwd: &Path) -> Result<Vec<String>, Stri
                 .map(|lines| lines.iter().map(ToString::to_string).collect());
         }
         slash::Action::Phase(value) | slash::Action::Workflow(value) if value.is_empty() => {
-            vec!["会話は開始していません。保存済みworkflowは読み込んでいません".into()]
-        }
-        slash::Action::WebSearch(value) if matches!(value.as_str(), "" | "status" | "disabled") => {
-            vec!["Web検索: disabled。モデル接続は開始していません".into()]
+            vec!["No conversation started. Saved workflow is not loaded".into()]
         }
         _ => return Err(WINDOWS_OWNER_UNAVAILABLE.into()),
     };

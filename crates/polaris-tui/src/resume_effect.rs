@@ -110,7 +110,7 @@ impl ResumeSubjectV1<'_> {
                     || snapshot.raw_hash != polaris_core::conversation_state::content_hash(&raw)
                     || snapshot.raw_offset != raw.len() as u64
                 {
-                    return Err("選択した保存セッションが変更されました".into());
+                    return Err("The selected saved session changed".into());
                 }
                 let project = persist::project_identity(Path::new(&snapshot.state.project_id))
                     .map_err(|e| e.to_string())?;
@@ -118,7 +118,7 @@ impl ResumeSubjectV1<'_> {
                     || directory.file_name().and_then(|n| n.to_str())
                         != Some(snapshot.state.session_id.as_str())
                 {
-                    return Err("選択したセッションのプロジェクトまたはIDが一致しません".into());
+                    return Err("Selected session project or ID mismatch".into());
                 }
                 Ok(ResumeIdentityV1 {
                     project: ManagementEffectHashV1::digest(project.as_bytes()),
@@ -137,12 +137,12 @@ impl ResumeSubjectV1<'_> {
                 if project != project_id
                     || path.extension().and_then(|s| s.to_str()) != Some("jsonl")
                 {
-                    return Err("旧セッションのプロジェクトまたは保存形式が一致しません".into());
+                    return Err("Legacy session project or storage format mismatch".into());
                 }
                 let id = path
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .ok_or("旧セッションIDが不正です")?;
+                    .ok_or("Invalid legacy session ID")?;
                 polaris_memory::management::validate_session_id(id).map_err(|e| e.to_string())?;
                 let meta = read_bounded_session_file(
                     &path.with_extension("meta.json"),
@@ -151,12 +151,12 @@ impl ResumeSubjectV1<'_> {
                     limits.max_total_bytes,
                 )
                 .map_err(|e| e.to_string())?;
-                let parsed: persist::SessionMeta = serde_json::from_slice(&meta)
-                    .map_err(|_| "旧セッションのメタデータが不正です")?;
+                let parsed: persist::SessionMeta =
+                    serde_json::from_slice(&meta).map_err(|_| "Invalid legacy session metadata")?;
                 let saved_project =
                     persist::project_identity(Path::new(&parsed.cwd)).map_err(|e| e.to_string())?;
                 if saved_project != project {
-                    return Err("別プロジェクトの保存セッションは選択できません".into());
+                    return Err("Cannot select a saved session from another project".into());
                 }
                 let raw = read_bounded_session_file(
                     path,
@@ -198,14 +198,14 @@ impl ResumeSelectionOwnerV1<'_> {
         selected: ResumeSubjectV1<'_>,
     ) -> Result<PreparedResumeSelectionV1, String> {
         if self.lease.store_root() != self.effects.state_dir().join("rewind-workspace") {
-            return Err("セッション選択のproject leaseが一致しません".into());
+            return Err("Session selection project lease mismatch".into());
         }
         let from = previous.map(ResumeSubjectV1::identity).transpose()?;
         let to = selected.identity()?;
         if to.project != self.effects.project_scope_hash()
             || from.as_ref().is_some_and(|from| from.project != to.project)
         {
-            return Err("セッション選択のプロジェクトが一致しません".into());
+            return Err("Session selection project mismatch".into());
         }
         let request_hash = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&(inventory, &from, &to)).map_err(|e| e.to_string())?,
@@ -235,7 +235,7 @@ impl ResumeSelectionOwnerV1<'_> {
         {
             PrepareManagementEffectOutcomeV1::Prepared(effect) => effect,
             PrepareManagementEffectOutcomeV1::Existing(_) => {
-                return Err("既存のセッション選択結果は未確定です".into());
+                return Err("The existing session selection outcome is unresolved".into());
             }
         };
         Ok(PreparedResumeSelectionV1 { from, to, effect })
@@ -277,7 +277,7 @@ impl ResumeSelectionOwnerV1<'_> {
                         ManagementDenialReasonV1::StaleRequest,
                     )
                     .map_err(|e| e.to_string())?;
-                return Err("選択したセッションまたは現在の会話が変更されました".into());
+                return Err("The selected session or current conversation changed".into());
             }
             Err(error) => {
                 self.effects
@@ -326,7 +326,7 @@ impl ResumeSelectionOwnerV1<'_> {
                 )
                 .map_err(|e| e.to_string())?;
             return Err(format!(
-                "セッション選択の結果は不明です。再選択前に管理操作を確認してください: {error}"
+                "Session selection outcome is unknown. Inspect management operations before selecting again: {error}"
             ));
         }
         Ok(true)

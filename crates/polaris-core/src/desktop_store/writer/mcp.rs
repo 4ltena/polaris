@@ -691,7 +691,11 @@ pub(in crate::desktop_store) fn validate_transition(
                         && (old.terminal.is_none() || old.terminal == new.terminal)
                         && (op.result_id.is_none()
                             || current.unwrap().result_id == op.result_id) => {}
-                _ => return Err(StoreError::Corrupt("MCP操作証拠の変更・削除")),
+                _ => {
+                    return Err(StoreError::Corrupt(
+                        "MCP operation evidence changed or deleted",
+                    ));
+                }
             }
         }
     }
@@ -707,14 +711,14 @@ pub(in crate::desktop_store) fn validate_state(state: &Sidecar) -> StoreResult<(
             let proof = &saved.intent;
             proof
                 .validate()
-                .map_err(|_| StoreError::Corrupt("MCP操作証拠"))?;
+                .map_err(|_| StoreError::Corrupt("MCP operation evidence"))?;
             if proof.run_id != record.run.run_id.as_str()
                 || proof.attempt_id != record.run.attempt_id.as_str()
                 || proof.operation_id != op.operation_id.as_str()
                 || proof.policy_revision != record.policy_revision.get()
                 || saved.terminal.is_some() != op.result_id.is_some()
             {
-                return Err(StoreError::Corrupt("MCP操作の対応"));
+                return Err(StoreError::Corrupt("MCP operation association"));
             }
             let approval = state
                 .approval_records
@@ -722,10 +726,10 @@ pub(in crate::desktop_store) fn validate_state(state: &Sidecar) -> StoreResult<(
                 .find(|a| a.pending.operation_id == op.operation_id);
             if proof.resource.is_some() {
                 if approval.is_some() {
-                    return Err(StoreError::Corrupt("MCP読取りとtool承認の混同"));
+                    return Err(StoreError::Corrupt("MCP read confused with tool approval"));
                 }
             } else {
-                let approval = approval.ok_or(StoreError::Corrupt("MCP承認証拠"))?;
+                let approval = approval.ok_or(StoreError::Corrupt("MCP approval evidence"))?;
                 let a = &approval.pending;
                 if a.run_id != record.run.run_id
                     || a.attempt_id != record.run.attempt_id
@@ -737,12 +741,14 @@ pub(in crate::desktop_store) fn validate_state(state: &Sidecar) -> StoreResult<(
                     || a.policy_revision.get() != proof.policy_revision
                     || a.expires_at_unix_ms.get() != proof.expires_at_ms
                 {
-                    return Err(StoreError::Corrupt("MCP承認・操作の対応"));
+                    return Err(StoreError::Corrupt(
+                        "MCP approval and operation association",
+                    ));
                 }
             }
             if let Some(terminal) = &saved.terminal {
                 if op.result_id.as_ref() != Some(&result_id(&terminal.envelope_hash)?) {
-                    return Err(StoreError::Corrupt("MCP結果IDの対応"));
+                    return Err(StoreError::Corrupt("MCP result ID association"));
                 }
                 if (terminal.disposition == McpDisposition::OutcomeUnknown
                     && record.run.state.is_terminal()
@@ -772,7 +778,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
             };
             let proof = &saved.intent;
             if proof.resource.is_some() && proof.target != p.marker.project_id.as_str() {
-                return Err(StoreError::Corrupt("MCP読取りprojectの対応"));
+                return Err(StoreError::Corrupt("MCP read project association"));
             }
             check_call(&suffix, proof, saved.terminal.is_some())?;
             if let Some(terminal) = &saved.terminal {
@@ -783,14 +789,14 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                 if message.content.len() > MAX_VISIBLE_BYTES
                     || content_hash(message.content.as_bytes()) != terminal.envelope_hash
                 {
-                    return Err(StoreError::Corrupt("MCP結果hash"));
+                    return Err(StoreError::Corrupt("MCP result hash"));
                 }
                 let envelope: Envelope = serde_json::from_str(&message.content)?;
                 if envelope.intent != *proof
                     || envelope.disposition != terminal.disposition
                     || serde_json::to_string(&envelope)? != message.content
                 {
-                    return Err(StoreError::Corrupt("MCP結果の出典・形式"));
+                    return Err(StoreError::Corrupt("MCP result source or format"));
                 }
                 validate_envelope(&envelope)?;
             }

@@ -134,9 +134,7 @@ fn configure_tool_memory_inner(
             || opened.uid() != effective_uid()
             || opened.permissions().mode() & 0o022 != 0
         {
-            return Err(io::Error::other(
-                "記憶保存先の所有者または状態が変わりました",
-            ));
+            return Err(io::Error::other("Memory storage owner or state changed"));
         }
         if opened.permissions().mode() & 0o077 != 0 {
             directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
@@ -182,7 +180,7 @@ fn validate_session_ids(current_session_id: &str, origins: &[String]) -> io::Res
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         {
-            return Err(io::Error::other("記憶セッションIDが不正です"));
+            return Err(io::Error::other("Invalid memory session ID"));
         }
     }
     Ok(())
@@ -190,7 +188,7 @@ fn validate_session_ids(current_session_id: &str, origins: &[String]) -> io::Res
 
 fn validate_raw_ids(ids: &[String]) -> io::Result<BTreeSet<String>> {
     if ids.iter().any(|id| !is_raw_id(id)) {
-        return Err(io::Error::other("記憶原文IDが不正です"));
+        return Err(io::Error::other("Invalid memory source ID"));
     }
     Ok(ids.iter().cloned().collect())
 }
@@ -218,7 +216,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(io::Error::other(
-            "保存先に親ディレクトリ参照は指定できません",
+            "Storage paths cannot contain parent-directory references",
         ));
     }
     let absolute = if state.is_absolute() {
@@ -230,7 +228,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
                 return Err(io::Error::other(
-                    "記憶保存先の経路にリンクまたは非ディレクトリがあります",
+                    "The memory storage path contains a link or non-directory",
                 ));
             }
             Ok(meta) => {
@@ -240,7 +238,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
                     let mode = meta.permissions().mode();
                     if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && meta.uid() == 0) {
                         return Err(io::Error::other(
-                            "記憶保存先の経路が他ユーザーから書込み可能です",
+                            "The memory storage path is writable by other users",
                         ));
                     }
                 }
@@ -260,7 +258,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
             };
             if meta.uid() != effective_uid() || meta.permissions().mode() & forbidden != 0 {
                 return Err(io::Error::other(
-                    "記憶保存先は所有者専用のディレクトリにしてください（権限は変更しません）",
+                    "Memory storage must be an owner-only directory (permissions are not changed)",
                 ));
             }
         }
@@ -276,7 +274,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
             Ok(meta) => {
                 if !meta.is_file() || meta.file_type().is_symlink() {
                     return Err(io::Error::other(
-                        "記憶ファイルにリンクまたは非通常ファイルがあります",
+                        "A memory file is a link or non-regular file",
                     ));
                 }
                 #[cfg(unix)]
@@ -286,9 +284,7 @@ fn check_paths(state: &Path, allow_readable_directory: bool) -> io::Result<()> {
                         || meta.nlink() != 1
                         || meta.permissions().mode() & 0o077 != 0
                     {
-                        return Err(io::Error::other(
-                            "記憶ファイルが共有されているため開けません",
-                        ));
+                        return Err(io::Error::other("Cannot open a shared memory file"));
                     }
                 }
             }
@@ -325,7 +321,9 @@ impl Backend {
                 .is_session_forgotten(&self.project, session)
                 .map_err(io::Error::other)?
             {
-                return Err(io::Error::other("削除済みセッションの記憶は利用できません"));
+                return Err(io::Error::other(
+                    "Memory from a deleted session is unavailable",
+                ));
             }
         }
         Ok(store)
@@ -402,15 +400,12 @@ impl Backend {
                 return Ok(record);
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "記憶が見つかりません",
-        ))
+        Err(io::Error::new(io::ErrorKind::NotFound, "Memory not found"))
     }
     fn insert(&self, store: &mut MemoryStore, record: &Record) -> io::Result<bool> {
         if record.project_id != self.project || record.session_id != self.session {
             return Err(io::Error::other(
-                "記憶の書込み先が現セッションではありません",
+                "The memory write destination is not the current session",
             ));
         }
         if let Some(old) = store
@@ -418,7 +413,7 @@ impl Backend {
             .map_err(io::Error::other)?
         {
             if old.text != record.text || old.role != record.role || old.source != record.source {
-                return Err(io::Error::other("同じ記憶IDの内容が一致しません"));
+                return Err(io::Error::other("Different content for the same memory ID"));
             }
             return Ok(false);
         }
@@ -489,7 +484,7 @@ impl Backend {
             }
         }
         if self.get(&store, &id, RAW)?.text != text {
-            return Err(io::Error::other("記憶原文の再読取検証に失敗しました"));
+            return Err(io::Error::other("Memory source reread verification failed"));
         }
         Ok((id, added))
     }
@@ -573,9 +568,10 @@ impl Backend {
         }
         let mut hits: Vec<_> = ranked.into_values().collect();
         hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
-        let mut output = format!("{diagnostic}\n一致箇所の抜粋（全件・全文ではありません）\n");
+        let mut output =
+            format!("{diagnostic}\nExcerpts of matches (not all matches or full text)\n");
         if vector.is_some() && semantic_count == 0 {
-            output.push_str("利用可能な意味検索候補なし：キーワード検索へフォールバック\n");
+            output.push_str("No usable semantic candidates: falling back to keyword search\n");
         }
         let mut seen = std::collections::HashSet::new();
         for (hit, _) in hits {
@@ -603,11 +599,13 @@ impl Backend {
                 let first = raw.text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
                 let last = first + raw.text[start..end].bytes().filter(|&b| b == b'\n').count();
                 let row = format!(
-                    "memory://{raw_id}/bytes/{start}\n保存本文の行{first}–{last}（抜粋）\n{}\n",
+                    "memory://{raw_id}/bytes/{start}\nSaved body lines {first}–{last} (excerpt)\n{}\n",
                     &raw.text[start..end]
                 );
                 if output.len() + row.len() > 4000 {
-                    output.push_str("追加の候補を省略。必要なら原文を取得。\n");
+                    output.push_str(
+                        "Additional candidates omitted. Retrieve the original text if needed.\n",
+                    );
                     return Ok(output);
                 }
                 output.push_str(&row);
@@ -623,13 +621,13 @@ impl Backend {
         let raw = self.get(&store, id, RAW).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "指定した記憶IDは現プロジェクトまたは許可された祖先にありません",
+                "The specified memory ID is not in the current project or an allowed ancestor",
             )
         })?;
         let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         let lower = raw.text.to_lowercase();
         let mut output = format!(
-            "記録限定キーワード検索\nmemory://{id}\n一致箇所の抜粋（全件・全文ではありません）\n"
+            "Record-scoped keyword search\nmemory://{id}\nExcerpts of matches (not all matches or full text)\n"
         );
         if terms.is_empty() || !terms.iter().all(|term| lower.contains(term)) {
             return Ok(output);
@@ -638,11 +636,13 @@ impl Backend {
             let first = raw.text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
             let last = first + raw.text[start..end].bytes().filter(|&b| b == b'\n').count();
             let row = format!(
-                "memory://{id}/bytes/{start}\n保存本文の行{first}–{last}（抜粋）\n{}\n",
+                "memory://{id}/bytes/{start}\nSaved body lines {first}–{last} (excerpt)\n{}\n",
                 &raw.text[start..end]
             );
             if output.len() + row.len() > 4000 {
-                output.push_str("追加の候補を省略。必要なら原文を取得。\n");
+                output.push_str(
+                    "Additional candidates omitted. Retrieve the original text if needed.\n",
+                );
                 break;
             }
             output.push_str(&row);
@@ -662,7 +662,7 @@ impl ToolMemoryBackend for Backend {
                 for chunk in chunks {
                     let vector = encoder.encode(&chunk.text).await.map_err(|_| {
                         io::Error::other(
-                            "原文は保存済みですが埋め込みに失敗しました。全文を維持します",
+                            "Original text saved, but embedding failed. Full text is retained",
                         )
                     })?;
                     let _lock = self.lock()?;
@@ -678,7 +678,7 @@ impl ToolMemoryBackend for Backend {
                 let _lock = self.lock()?;
                 let store = self.store()?;
                 if self.get(&store, &id, RAW)?.text != text {
-                    return Err(io::Error::other("記憶原文が一致しません"));
+                    return Err(io::Error::other("Memory source mismatch"));
                 }
             }
             Ok(SavedToolResult {
@@ -697,10 +697,10 @@ impl ToolMemoryBackend for Backend {
         Box::pin(async move {
             let target = path
                 .strip_prefix("memory://")
-                .ok_or_else(|| io::Error::other("記憶URIが不正です"))?;
+                .ok_or_else(|| io::Error::other("Invalid memory URI"))?;
             if let Some(query) = target.strip_prefix("search/") {
                 if query.is_empty() || query.len() > 4096 {
-                    return Err(io::Error::other("検索語は1〜4096バイトで指定してください"));
+                    return Err(io::Error::other("Specify a search query of 1–4096 bytes"));
                 }
                 // Check tombstones before sending any query to the encoder, too.
                 {
@@ -709,24 +709,24 @@ impl ToolMemoryBackend for Backend {
                 }
                 let vector = match &self.embedding {
                     Some(e) => e.encode(query).await,
-                    None => Err(io::Error::other("未設定")),
+                    None => Err(io::Error::other("not configured")),
                 };
                 let label = if vector.is_ok() {
-                    "ハイブリッド検索"
+                    "hybrid search"
                 } else if self.embedding.is_some() {
-                    "埋め込み失敗：キーワード検索へフォールバック"
+                    "embedding failed: falling back to keyword search"
                 } else {
-                    "キーワード検索（埋め込み未設定）"
+                    "keyword search (embedding not configured)"
                 };
                 return self.search(query, vector.as_ref().ok(), label);
             }
             if let Some((id, query)) = target.split_once("/search/") {
                 if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(io::Error::other("原文IDが不正です"));
+                    return Err(io::Error::other("Invalid source ID"));
                 }
                 if query.trim().is_empty() || query.len() > 4096 {
                     return Err(io::Error::other(
-                        "記録限定検索語は1〜4096バイトで指定してください",
+                        "Specify a record-scoped search query of 1–4096 bytes",
                     ));
                 }
                 return self.search_scoped(id, query);
@@ -736,7 +736,7 @@ impl ToolMemoryBackend for Backend {
                 None => (target, 0),
             };
             if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(io::Error::other("原文IDが不正です"));
+                return Err(io::Error::other("Invalid source ID"));
             }
             let _lock = self.lock()?;
             let store = self.store()?;
@@ -841,7 +841,7 @@ fn bounded_read(
     byte: usize,
 ) -> io::Result<String> {
     if byte > text.len() || !text.is_char_boundary(byte) {
-        return Err(io::Error::other("UTF-8の取得位置が不正です"));
+        return Err(io::Error::other("Invalid UTF-8 retrieval offset"));
     }
     if limit == 0 {
         return Ok(String::new());
@@ -861,7 +861,7 @@ fn bounded_read(
     let end = floor(text, end_lines.min(start.saturating_add(PAYLOAD)));
     let mut result = text[start..end].to_owned();
     if end < text.len() {
-        result.push_str(&format!("\n[続き: memory://{id}/bytes/{end}]\n"));
+        result.push_str(&format!("\n[Continue: memory://{id}/bytes/{end}]\n"));
     }
     Ok(result)
 }
@@ -878,7 +878,7 @@ pub struct Encoder {
 impl Encoder {
     pub fn new(base: &str, model: String) -> io::Result<Self> {
         let mut url =
-            url::Url::parse(base).map_err(|_| io::Error::other("埋め込みURLが不正です"))?;
+            url::Url::parse(base).map_err(|_| io::Error::other("Invalid embedding URL"))?;
         let local = match url.host_str() {
             Some("localhost") => true,
             Some(host) => host
@@ -897,7 +897,7 @@ impl Encoder {
             || model.len() > 1024
         {
             return Err(io::Error::other(
-                "埋め込みには認証情報を含まないループバックURLとモデルを指定してください",
+                "Specify a credential-free loopback URL and model for embeddings",
             ));
         }
         // Pin localhost to a literal address; never delegate its resolution to DNS.
@@ -935,16 +935,16 @@ impl Encoder {
             .await
             .map_err(io::Error::other)?;
         if !response.status().is_success() {
-            return Err(io::Error::other("埋め込みHTTP要求に失敗しました"));
+            return Err(io::Error::other("Embedding HTTP request failed"));
         }
         const MAX: usize = 1024 * 1024;
         if response.content_length().is_some_and(|n| n > MAX as u64) {
-            return Err(io::Error::other("埋め込み応答が上限を超えました"));
+            return Err(io::Error::other("Embedding response exceeds the limit"));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
             if bytes.len() + chunk.len() > MAX {
-                return Err(io::Error::other("埋め込み応答が上限を超えました"));
+                return Err(io::Error::other("Embedding response exceeds the limit"));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -977,7 +977,7 @@ fn decode_embedding(bytes: &[u8], model: &str) -> io::Result<Embedding> {
     let body: serde_json::Value = serde_json::from_slice(bytes).map_err(io::Error::other)?;
     let values: Vec<f32> = serde_json::from_value(
         body.pointer("/data/0/embedding")
-            .ok_or_else(|| io::Error::other("埋め込み応答がありません"))?
+            .ok_or_else(|| io::Error::other("No embedding response"))?
             .clone(),
     )
     .map_err(io::Error::other)?;
@@ -986,7 +986,7 @@ fn decode_embedding(bytes: &[u8], model: &str) -> io::Result<Embedding> {
         || values.iter().any(|v| !v.is_finite())
         || values.iter().all(|v| *v == 0.0)
     {
-        return Err(io::Error::other("埋め込みベクトルが不正です"));
+        return Err(io::Error::other("Invalid embedding vector"));
     }
     Ok(Embedding {
         model: model.into(),
@@ -1058,7 +1058,7 @@ mod tests {
             .read(&format!("memory://{}", saved.id), 0, 100)
             .await
             .unwrap();
-        assert!(read.len() <= 4096 && read.contains("[続き:"));
+        assert!(read.len() <= 4096 && read.contains("[Continue:"));
         let search = backend.read("memory://search/needle", 0, 20).await.unwrap();
         assert!(search.contains(&saved.id) && search.contains("needle"));
     }
@@ -1099,7 +1099,7 @@ mod tests {
         loop {
             let page = backend.read(&uri, 0, 1).await.unwrap();
             assert!(page.len() <= 4096);
-            if let Some((body, trailer)) = page.rsplit_once("\n[続き: ") {
+            if let Some((body, trailer)) = page.rsplit_once("\n[Continue: ") {
                 restored.push_str(body);
                 uri = trailer.strip_suffix("]\n").unwrap().to_owned();
                 assert!(uri.starts_with(&format!("memory://{}/bytes/", saved.id)));
@@ -1125,7 +1125,7 @@ mod tests {
         loop {
             let page = bounded_read(&text, &"a".repeat(64), 0, 100, byte).unwrap();
             assert!(page.len() <= 4096);
-            if let Some((body, continuation)) = page.rsplit_once("\n[続き: ") {
+            if let Some((body, continuation)) = page.rsplit_once("\n[Continue: ") {
                 restored.push_str(body);
                 let next = continuation
                     .split("/bytes/")
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(restored, text);
         assert_eq!(
             bounded_read("one\ntwo\nthree", "id", 1, 1, 0).unwrap(),
-            "two\n\n[続き: memory://id/bytes/8]\n"
+            "two\n\n[Continue: memory://id/bytes/8]\n"
         );
         assert!(bounded_read("日本", "id", 0, 1, 1).is_err());
         assert_eq!(bounded_read("one", "id", usize::MAX, 1, 0).unwrap(), "");
@@ -1346,19 +1346,19 @@ mod tests {
                 .is_empty()
         );
         let result = backend
-            .search("unmatched", Some(&vector), "ハイブリッド検索")
+            .search("unmatched", Some(&vector), "hybrid search")
             .unwrap();
         assert!(result.contains(&id) && result.contains("意味で取得する原文"));
-        assert!(!result.contains("フォールバック"));
+        assert!(!result.contains("falling back"));
         let unknown = Embedding {
             model: "unknown".into(),
             values: vec![1.0],
         };
         assert!(
             backend
-                .search("原文", Some(&unknown), "ハイブリッド検索")
+                .search("原文", Some(&unknown), "hybrid search")
                 .unwrap()
-                .contains("フォールバック")
+                .contains("falling back")
         );
     }
 
@@ -1654,7 +1654,7 @@ mod tests {
         assert!(lexical.contains(&before.id) && lexical.contains(&own.id));
         assert!(!lexical.contains(&after.id) && !lexical.contains("later origin"));
         let semantic = child
-            .search("unmatched", Some(&vector), "ハイブリッド検索")
+            .search("unmatched", Some(&vector), "hybrid search")
             .unwrap();
         assert!(semantic.contains(&before.id));
         assert!(!semantic.contains(&after.id) && !semantic.contains("later origin"));
@@ -1692,7 +1692,7 @@ mod tests {
         assert!(restarted_lexical.contains(&before.id));
         assert!(!restarted_lexical.contains(&after.id));
         let restarted_semantic = restarted
-            .search("unmatched", Some(&vector), "ハイブリッド検索")
+            .search("unmatched", Some(&vector), "hybrid search")
             .unwrap();
         assert!(restarted_semantic.contains(&before.id));
         assert!(!restarted_semantic.contains(&after.id));

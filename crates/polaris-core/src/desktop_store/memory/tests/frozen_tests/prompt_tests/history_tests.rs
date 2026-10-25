@@ -98,7 +98,9 @@ fn request_history_rejects_changed_inherited_message_after_restart() {
     let before = bytes(&path);
     assert!(matches!(
         child.project_request_history(&target),
-        Err(StoreError::Corrupt("継承原文と固定親の不一致"))
+        Err(StoreError::Corrupt(
+            "Inherited source text does not match the pinned parent"
+        ))
     ));
     assert_eq!(bytes(&path), before);
 }

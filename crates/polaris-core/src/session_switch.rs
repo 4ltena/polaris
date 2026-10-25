@@ -46,13 +46,13 @@ struct SwitchDescriptor {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionSwitchError {
-    #[error("管理操作の記録: {0}")]
+    #[error("Management operation record: {0}")]
     Effect(#[from] ManagementEffectStoreError),
-    #[error("会話familyの保存: {0}")]
+    #[error("Conversation family storage: {0}")]
     Manager(#[from] StoreError),
-    #[error("会話の保存: {0}")]
+    #[error("Conversation storage: {0}")]
     Session(#[from] io::Error),
-    #[error("管理操作IDが既存の操作と競合しました")]
+    #[error("Management operation ID conflicts with an existing operation")]
     OperationCollision,
 }
 
@@ -149,9 +149,10 @@ impl SessionSwitchOwner<'_> {
             ManagementEffectStateV1::OutcomeUnknown { .. } if child_exists && !orphan_exists => {
                 let partial = is_partial_child(&child_path, &descriptor)?;
                 if family_exists && partial {
-                    return Err(
-                        io::Error::other("会話familyと部分的な分岐先が競合しています").into(),
-                    );
+                    return Err(io::Error::other(
+                        "Conversation family conflicts with a partial fork destination",
+                    )
+                    .into());
                 }
                 if partial {
                     let orphan_root = ensure_orphan_root(data_root)?;
@@ -172,7 +173,10 @@ impl SessionSwitchOwner<'_> {
                     PersistedSession::open(data_root, database, project_id, child_id.as_str())?;
                 let snapshot = child.snapshot()?;
                 if !matches_descriptor(&snapshot, &descriptor)? {
-                    return Err(io::Error::other("管理操作の会話証拠が一致しません").into());
+                    return Err(io::Error::other(
+                        "Management operation conversation evidence mismatch",
+                    )
+                    .into());
                 }
                 fs::File::open(&child_path)?.sync_all()?;
                 fs::File::open(&sessions_root)?.sync_all()?;
@@ -189,7 +193,10 @@ impl SessionSwitchOwner<'_> {
                     .complete_unknown(self.lease, &unknown, evidence)?;
             }
             _ => {
-                return Err(io::Error::other("管理操作に部分的な会話証拠が残っています").into());
+                return Err(io::Error::other(
+                    "Partial conversation evidence remains for the management operation",
+                )
+                .into());
             }
         }
         Ok(())
@@ -298,7 +305,9 @@ impl SessionSwitchOwner<'_> {
             .as_ref()
             .is_some_and(|snapshot| snapshot.state.project_id != project_id)
         {
-            return Err(io::Error::other("新規会話のprojectがsourceと一致しません").into());
+            return Err(
+                io::Error::other("New conversation project does not match the source").into(),
+            );
         }
         crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
             Path::new(project_id),
@@ -471,7 +480,10 @@ impl SessionSwitchOwner<'_> {
                 started,
                 ManagementUnknownReasonV1::ReceiptPersistenceFailed,
             )?;
-            return Err(io::Error::other("分岐先の保存証拠が操作前の記録と一致しません").into());
+            return Err(io::Error::other(
+                "Fork destination storage evidence does not match the pre-operation record",
+            )
+            .into());
         }
         let evidence = child_evidence(&snapshot);
         match self.effects.complete_started(self.lease, started, evidence) {
@@ -509,7 +521,7 @@ fn switch_descriptor_root(state_dir: &Path) -> io::Result<std::path::PathBuf> {
     match fs::symlink_metadata(&root) {
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
             return Err(io::Error::other(
-                "会話切替記録の保存先がdirectoryではありません",
+                "Conversation switch record storage is not a directory",
             ));
         }
         Ok(_) => {}
@@ -531,7 +543,9 @@ fn write_descriptor(state_dir: &Path, descriptor: &SwitchDescriptor) -> io::Resu
     let root = switch_descriptor_root(state_dir)?;
     let bytes = serde_json::to_vec(descriptor)?;
     if bytes.len() > 16 * 1024 {
-        return Err(io::Error::other("会話切替記録が上限を超えました"));
+        return Err(io::Error::other(
+            "Conversation switch record exceeds the limit",
+        ));
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -555,7 +569,7 @@ fn read_descriptor(
     let root_metadata = fs::symlink_metadata(&root)?;
     if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
         return Err(io::Error::other(
-            "会話切替記録の保存先がdirectoryではありません",
+            "Conversation switch record storage is not a directory",
         ));
     }
     let path = descriptor_path(&root, effect.request.operation_id);
@@ -564,7 +578,9 @@ fn read_descriptor(
         || metadata.file_type().is_symlink()
         || metadata.len() > 16 * 1024
     {
-        return Err(io::Error::other("会話切替記録の形式が不正です"));
+        return Err(io::Error::other(
+            "Invalid conversation switch record format",
+        ));
     }
     let file = OpenOptions::new()
         .read(true)
@@ -592,7 +608,9 @@ fn read_descriptor(
         || matches!(descriptor.inventory.as_str(), "T16" | "F18")
             != descriptor.initial_state_hash.is_some()
     {
-        return Err(io::Error::other("会話切替記録と管理操作が一致しません"));
+        return Err(io::Error::other(
+            "Conversation switch record and management operation mismatch",
+        ));
     }
     Ok(descriptor)
 }
@@ -606,7 +624,7 @@ fn is_partial_child(child_path: &Path, descriptor: &SwitchDescriptor) -> io::Res
     };
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(io::Error::other(
-            "分岐先のmarkerが通常ファイルではありません",
+            "Fork destination marker is not a regular file",
         ));
     }
     let state: crate::conversation_state::ConversationStateV2 =
@@ -624,7 +642,9 @@ fn ensure_orphan_root(data_root: &Path) -> io::Result<std::path::PathBuf> {
     let root = parent.join("session-switch-orphans-v1");
     match fs::symlink_metadata(&root) {
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
-            return Err(io::Error::other("分岐先の退避先がdirectoryではありません"));
+            return Err(io::Error::other(
+                "Fork destination archive is not a directory",
+            ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -658,18 +678,22 @@ fn hash_orphan_tree(
 ) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     if depth > 8 {
-        return Err(io::Error::other("退避した会話の階層が上限を超えました"));
+        return Err(io::Error::other(
+            "Archived conversation depth exceeds the limit",
+        ));
     }
     let metadata = fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other("退避した会話のdirectoryが不正です"));
+        return Err(io::Error::other("Invalid archived conversation directory"));
     }
     let mut children = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         *entries += 1;
         if *entries > 4096 {
-            return Err(io::Error::other("退避した会話のfile数が上限を超えました"));
+            return Err(io::Error::other(
+                "Archived conversation file count exceeds the limit",
+            ));
         }
         let name = child.file_name();
         let bytes = name.as_bytes();
@@ -678,7 +702,7 @@ fn hash_orphan_tree(
         let path = child.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            return Err(io::Error::other("退避した会話にsymlinkがあります"));
+            return Err(io::Error::other("Archived conversation contains a symlink"));
         }
         if metadata.file_type().is_dir() {
             hasher.update(b"directory");
@@ -700,7 +724,9 @@ fn hash_orphan_tree(
             }
             file.sync_all()?;
         } else {
-            return Err(io::Error::other("退避した会話に特殊fileがあります"));
+            return Err(io::Error::other(
+                "Archived conversation contains a special file",
+            ));
         }
     }
     fs::File::open(directory)?.sync_all()?;
@@ -722,7 +748,7 @@ fn child_evidence(
 fn private_child_exists(parent: &Path, child: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(parent) {
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
-            return Err(io::Error::other("会話保存先がdirectoryではありません"));
+            return Err(io::Error::other("Conversation storage is not a directory"));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -730,7 +756,7 @@ fn private_child_exists(parent: &Path, child: &Path) -> io::Result<bool> {
     }
     match fs::symlink_metadata(child) {
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
-            Err(io::Error::other("分岐先がdirectoryではありません"))
+            Err(io::Error::other("Fork destination is not a directory"))
         }
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -748,7 +774,7 @@ fn family_root(state_dir: &Path) -> io::Result<std::path::PathBuf> {
     match fs::symlink_metadata(&root) {
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
             return Err(io::Error::other(
-                "会話familyの保存先がdirectoryではありません",
+                "Conversation family storage is not a directory",
             ));
         }
         Ok(_) => {}
@@ -761,7 +787,9 @@ fn family_root(state_dir: &Path) -> io::Result<std::path::PathBuf> {
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     let canonical = fs::canonicalize(root)?;
     if canonical.parent() != Some(parent.as_path()) {
-        return Err(io::Error::other("会話familyの保存先がstate領域の外です"));
+        return Err(io::Error::other(
+            "Conversation family storage is outside the state area",
+        ));
     }
     Ok(canonical)
 }
@@ -774,7 +802,7 @@ fn existing_family_root(state_dir: &Path) -> io::Result<Option<std::path::PathBu
             Ok(Some(fs::canonicalize(root)?))
         }
         Ok(_) => Err(io::Error::other(
-            "会話familyの保存先がdirectoryではありません",
+            "Conversation family storage is not a directory",
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),

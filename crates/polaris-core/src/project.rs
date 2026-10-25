@@ -144,6 +144,13 @@ pub fn state_dir(cwd: &Path) -> std::io::Result<PathBuf> {
     state_dir_at(&storage_root_from_env()?, cwd)
 }
 
+/// Compute the same project state location without creating or repairing it.
+pub fn state_path(cwd: &Path) -> std::io::Result<PathBuf> {
+    Ok(storage_root_from_env()?
+        .join("state")
+        .join(project_id(&resolve_root(cwd))))
+}
+
 fn sessions_dir_at(storage_root: &Path) -> std::io::Result<PathBuf> {
     let dir = storage_root.join("sessions");
     std::fs::create_dir_all(&dir)?;

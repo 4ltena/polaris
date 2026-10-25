@@ -928,14 +928,16 @@ impl RealRun {
         if let Some(outcome) = self.outcome {
             if outcome == Observation::OutcomeUnknown {
                 status.phase = MemoryPhase::OutcomeUnknown;
-                status.detail = "実行結果が不明です。要約を自動再送していません".into();
+                status.detail =
+                    "The execution outcome is unknown. Summarization was not resent automatically"
+                        .into();
             } else if status.phase == MemoryPhase::Preparing {
                 status.phase = MemoryPhase::Failed;
                 status.detail =
-                    "会話記憶の準備を完了できなかったため主要求を開始していません".into();
+                    "The main request was not started because conversation memory preparation could not complete".into();
             }
             if self.memory_evidence_over_budget {
-                status.detail = "出典情報を含む記憶が256トークンを超えたため主要求を開始していません。要約は自動再送していません".into();
+                status.detail = "The main request was not started because memory including source information exceeds 256 tokens. Summarization was not resent automatically".into();
             }
         }
         store.record_memory_status(target, status.clone())?;
@@ -1810,7 +1812,7 @@ impl Engine {
                     })
                     .count();
                 format!(
-                    "- {} [{:?}] 受入 {}/{}",
+                    "- {} [{:?}] acceptance {}/{}",
                     task.title,
                     task.state,
                     met,

@@ -120,7 +120,9 @@ pub fn summary_input(
     intent: &StructuredIntent,
 ) -> io::Result<StructuredSummaryInput> {
     if structured_summary_intent(snapshot)?.as_ref() != Some(intent) {
-        return Err(io::Error::other("構造化抽出source mapが原文と一致しません"));
+        return Err(io::Error::other(
+            "Structured extraction source map does not match the original text",
+        ));
     }
     super::strict_history::turn_messages(snapshot, turn)?;
     let mut sources: BTreeMap<_, _> = intent
@@ -147,7 +149,9 @@ pub fn summary_input(
             });
     }
     if summary_target_source_ids.is_empty() {
-        return Err(io::Error::other("構造化要約の対象sourceがありません"));
+        return Err(io::Error::other(
+            "No target source for structured summarization",
+        ));
     }
     let input = StructuredSummaryInput {
         sources: sources.into_values().collect(),
@@ -163,7 +167,7 @@ pub fn source_budget(sources: &[StructuredPromptSource]) -> io::Result<()> {
     let text = serde_json::to_string(sources)?;
     if text.len() > MAX_RESPONSE_BYTES || crate::budget::count_tokens(&text) > MAX_SOURCE_TOKENS {
         return Err(io::Error::other(
-            "構造化sourceが64KiBまたは16,384参照tokensを超えました",
+            "Structured source exceeds 64 KiB or 16,384 reference tokens",
         ));
     }
     Ok(())
@@ -172,7 +176,7 @@ pub fn source_budget(sources: &[StructuredPromptSource]) -> io::Result<()> {
 pub fn hint_budget(hints: &[polaris_memory::structured::StructuredEntityHint]) -> io::Result<()> {
     if hints.len() > 64 || crate::budget::count_tokens(&serde_json::to_string(hints)?) > 2_048 {
         return Err(io::Error::other(
-            "関連entity候補が64件または2,048参照tokensを超え、曖昧さを保持できません",
+            "Related entity candidates exceed 64 entries or 2,048 reference tokens; ambiguity cannot be retained",
         ));
     }
     Ok(())
@@ -243,7 +247,9 @@ impl EntityRelationCandidate {
             || !self.evidence_text.contains(&self.from.name)
             || !self.evidence_text.contains(&self.to.name)
         {
-            return Err(io::Error::other("entity関係に有効な原文根拠がありません"));
+            return Err(io::Error::other(
+                "Entity relation has no valid evidence in the original text",
+            ));
         }
         let resolve = |reference: &EntityReference| {
             resolve_entity(
@@ -253,12 +259,12 @@ impl EntityRelationCandidate {
                 &reference.name,
                 &reference.subject_project,
             )?
-            .ok_or_else(|| io::Error::other("entity関係の参照が不在または曖昧です"))
+            .ok_or_else(|| io::Error::other("Entity relation reference is missing or ambiguous"))
         };
         let from = resolve(&self.from)?;
         let to = resolve(&self.to)?;
         if from == to {
-            return Err(io::Error::other("entity関係の両端が同一です"));
+            return Err(io::Error::other("Entity relation endpoints are identical"));
         }
         Ok(StructuredEntityRelation {
             source_entity_id: from,
@@ -326,7 +332,7 @@ pub fn validate_saved_response(
         || p.prompt_version != STRUCTURED_PROMPT_VERSION
     {
         return Err(io::Error::other(
-            "保存済み構造化応答の入力・scope・coverageが一致しません",
+            "The saved structured response input, scope, or coverage does not match",
         ));
     }
     authority::validate_sources(snapshot, intent, delta)
@@ -358,7 +364,9 @@ pub fn structured_summary_intent(
         return Ok(None);
     }
     if snapshot.state.raw_commit_hash != snapshot.raw_hash {
-        return Err(io::Error::other("構造化要約の確定原文hashが一致しません"));
+        return Err(io::Error::other(
+            "Structured summary finalized source hash mismatch",
+        ));
     }
     let raw = snapshot_raw(snapshot)?;
     crate::conversation_state::validate_coverage_boundary(
@@ -433,7 +441,7 @@ pub fn structured_intent(snapshot: &ConversationSnapshot) -> io::Result<Option<S
     let raw = snapshot_raw(snapshot)?;
     if raw.len() as u64 != snapshot.raw_offset || content_hash(&raw) != snapshot.raw_hash {
         return Err(io::Error::other(
-            "構造化抽出のraw byte境界を再構成できません",
+            "Cannot reconstruct structured extraction raw byte boundaries",
         ));
     }
     let offset = raw_offset_for_sequence(&raw, last_sequence)?;
@@ -487,13 +495,17 @@ pub fn validate_response_with_resolver(
     resolver: &dyn StructuredResolver,
 ) -> io::Result<ValidatedStructuredResponse> {
     if structured_summary_intent(snapshot)?.as_ref() != Some(intent) {
-        return Err(io::Error::other("構造化抽出source mapが原文と一致しません"));
+        return Err(io::Error::other(
+            "Structured extraction source map does not match the original text",
+        ));
     }
     if response.len() > MAX_RESPONSE_BYTES {
-        return Err(io::Error::other("構造化抽出応答が64KiBを超えました"));
+        return Err(io::Error::other(
+            "Structured extraction response exceeds 64 KiB",
+        ));
     }
     let envelope: Envelope = serde_json::from_str(response)
-        .map_err(|_| io::Error::other("構造化抽出応答の形式が不正です"))?;
+        .map_err(|_| io::Error::other("Invalid structured extraction response format"))?;
     let summary = serde_json::to_string(&envelope.summary)?;
     super::validate_summary(&summary, turn)?;
     let expected: Vec<_> = intent
@@ -517,7 +529,9 @@ pub fn validate_response_with_resolver(
         || envelope.fact_deltas.len() > 64
         || envelope.entity_relations.len() > 32
     {
-        return Err(io::Error::other("構造化抽出の出典集合または件数が不正です"));
+        return Err(io::Error::other(
+            "Invalid structured extraction source set or count",
+        ));
     }
     let sources: BTreeMap<_, _> = intent
         .sources
@@ -561,7 +575,9 @@ pub fn validate_response_with_resolver(
             .iter()
             .any(|c| !sources.contains_key(c.source_id.as_str()))
     {
-        return Err(io::Error::other("構造化候補のsourceが抽出範囲外です"));
+        return Err(io::Error::other(
+            "The structured candidate source is outside the extraction range",
+        ));
     }
     let mut pending_entities = BTreeMap::new();
     let mut fact_updates = FactUpdates::default();
@@ -591,13 +607,13 @@ pub fn validate_response_with_resolver(
             )?;
             if candidate.aliases.len() > 32 || candidate.aliases.iter().any(|a| invalid_metadata(a))
             {
-                return Err(io::Error::other("構造化entity aliasが不正です"));
+                return Err(io::Error::other("Invalid structured entity alias"));
             }
             if !entity_ordinals.insert((candidate.source_id.clone(), candidate.ordinal))
                 || !candidate.evidence_text.contains(&candidate.name)
             {
                 return Err(io::Error::other(
-                    "構造化entityの名前またはordinalが不正です",
+                    "Invalid structured entity name or ordinal",
                 ));
             }
             let identity_targets: Vec<_> = [
@@ -623,7 +639,7 @@ pub fn validate_response_with_resolver(
                             .any(|name| !candidate.evidence_text.contains(name.as_str()))))
             {
                 return Err(io::Error::other(
-                    "構造化entityの同一性変更に有効な原文根拠がありません",
+                    "Structured entity identity change has no valid source evidence",
                 ));
             }
             for relation in [
@@ -635,7 +651,7 @@ pub fn validate_response_with_resolver(
                     .as_ref()
                     .is_some_and(|value| invalid_metadata(value))
                 {
-                    return Err(io::Error::other("構造化entity relationが不正です"));
+                    return Err(io::Error::other("Invalid structured entity relation"));
                 }
             }
             let mut id = stable_entity_id(
@@ -657,7 +673,9 @@ pub fn validate_response_with_resolver(
                     target,
                     &candidate.subject_project,
                 )?
-                .ok_or_else(|| io::Error::other("構造化entity relationが不在または曖昧です"))?;
+                .ok_or_else(|| {
+                    io::Error::other("Structured entity relation is missing or ambiguous")
+                })?;
                 true
             } else {
                 false
@@ -671,10 +689,12 @@ pub fn validate_response_with_resolver(
                     &candidate.subject_project,
                 )?
                 .ok_or_else(|| {
-                    io::Error::other("構造化entity distinct_fromが不在または曖昧です")
+                    io::Error::other("Structured entity distinct_from is missing or ambiguous")
                 })?;
                 if target_id == id {
-                    return Err(io::Error::other("構造化entity distinct_fromが同一です"));
+                    return Err(io::Error::other(
+                        "Structured entity distinct_from references the same entity",
+                    ));
                 }
                 relations.push(StructuredEntityRelation {
                     source_entity_id: id.clone(),
@@ -695,7 +715,9 @@ pub fn validate_response_with_resolver(
             if revisions.iter().any(|r: &StructuredEntityRevision| {
                 r.entity_id == id && r.source_id == source.source_id
             }) {
-                return Err(io::Error::other("同じsource内のentity更新が曖昧です"));
+                return Err(io::Error::other(
+                    "Entity updates within the same source are ambiguous",
+                ));
             }
             revisions.retain(|r| r.entity_id != id);
             let state = pending_entities
@@ -743,7 +765,7 @@ pub fn validate_response_with_resolver(
         {
             let row = relation.validate(&sources, &user_inputs, resolver, &pending_entities)?;
             if relations.contains(&row) {
-                return Err(io::Error::other("entity関係候補が重複しています"));
+                return Err(io::Error::other("Duplicate entity relation candidates"));
             }
             relations.push(row);
         }
@@ -802,18 +824,18 @@ fn checked_source<'a>(
     let source = sources
         .get(id)
         .copied()
-        .ok_or_else(|| io::Error::other("構造化候補のsource IDが不正です"))?;
+        .ok_or_else(|| io::Error::other("Invalid structured candidate source ID"))?;
     let end = span
         .start
         .checked_add(span.length)
-        .ok_or_else(|| io::Error::other("構造化候補spanが不正です"))?;
+        .ok_or_else(|| io::Error::other("Invalid structured candidate span"))?;
     if end > source.content.len()
         || !source.content.is_char_boundary(span.start)
         || !source.content.is_char_boundary(end)
         || &source.content[span.start..end] != evidence
     {
         return Err(io::Error::other(
-            "構造化候補のevidence spanが原文と一致しません",
+            "Structured candidate evidence span does not match the original text",
         ));
     }
     Ok(source)
@@ -854,7 +876,7 @@ fn resolve_entity(
         ids.insert(id);
     }
     if ids.len() > 1 {
-        return Err(io::Error::other("構造化entity参照が曖昧です"));
+        return Err(io::Error::other("Ambiguous structured entity reference"));
     }
     Ok(ids.into_iter().next())
 }
@@ -877,7 +899,7 @@ fn validate_candidate_fields(speech_act: &str, fields: &[&str]) -> io::Result<()
     ) || fields.iter().any(|v| invalid_metadata(v))
     {
         return Err(io::Error::other(
-            "構造化候補metadataまたは発話分類が不正です",
+            "Invalid structured candidate metadata or utterance classification",
         ));
     }
     Ok(())
@@ -899,7 +921,7 @@ fn raw_offset_for_sequence(raw: &[u8], sequence: u64) -> io::Result<usize> {
             return Ok(offset);
         }
     }
-    Err(io::Error::other("構造化coverage sequenceがありません"))
+    Err(io::Error::other("Missing structured coverage sequence"))
 }
 
 #[cfg(test)]

@@ -23,44 +23,45 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     has_pending: bool,
 ) -> Result<Vec<Line<'static>>, String> {
     if has_pending {
-        return Err("送信待ちの入力があるためsandboxを実行できません".into());
+        return Err("Cannot run sandbox commands while input is queued".into());
     }
     session.check_persistence().map_err(|e| e.to_string())?;
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("保存された会話がありません")?;
+        .ok_or("No saved conversation")?;
     let request = request.trim().trim_start_matches('/');
     let request = request.strip_prefix("sandbox ").unwrap_or(request).trim();
     if request.len() > 8 * 1024 {
-        return Err("sandbox commandは8KiB以内で指定してください".into());
+        return Err("Specify a sandbox command within 8 KiB".into());
     }
-    let argv: Vec<String> = serde_json::from_str(request)
-        .map_err(|_| "sandboxは絶対pathのprogramと引数をJSON配列で指定してください")?;
+    let argv: Vec<String> = serde_json::from_str(request).map_err(
+        |_| "Specify the sandbox program as an absolute path with arguments in a JSON array",
+    )?;
     let preview =
         SandboxCommandOwnerV1::preview(persistence, workspace.project_root(), startup_policy, argv)
             .map_err(|e| e.to_string())?;
     let command = serde_json::to_string(preview.argv()).map_err(|e| e.to_string())?;
     let confinement = if let Some(boundary) = preview.policy().isolated_boundary() {
         format!(
-            "読み取り: {:?}\nnetwork: {} / 子孫作成禁止",
+            "Read: {:?}\nnetwork: {} / descendant creation prohibited",
             boundary.readable_roots,
             if boundary.loopback_network {
-                "loopbackのみ"
+                "loopback only"
             } else {
-                "禁止"
+                "prohibited"
             }
         )
     } else {
-        "既存CLIのLinux Landlock policy。書き込みは表示の範囲のみ。読み取りはfilesystem全体、networkと子孫作成は制限しません。process groupを監視し、未分類の効果を巻き戻しません。".into()
+        "Existing CLI Linux Landlock policy. Writes are limited to the displayed scope. Reads cover the whole filesystem; network access and descendant creation are unrestricted. The process group is monitored; unclassified effects are not rewound.".into()
     };
     let detail = format!(
-        "{command}\n{}\n{confinement}\n実行上限30秒 / 出力各256KiB\n実行結果が不明な場合、新しい操作を停止します。",
+        "{command}\n{}\n{confinement}\nExecution limit: 30 seconds / output: 256 KiB per stream\nNew operations stop if the execution outcome is unknown.",
         preview.policy().describe()
     );
     let lease = workspace
         .try_mutation()
-        .map_err(|_| "projectで実行中の操作があります")?;
+        .map_err(|_| "An operation is active in the project")?;
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|e| e.to_string())?;
@@ -75,12 +76,12 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     if !account::confirm(
         terminal,
         reader,
-        "sandbox commandを実行",
+        "Run sandbox command",
         workspace.project_root().to_string_lossy().as_ref(),
         &detail,
     ) {
         owner.deny(&prepared).map_err(|e| e.to_string())?;
-        return Ok(vec![Line::from("sandboxの実行を取り消しました")]);
+        return Ok(vec![Line::from("Sandbox execution cancelled")]);
     }
     let started = Instant::now();
     let outcome = owner
@@ -101,17 +102,17 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
         "C38 {} / {} / exit {}",
         prepared.operation_id().as_hex(),
         if unknown {
-            "結果不明・新しい操作を停止"
+            "outcome unknown; new operations stopped"
         } else if outcome.end == ControlledEnd::Exited {
-            "終了"
+            "exited"
         } else {
-            "停止"
+            "stopped"
         },
         outcome
             .status
             .as_ref()
             .and_then(|status| status.code())
-            .map_or_else(|| "未確認".into(), |code| code.to_string())
+            .map_or_else(|| "unverified".into(), |code| code.to_string())
     ))];
     // Captured streams have independent native bounds; the reader projection is smaller.
     let mut remaining = 64 * 1024;
@@ -130,7 +131,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
             );
         }
         if truncated || take < bytes.len() {
-            lines.push(Line::from(format!("{name}: 表示上限で省略しました")));
+            lines.push(Line::from(format!("{name}: truncated at display limit")));
         }
     }
     // An unresolved owned child is now durably classified unknown; dropping it

@@ -154,7 +154,7 @@ fn model_dimension_and_missing_embeddings_never_mix() {
         ("lexical_only", None),
     ] {
         store
-            .upsert(&record("p", "s", id, "記録"), vector.as_ref())
+            .upsert(&record("p", "s", id, "record"), vector.as_ref())
             .unwrap();
     }
     let hits = store
@@ -174,7 +174,7 @@ fn model_dimension_and_missing_embeddings_never_mix() {
     );
     assert_eq!(
         store
-            .search(&SearchRequest::lexical("p", "記録"))
+            .search(&SearchRequest::lexical("p", "record"))
             .unwrap()
             .len(),
         5
@@ -190,7 +190,7 @@ fn forgetting_removes_vectors_and_persists_tombstones_across_connections() {
     let vector = embedding("m", &[1.0]);
     for (project, session) in [("p", "s"), ("p", "keep"), ("other", "s")] {
         store
-            .upsert(&record(project, session, "id", "記録"), Some(&vector))
+            .upsert(&record(project, session, "id", "record"), Some(&vector))
             .unwrap();
     }
     assert!(!importer.is_session_forgotten("p", "s").unwrap());
@@ -206,7 +206,10 @@ fn forgetting_removes_vectors_and_persists_tombstones_across_connections() {
     assert!(store.get("p", "s", "id").unwrap().is_none());
     assert!(store.is_session_forgotten("p", "s").unwrap());
     assert!(!store.is_session_forgotten("other", "s").unwrap());
-    for request in [SearchRequest::lexical("p", "記録"), semantic("p", &vector)] {
+    for request in [
+        SearchRequest::lexical("p", "record"),
+        semantic("p", &vector),
+    ] {
         let hits = store.search(&request).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "keep");
@@ -224,7 +227,7 @@ fn forgetting_an_unimported_session_also_prevents_resurrection() {
     let mut store = MemoryStore::open(":memory:").unwrap();
     assert_eq!(store.delete_session("p", "s").unwrap(), 0);
     assert!(matches!(
-        store.upsert(&record("p", "s", "id", "記録"), None),
+        store.upsert(&record("p", "s", "id", "record"), None),
         Err(Error::SessionForgotten)
     ));
 }
@@ -379,7 +382,7 @@ fn hybrid_fuses_a_bounded_filtered_union_with_lexical_excerpts() {
 #[test]
 fn setting_embeddings_preserves_records_and_respects_forgetting() {
     let mut store = MemoryStore::open(":memory:").unwrap();
-    let original = record("p", "s", "id", "記録");
+    let original = record("p", "s", "id", "record");
     store.upsert(&original, None).unwrap();
     let vector = embedding("m", &[1.0]);
     store.set_embedding("p", "s", "id", &vector).unwrap();

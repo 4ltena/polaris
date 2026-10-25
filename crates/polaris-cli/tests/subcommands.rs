@@ -46,7 +46,9 @@ fn decision_verify_refuses_unaccepted_profiles_without_provider_or_mutation() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("受入登録が未完了") || error.contains("このplatform"));
+    assert!(
+        error.contains("acceptance registration is incomplete") || error.contains("this platform")
+    );
     assert!(!dir.path().join(".polaris").exists());
     assert!(!error.contains("API_KEY"));
 }
@@ -111,7 +113,10 @@ fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {
         }
         let output = command.output().unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("受入登録が未完了"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("acceptance registration is incomplete")
+        );
         assert!(output.stdout.is_empty());
         assert!(!home.path().join(".polaris").exists());
         assert!(!project.path().join(".polaris").exists());
@@ -196,7 +201,10 @@ fn decision_download_never_uses_unaccepted_sources_even_with_explicit_yes() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("受入登録が未完了") || error.contains("このplatform"));
+        assert!(
+            error.contains("acceptance registration is incomplete")
+                || error.contains("this platform")
+        );
         assert!(!root.path().join(".polaris").exists());
     }
 }
@@ -227,7 +235,10 @@ fn decision_management_pipe_requires_its_own_confirmation_and_cannot_bypass_acce
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(if yes { 2 } else { 1 }));
         if !yes {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("受入登録が未完了"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("acceptance registration is incomplete")
+            );
         }
         assert!(output.stdout.is_empty());
         assert!(!home.path().join(".polaris").exists());
@@ -269,7 +280,10 @@ fn mcp_configure_exposes_the_fixed_preset_and_rejects_unconfirmed_non_tty_withou
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("構成の確認には対話端末が必要"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Configuration confirmation requires an interactive terminal")
+    );
     assert!(!home.path().join(".polaris").exists());
     assert!(!project.path().join(".polaris").exists());
 }
@@ -376,7 +390,7 @@ fn common_tests_rejects_a_plan_larger_than_the_decode_limit() {
         .output()
         .expect("could not launch common-tests");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("計画を読めません"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cannot read the plan"));
 }
 
 #[cfg(unix)]
@@ -467,7 +481,7 @@ fn common_tests_rejects_an_invalid_plan_before_execution() {
         .expect("could not launch common-tests");
     assert!(!out.status.success(), "invalid plan unexpectedly succeeded");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("計画の形式が不正です"),
+        String::from_utf8_lossy(&out.stderr).contains("Invalid plan format"),
         "invalid schema was not rejected explicitly: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -836,7 +850,7 @@ fn registered_startup_distinguishes_logout_ready_reauth_and_in_progress() {
     for provider in [None, Some("codex")] {
         assert!(run(provider, &[]).contains("refusing to start onboarding"));
     }
-    assert!(run(Some("codex"), &["-p", "synthetic"]).contains("使用できる登録がありません"));
+    assert!(run(Some("codex"), &["-p", "synthetic"]).contains("No usable registrations"));
     assert!(
         !run(Some("codex"), &["--account", &reservation.registration_id]).contains("onboarding")
     );
@@ -1172,7 +1186,7 @@ fn an_explicit_account_is_refused_without_a_registration_or_outside_codex() {
     let openai = run("openai");
     assert!(!openai.status.success());
     assert!(
-        String::from_utf8_lossy(&openai.stderr).contains("--accountはcodexのみ"),
+        String::from_utf8_lossy(&openai.stderr).contains("--account is supported only by codex"),
         "{}",
         String::from_utf8_lossy(&openai.stderr)
     );

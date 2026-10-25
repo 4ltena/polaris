@@ -59,7 +59,7 @@ impl EffectTracker {
                         self.running_children.remove(display_name);
                     }
                 } else {
-                    self.unknown = Some("開始を確認できないsubagentが終了しました".into());
+                    self.unknown = Some("A subagent ended without a verified start".into());
                 }
             }
             _ => {}
@@ -81,17 +81,19 @@ impl EffectTracker {
                     .as_deref()
                     .is_some_and(|path| restorable_path(Path::new(path)))
                 {
-                    self.unknown = Some(format!("{name}の対象を復元範囲と照合できません"));
+                    self.unknown = Some(format!(
+                        "Cannot reconcile the {name} target with the restoration scope"
+                    ));
                 }
             }
-            _ => self.unknown = Some(format!("{name}の外部効果を検証できません")),
+            _ => self.unknown = Some(format!("Cannot verify external effects of {name}")),
         }
     }
 
     pub(crate) fn unknown_reason(&self) -> Option<String> {
         self.unknown.clone().or_else(|| {
             (!self.running_children.is_empty())
-                .then(|| "終了を確認できないsubagentがあります".to_owned())
+                .then(|| "A subagent has no verified termination".to_owned())
         })
     }
 }

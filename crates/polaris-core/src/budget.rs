@@ -26,7 +26,7 @@ pub fn validate_mcp_meta_schema() -> std::io::Result<()> {
             > MCP_META_SCHEMA_LIMIT
         {
             return Err(std::io::Error::other(
-                "MCP操作の定義が256tokensを超えました",
+                "MCP operation definition exceeds 256 tokens",
             ));
         }
     }
@@ -36,7 +36,7 @@ pub fn validate_mcp_meta_schema() -> std::io::Result<()> {
 /// Counts full production tool wire, including aliases and descriptions.
 pub fn validate_mcp_tool_budget(tools: &[ToolSpec]) -> std::io::Result<()> {
     if tools.len() > 4 {
-        return Err(std::io::Error::other("MCP toolの選択は4件以内です"));
+        return Err(std::io::Error::other("At most 4 MCP tools may be selected"));
     }
     for wire in [
         polaris_provider::openai::tool_wire_shape(tools),
@@ -46,7 +46,7 @@ pub fn validate_mcp_tool_budget(tools: &[ToolSpec]) -> std::io::Result<()> {
             > MCP_SELECTED_SCHEMA_LIMIT
         {
             return Err(std::io::Error::other(
-                "MCP toolの定義が4096tokensを超えました",
+                "MCP tool definitions exceed 4096 tokens",
             ));
         }
     }
@@ -62,7 +62,7 @@ pub fn validate_state_schema() -> std::io::Result<()> {
         let text = serde_json::to_string(&wire).map_err(std::io::Error::other)?;
         if count_tokens(&text) > STATE_SCHEMA_LIMIT {
             return Err(std::io::Error::other(
-                "state toolの定義が256tokensを超えました",
+                "State tool definition exceeds 256 tokens",
             ));
         }
     }
@@ -408,7 +408,8 @@ mod tests {
         // themselves rather than telling the caller what to pass. 45 tokens
         // of margin is deliberate — enough that a project's own rules do
         // not push the prefix back under the threshold.
-        const PINNED: usize = 1085;
+        // Removing the legacy Next.js setting recipe saves seven tokens.
+        const PINNED: usize = 1078;
         let mut tools = polaris_tools::all_specs();
         tools.push(polaris_tools::mcp_setup_spec());
         tools.push(polaris_tools::setting_spec());

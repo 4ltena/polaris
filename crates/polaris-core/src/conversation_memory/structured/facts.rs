@@ -69,14 +69,15 @@ impl FactUpdates {
             || c.depends_on.len() > 32
             || !self.ordinals.insert((c.source_id.clone(), c.ordinal))
         {
-            return Err(io::Error::other("構造化factの上限またはordinalが不正です"));
+            return Err(io::Error::other("Invalid structured fact limit or ordinal"));
         }
         let value_json = serde_json::to_string(&c.value)?;
         if value_json.len() > 16 * 1024 {
-            return Err(io::Error::other("構造化fact valueが16KiBを超えました"));
+            return Err(io::Error::other("Structured fact value exceeds 16 KiB"));
         }
-        let entity_id = entity(c.entity_kind, &c.entity_name, project)?
-            .ok_or_else(|| io::Error::other("構造化factのentityが不在または曖昧です"))?;
+        let entity_id = entity(c.entity_kind, &c.entity_name, project)?.ok_or_else(|| {
+            io::Error::other("The structured fact entity is missing or ambiguous")
+        })?;
         let authoritative = source.role == Role::User
             && user_inputs.contains(&source.sequence)
             && matches!(
@@ -98,7 +99,9 @@ impl FactUpdates {
         };
         if !authoritative || c.relation == FactRelation::Propose {
             if !c.depends_on.is_empty() {
-                return Err(io::Error::other("未採用の発話から依存関係を作れません"));
+                return Err(io::Error::other(
+                    "Cannot create dependencies from an unadopted utterance",
+                ));
             }
             row.reason = if c.speech_act == "propose" {
                 "proposed"
@@ -111,20 +114,24 @@ impl FactUpdates {
         match c.relation {
             FactRelation::Assert | FactRelation::Unresolved | FactRelation::DependsOn => {
                 if c.speech_act == "withdraw" {
-                    return Err(io::Error::other("撤回の発話を採用に使えません"));
+                    return Err(io::Error::other(
+                        "A retraction utterance cannot be used for adoption",
+                    ));
                 }
                 if c.relation == FactRelation::Unresolved && !c.value.is_null() {
-                    return Err(io::Error::other("未解決のfactには値を指定できません"));
+                    return Err(io::Error::other("An unresolved fact cannot have a value"));
                 }
                 if c.relation == FactRelation::DependsOn && c.depends_on.is_empty() {
-                    return Err(io::Error::other("依存先がありません"));
+                    return Err(io::Error::other("Missing dependency target"));
                 }
                 // A second assertion cannot silently replace an existing decision.
                 if self
                     .current_target(resolver, &row.entity_id, &row.fact_kind, &row.condition)?
                     .is_some()
                 {
-                    return Err(io::Error::other("既存の決定には明示的な訂正が必要です"));
+                    return Err(io::Error::other(
+                        "An existing decision requires an explicit correction",
+                    ));
                 }
                 row.status = FactStatus::Active;
                 row.reason = if c.relation == FactRelation::Unresolved {
@@ -143,13 +150,17 @@ impl FactUpdates {
                         && !matches!(c.speech_act.as_str(), "adopt" | "correct"))
                     || (c.relation == FactRelation::Withdraw && !c.depends_on.is_empty())
                 {
-                    return Err(io::Error::other("訂正・撤回の発話と候補が一致しません"));
+                    return Err(io::Error::other(
+                        "The correction or retraction utterance does not match the candidate",
+                    ));
                 }
                 let mut previous = self
                     .current_target(resolver, &row.entity_id, &row.fact_kind, &row.condition)?
-                    .ok_or_else(|| io::Error::other("訂正・撤回の対象factが不在または曖昧です"))?;
+                    .ok_or_else(|| io::Error::other("The fact targeted for correction or retraction is missing or ambiguous"))?;
                 if c.relation == FactRelation::Withdraw && previous.fact_kind == "unresolved" {
-                    return Err(io::Error::other("対象の決定は既に撤回済みです"));
+                    return Err(io::Error::other(
+                        "The target decision has already been retracted",
+                    ));
                 }
                 if c.relation == FactRelation::Withdraw {
                     row.unit = previous.unit.clone();
@@ -196,7 +207,9 @@ impl FactUpdates {
             FactRelation::Propose => unreachable!(),
         }
         if self.dependencies.len() > 32 {
-            return Err(io::Error::other("構造化依存関係が32件を超えました"));
+            return Err(io::Error::other(
+                "Structured dependencies exceed 32 entries",
+            ));
         }
         Ok(())
     }
@@ -245,7 +258,11 @@ impl FactUpdates {
                     .map(Ok)
                     .unwrap_or_else(|| {
                         resolver.fact(old_id).and_then(|r| {
-                            r.ok_or_else(|| io::Error::other("撤回元のfactが許可viewにありません"))
+                            r.ok_or_else(|| {
+                                io::Error::other(
+                                    "The retraction source fact is not in the allowed view",
+                                )
+                            })
                         })
                     })?;
                 if old.entity_id == entity && old.fact_kind == kind && old.condition == condition {
@@ -261,7 +278,9 @@ impl FactUpdates {
         });
         let result = current.next();
         if current.next().is_some() {
-            return Err(io::Error::other("構造化factの現在値が曖昧です"));
+            return Err(io::Error::other(
+                "The current structured fact value is ambiguous",
+            ));
         }
         Ok(result)
     }
@@ -284,14 +303,14 @@ impl FactUpdates {
                 ],
             )?;
             if reference.condition.len() > MAX_METADATA_BYTES {
-                return Err(io::Error::other("依存先の条件が過大です"));
+                return Err(io::Error::other("Dependency conditions exceed the limit"));
             }
             let target_entity = entity(
                 reference.entity_kind,
                 &reference.entity_name,
                 &reference.subject_project,
             )?
-            .ok_or_else(|| io::Error::other("依存先entityが不在または曖昧です"))?;
+            .ok_or_else(|| io::Error::other("The dependency entity is missing or ambiguous"))?;
             let target = self
                 .current_target(
                     resolver,
@@ -300,9 +319,9 @@ impl FactUpdates {
                     &reference.condition,
                 )?
                 .filter(|r| r.status == FactStatus::Active)
-                .ok_or_else(|| io::Error::other("依存先factが有効ではありません"))?;
+                .ok_or_else(|| io::Error::other("The dependency fact is invalid"))?;
             if target.fact_id == row.fact_id {
-                return Err(io::Error::other("自身へ依存できません"));
+                return Err(io::Error::other("Self-dependency is not allowed"));
             }
             self.dependencies.push(StructuredFactDependency {
                 dependent_fact_id: row.fact_id.clone(),
@@ -311,7 +330,9 @@ impl FactUpdates {
             });
         }
         if self.dependencies.len() > 32 {
-            return Err(io::Error::other("構造化依存関係が32件を超えました"));
+            return Err(io::Error::other(
+                "Structured dependencies exceed 32 entries",
+            ));
         }
         Ok(())
     }
@@ -323,7 +344,7 @@ impl FactUpdates {
     ) -> io::Result<()> {
         validate_fact_transition(None, row.status, relation).map_err(io::Error::other)?;
         if self.current.contains_key(&row.fact_id) {
-            return Err(io::Error::other("同じsourceに重複したfactがあります"));
+            return Err(io::Error::other("Duplicate facts for the same source"));
         }
         self.record(row)
     }
@@ -332,7 +353,9 @@ impl FactUpdates {
         self.rows
             .insert((row.fact_id.clone(), row.source_id.clone()), row);
         if self.rows.len() > 64 {
-            return Err(io::Error::other("構造化fact revisionが64件を超えました"));
+            return Err(io::Error::other(
+                "Structured fact revisions exceed 64 entries",
+            ));
         }
         Ok(())
     }
@@ -350,7 +373,7 @@ impl FactUpdates {
                 continue;
             }
             if visited.len() > 64 {
-                return Err(io::Error::other("依存更新が64件を超えました"));
+                return Err(io::Error::other("Dependency updates exceed 64 entries"));
             }
             let mut ids: BTreeSet<_> = resolver.dependents(&id)?.into_iter().collect();
             ids.extend(
@@ -362,9 +385,9 @@ impl FactUpdates {
             for dependent in ids {
                 let mut row = match self.current.get(&dependent) {
                     Some(row) => row.clone(),
-                    None => resolver
-                        .fact(&dependent)?
-                        .ok_or_else(|| io::Error::other("依存factが許可viewにありません"))?,
+                    None => resolver.fact(&dependent)?.ok_or_else(|| {
+                        io::Error::other("The dependency fact is not in the allowed view")
+                    })?,
                 };
                 if row.status == FactStatus::Active {
                     validate_fact_transition(

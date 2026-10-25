@@ -14,30 +14,30 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// 登録profileと容量の推薦を表示。導入・認証・通信・推論なし。
+    /// Show registered profiles and capacity recommendations without installation, authentication, network access, or inference.
     List,
-    /// 導入済み固定generationの全SHAを検証。起動・有効化・copyなし。
+    /// Verify every SHA in the installed pinned generation without launching, activating, or copying it.
     Verify {
         profile: String,
         /// Internal result channel for the packaged GUI; status is in the frame.
         #[arg(long, hide = true)]
         stdio_result: bool,
     },
-    /// 明示導入の内容をJSONで表示。ファイルの取得・copyなし。
+    /// Show an explicit installation plan as JSON without downloading or copying files.
     Plan {
         #[command(flatten)]
         sources: Sources,
-        /// 既存generationを保持して修復する計画を表示。
+        /// Plan a repair while retaining the existing generation.
         #[arg(long)]
         repair: bool,
     },
-    /// 固定配布元から取得する計画を表示。通信・copyなし。
+    /// Show a download plan for pinned sources without network access or copying.
     PlanDownload {
         profile: String,
         #[arg(long)]
         repair: bool,
     },
-    /// 固定配布元から明示取得し、SHA検証後に導入。推論なし。
+    /// Download from pinned sources and install after SHA verification; no inference.
     Download {
         profile: String,
         #[arg(long)]
@@ -47,18 +47,18 @@ enum Command {
         #[arg(long, hide = true, conflicts_with = "yes")]
         stdio_confirm: bool,
     },
-    /// 確認した固定artifactをcopy。backend設定や推論は開始しない。
+    /// Copy confirmed pinned artifacts without changing backend settings or starting inference.
     Import {
         #[command(flatten)]
         sources: Sources,
-        /// 表示する今回の計画で導入することを明示承認。
+        /// Explicitly approve installation using the displayed plan.
         #[arg(long)]
         yes: bool,
         /// Internal same-process confirmation channel for the packaged GUI.
         #[arg(long, hide = true, conflicts_with = "yes")]
         stdio_confirm: bool,
     },
-    /// 固定artifactで修復。旧generationは表示した復旧先に保持する。
+    /// Repair using pinned artifacts; retain the old generation at the displayed recovery location.
     Repair {
         #[command(flatten)]
         sources: Sources,
@@ -72,10 +72,10 @@ enum Command {
 #[derive(clap::Args)]
 struct Sources {
     profile: String,
-    /// 固定SHAと照合するworkerの絶対path。
+    /// Absolute worker path to verify against the pinned SHA.
     #[arg(long)]
     worker: PathBuf,
-    /// 固定SHAと照合するmodelの絶対path。
+    /// Absolute model path to verify against the pinned SHA.
     #[arg(long)]
     model: PathBuf,
 }
@@ -99,7 +99,7 @@ async fn perform(args: Args) -> Result<(), String> {
                 "schema_version":1,
                 "registered_profiles":registered,
                 "capacity":polaris_core::decision_capacity::observation::diagnostic_lines(&observation),
-                "note":"登録は導入・実行可否の確認ではありません。Jev/SemIfの設定は変更しません。"
+                "note":"Registration does not verify installation or execution availability. Jev/SemIf settings remain unchanged."
             })).map_err(|e| e.to_string())?);
             return Ok(());
         }
@@ -141,7 +141,7 @@ async fn perform(args: Args) -> Result<(), String> {
         &frame,
         &consent,
         import,
-        if repair { "修復" } else { "導入" },
+        if repair { "repaired" } else { "installed" },
     )
     .await?
     {
@@ -174,11 +174,11 @@ async fn perform(args: Args) -> Result<(), String> {
         );
     } else {
         println!(
-            "Clef generationを{}しました。backendの選択・有効化は変更していません。",
-            if repair { "修復" } else { "導入" }
+            "Clef generation {}. Backend selection and activation remain unchanged.",
+            if repair { "repaired" } else { "installed" }
         );
         if let Some(backup) = backup {
-            println!("旧generationの保持先: {}", backup.display());
+            println!("Previous generation retained at: {}", backup.display());
         }
     }
     Ok(())
@@ -214,8 +214,8 @@ async fn approve(
             receiver.recv_timeout(std::time::Duration::from_secs(120))
         })
         .await
-        .map_err(|_| "導入確認の待機を終了できませんでした")?
-        .map_err(|_| "導入確認が期限内に届きませんでした。変更していません。")??;
+        .map_err(|_| "Could not stop waiting for installation confirmation")?
+        .map_err(|_| "Installation confirmation timed out. No changes were made.")??;
         if !approved {
             println!(
                 "{}",
@@ -225,9 +225,9 @@ async fn approve(
         }
     } else if !yes {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Err("導入確認には対話端末、または今回の選択への明示的な --yes が必要です。変更していません。".into());
+            return Err("Installation confirmation requires an interactive terminal or explicit --yes for this selection. No changes were made.".into());
         }
-        eprint!("表示した計画で{}しますか？ [y/n]: ", action);
+        eprint!("Proceed with {} using the displayed plan? [y/n]: ", action);
         io::stderr().flush().map_err(|e| e.to_string())?;
         let mut answer = String::new();
         io::stdin()
@@ -236,7 +236,7 @@ async fn approve(
             .read_line(&mut answer)
             .map_err(|e| e.to_string())?;
         if answer.trim() != "y" {
-            eprintln!("Clef導入を取り消しました。変更していません。");
+            eprintln!("Clef installation cancelled. No changes were made.");
             return Ok(false);
         }
     }
@@ -258,9 +258,9 @@ async fn download(
         &consent,
         execution,
         if repair {
-            "取得・修復"
+            "download and repair"
         } else {
-            "取得・導入"
+            "download and install"
         },
     )
     .await?
@@ -290,10 +290,10 @@ async fn download(
         );
     } else {
         println!(
-            "固定artifactを取得・検証し、generationを導入しました。backendの選択・有効化は変更していません。"
+            "Downloaded and verified the pinned artifacts and installed the generation. Backend selection and activation remain unchanged."
         );
         if let Some(backup) = backup {
-            println!("旧generationの保持先: {}", backup.display());
+            println!("Previous generation retained at: {}", backup.display());
         }
     }
     Ok(())
@@ -326,7 +326,7 @@ async fn verify(profile: String, stdio_result: bool) -> Result<(), String> {
         println!("{}",serde_json::to_string(&serde_json::json!({"schema_version":1,"type":"verification","profile":selected,"status":status,"generation":generation})).map_err(|error|error.to_string())?);
     } else {
         let verified = result.map_err(|error| error.to_string())?;
-        println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"type":"verified","generation":verified,"note":"読み取り時点の固定SHAを照合しました。backend選択・有効化・推論・容量判定は行っていません。将来の置換や実行可否は保証しません。"})).map_err(|error|error.to_string())?);
+        println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"type":"verified","generation":verified,"note":"Verified the pinned SHA at read time. No backend selection, activation, inference, or capacity assessment was performed. Future replacement or execution availability is not guaranteed."})).map_err(|error|error.to_string())?);
     }
     Ok(())
 }
@@ -356,19 +356,21 @@ fn decode_confirmation(reader: impl Read, expected: &str) -> Result<bool, String
     io::BufReader::new(reader)
         .take(4097)
         .read_until(b'\n', &mut bytes)
-        .map_err(|_| "導入確認を読み取れませんでした")?;
+        .map_err(|_| "Could not read installation confirmation")?;
     if bytes.len() > 4096 || bytes.last() != Some(&b'\n') {
-        return Err("導入確認のframeが不正です。変更していません。".into());
+        return Err("Invalid installation confirmation frame. No changes were made.".into());
     }
     let frame: Confirmation = serde_json::from_slice(&bytes)
-        .map_err(|_| "導入確認の形式が不正です。変更していません。")?;
+        .map_err(|_| "Invalid installation confirmation format. No changes were made.")?;
     if frame.schema_version != 1 || frame.consent_sha256 != expected {
-        return Err("導入確認が今回の計画と一致しません。変更していません。".into());
+        return Err(
+            "Installation confirmation does not match this plan. No changes were made.".into(),
+        );
     }
     match frame.decision.as_str() {
         "approve" => Ok(true),
         "cancel" => Ok(false),
-        _ => Err("導入確認の応答が不明です。変更していません。".into()),
+        _ => Err("Unknown installation confirmation response. No changes were made.".into()),
     }
 }
 

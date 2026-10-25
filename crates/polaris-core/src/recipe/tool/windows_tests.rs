@@ -30,7 +30,7 @@ async fn assert_unavailable(tool: &SettingTool) {
             .expect("unsupported setting operation must fail");
         assert_eq!(
             error,
-            "このプラットフォームでは設定操作に必要な保護を確認できません。"
+            "Cannot verify the protections required for setup operations on this platform."
         );
     }
 }

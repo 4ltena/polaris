@@ -319,7 +319,7 @@ async fn frozen_host_user_content_requires_an_actual_input_boundary_for_active_f
         if active {
             assert!(matches!(
                 read,
-                Err(StoreError::Corrupt("固定原文の利用者入力根拠"))
+                Err(StoreError::Corrupt("Pinned source user input evidence"))
             ));
         } else {
             read.unwrap();

@@ -191,7 +191,7 @@ impl ManagementInventoryIdV1 {
         }
         let number = (bytes[1] - b'0') * 10 + (bytes[2] - b'0');
         let (family, maximum) = match bytes[0] {
-            b'C' => (ManagementInventoryFamilyV1::Cli, 42),
+            b'C' => (ManagementInventoryFamilyV1::Cli, 43),
             b'D' => (ManagementInventoryFamilyV1::Desktop, 41),
             b'T' => (ManagementInventoryFamilyV1::Tui, 21),
             b'F' => (ManagementInventoryFamilyV1::Flag, 25),
@@ -601,6 +601,8 @@ mod pure_tests {
         assert!(ManagementInventoryIdV1::parse("é1").is_err());
         assert!(ManagementInventoryIdV1::parse("T22").is_err());
         assert!(ManagementInventoryIdV1::parse("C42").is_ok());
+        assert!(ManagementInventoryIdV1::parse("C43").is_ok());
+        assert!(ManagementInventoryIdV1::parse("C44").is_err());
         assert!(ManagementInventoryIdV1::parse("D41").is_ok());
         assert!(ManagementInventoryIdV1::parse("F25").is_ok());
     }

@@ -109,7 +109,7 @@ impl FromStr for Phase {
         Self::ALL
             .into_iter()
             .find(|phase| phase.as_str() == value)
-            .ok_or_else(|| format!("不明な作業段階です: {value}"))
+            .ok_or_else(|| format!("Unknown workflow phase: {value}"))
     }
 }
 
@@ -311,7 +311,7 @@ impl fmt::Display for TransitionBlockerV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "phase gate: {:?}; 次の作業: {}",
+            "phase gate: {:?}; next action: {}",
             self.code, self.next_task
         )
     }
@@ -366,11 +366,11 @@ pub fn validate_active_change_path(
             contract.validate()?;
             let metadata = graph
                 .metadata(contract)
-                .ok_or("active change contractがgraphにありません")?;
+                .ok_or("The active change contract is missing from the graph")?;
             if metadata.kind != WorkflowArtifactKindV1::ChangeContract
                 || graph.latest(&contract.id).map(|item| item.reference()) != Some(contract.clone())
             {
-                return Err("active change contractは現行revisionではありません".into());
+                return Err("The active change contract is not the current revision".into());
             }
             Ok(ActiveChangePathV1::Routine(contract.clone()))
         }
@@ -383,9 +383,9 @@ pub fn validate_active_change_path(
             })
         }
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-            Err("routine contractとfull-spec artifactを同時にactiveにできません".into())
+            Err("A routine contract and full-spec artifacts cannot be active together".into())
         }
-        _ => Err("full-spec pathにはactive featureとactive taskの両方が必要です".into()),
+        _ => Err("The full-spec path requires both an active feature and an active task".into()),
     }
 }
 
@@ -404,7 +404,7 @@ pub fn validate_full_spec_for_implementation(
         task: active_task,
     } = validate_active_change_path(state, graph)?
     else {
-        return Err("full-spec pathがactiveではありません".into());
+        return Err("The full-spec path is not active".into());
     };
     feature.validate()?;
     plan.validate()?;
@@ -414,7 +414,7 @@ pub fn validate_full_spec_for_implementation(
         || plan.reference() != task_graph.implementation_plan
         || task_graph.reference() != active_task.task_graph
     {
-        return Err("full-spec本文がactive exact revisionと一致しません".into());
+        return Err("The full-spec body does not match the active exact revision".into());
     }
     for reference in [
         feature.reference(),
@@ -423,27 +423,27 @@ pub fn validate_full_spec_for_implementation(
     ] {
         let metadata = graph
             .metadata(&reference)
-            .ok_or("full-spec artifactがgraphにありません")?;
+            .ok_or("The full-spec artifact is missing from the graph")?;
         if metadata.header.status != ArtifactStatusV1::Approved
             || graph.latest(&reference.id).map(|item| item.reference()) != Some(reference)
         {
-            return Err("full-spec artifactは現行のApproved revisionではありません".into());
+            return Err("The full-spec artifact is not the current Approved revision".into());
         }
     }
     if !feature.required_clarifications.is_empty() {
-        return Err("required clarificationが未解決です".into());
+        return Err("Required clarification is unresolved".into());
     }
     if !feature.consistency_errors.is_empty() {
-        return Err("spec consistency errorが残っています".into());
+        return Err("Spec consistency errors remain".into());
     }
     let (_, runtime) = task_graph
         .task(&active_task.task_id)
-        .ok_or("active taskがtask graphにありません")?;
+        .ok_or("The active task is missing from the task graph")?;
     if matches!(
         runtime.state,
         TaskStateV1::Completed | TaskStateV1::Cancelled
     ) {
-        return Err("completed/cancelled taskは実装を開始できません".into());
+        return Err("Completed or cancelled tasks cannot start implementation".into());
     }
     let expected = feature
         .header
@@ -461,19 +461,19 @@ pub fn validate_full_spec_for_implementation(
         .map(IdeaDecisionV1::reference)
         .collect::<std::collections::BTreeSet<_>>();
     if supplied != expected {
-        return Err("featureに結び付くIdeaDecision本文が不足または過剰です".into());
+        return Err("Insufficient or excess IdeaDecision bodies bound to the feature".into());
     }
     for decision in decisions {
         decision.validate()?;
         let reference = decision.reference();
         let metadata = graph
             .metadata(&reference)
-            .ok_or("IdeaDecisionがgraphにありません")?;
+            .ok_or("IdeaDecision is missing from the graph")?;
         if decision.is_unresolved()
             || metadata.header.status != ArtifactStatusV1::Approved
             || graph.latest(&reference.id).map(|item| item.reference()) != Some(reference)
         {
-            return Err("未解決または旧revisionのIdeaDecisionがあります".into());
+            return Err("An unresolved or outdated IdeaDecision exists".into());
         }
     }
     let decision_refs = supplied.into_iter().collect::<Vec<_>>();
@@ -486,7 +486,7 @@ pub fn validate_full_spec_for_implementation(
         &active_task,
         &decision_refs,
     ))
-    .map_err(|_| "full-spec gate basisを正規化できません")?;
+    .map_err(|_| "Cannot canonicalize the full-spec gate basis")?;
     Ok(FullSpecGateProofV1 {
         schema_version: WORKFLOW_ARTIFACT_SCHEMA_VERSION,
         artifact_graph_basis_hash: graph_basis,
@@ -528,7 +528,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::InvalidPhaseStep,
             Vec::new(),
             Vec::new(),
-            "phaseとstepの保存状態を修復する",
+            "Repair saved phase and step state",
         ));
     }
     graph.validate().map_err(|_| {
@@ -536,7 +536,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ChangeContractNotCurrent,
             Vec::new(),
             state.active_change_contract.clone().into_iter().collect(),
-            "artifact graphを復旧する",
+            "Recover the artifact graph",
         )
     })?;
     if validate_active_change_path(state, graph).is_err() {
@@ -544,7 +544,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ConflictingChangePaths,
             Vec::new(),
             Vec::new(),
-            "routineまたはfull-specのactive pathを一つだけ選び直す",
+            "Select exactly one active path: routine or full-spec",
         ));
     }
     if state
@@ -560,7 +560,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ChangeContractNotCurrent,
             Vec::new(),
             Vec::new(),
-            "active feature/taskのexact artifact参照を復旧する",
+            "Recover exact artifact references for the active feature and task",
         ));
     }
     if gates.phase_gate_schema_version.is_some()
@@ -572,7 +572,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::MissingEvidence,
             vec!["workflow_evidence".into()],
             Vec::new(),
-            "現行taskに結び付くphase evidenceを保存する",
+            "Save phase evidence bound to the current task",
         ));
     }
     if gates.phase_gate_schema_version.is_none() || state.phase == target {
@@ -581,7 +581,7 @@ pub fn evaluate_phase_transition(
                 TransitionBlockerCodeV1::ChangeContractNotCurrent,
                 Vec::new(),
                 Vec::new(),
-                "workflow gateの保存状態を復旧する",
+                "Recover saved workflow gate state",
             )
         });
     }
@@ -590,7 +590,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ChangeContractNotCurrent,
             Vec::new(),
             Vec::new(),
-            "対応するphase gate形式へ移行する",
+            "Migrate to the supported phase gate format",
         ));
     }
 
@@ -614,14 +614,14 @@ pub fn evaluate_phase_transition(
                     "task_graph".into(),
                 ],
                 Vec::new(),
-                "routine変更契約または完全仕様artifactをtrusted ownerで承認する",
+                "Approve the routine change contract or full-spec artifacts with a trusted owner",
             ));
         }
         if let Some(result) = routine {
             match result {
                 Ok(_) => {}
-                Err(reason) if reason.contains("完全仕様経路") && full.is_ok() => {}
-                Err(reason) if reason.contains("完全仕様経路") => {
+                Err(reason) if reason.contains("full-spec path") && full.is_ok() => {}
+                Err(reason) if reason.contains("full-spec path") => {
                     return Err(block(
                         TransitionBlockerCodeV1::ChangeRequiresFullSpecification,
                         vec![
@@ -630,7 +630,7 @@ pub fn evaluate_phase_transition(
                             "task_graph".into(),
                         ],
                         Vec::new(),
-                        "完全仕様経路へ昇格する",
+                        "Escalate to the full-spec path",
                     ));
                 }
                 Err(_) if full.is_ok() => {}
@@ -643,7 +643,7 @@ pub fn evaluate_phase_transition(
                         TransitionBlockerCodeV1::ChangeContractNotCurrent,
                         Vec::new(),
                         vec![reference.clone()],
-                        "現行revisionのroutine変更契約を承認する",
+                        "Approve the current routine change contract revision",
                     ));
                 }
             }
@@ -657,14 +657,14 @@ pub fn evaluate_phase_transition(
                         "task_graph".into(),
                     ],
                     Vec::new(),
-                    "完全仕様経路へ昇格する",
+                    "Escalate to the full-spec path",
                 ));
             }
             return Err(block(
                 TransitionBlockerCodeV1::ChangeContractNotCurrent,
                 Vec::new(),
                 Vec::new(),
-                "現行revisionの完全仕様artifactを復旧する",
+                "Recover the current full-spec artifact revision",
             ));
         }
     }
@@ -678,7 +678,7 @@ pub fn evaluate_phase_transition(
                 TransitionBlockerCodeV1::ChangeContractNotCurrent,
                 Vec::new(),
                 Vec::new(),
-                "workflow gateの保存状態を復旧する",
+                "Recover saved workflow gate state",
             )
         });
     }
@@ -687,7 +687,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ForwardPhaseSkipped,
             Vec::new(),
             Vec::new(),
-            "次のphaseを完了してから進む",
+            "Complete the next phase before proceeding",
         ));
     }
     if let Some(transition) = evidence_transition(state.phase, target) {
@@ -696,7 +696,7 @@ pub fn evaluate_phase_transition(
                 TransitionBlockerCodeV1::MissingEvidence,
                 vec!["workflow_evidence".into()],
                 Vec::new(),
-                "現行taskに結び付くreview・verification証拠を保存する",
+                "Save review and verification evidence bound to the current task",
             ));
         };
         if validate_convergence_binding(state, graph, convergence).is_err() {
@@ -704,7 +704,7 @@ pub fn evaluate_phase_transition(
                 TransitionBlockerCodeV1::EvidenceNotCurrent,
                 Vec::new(),
                 Vec::new(),
-                "証拠を現行taskとartifact graphへ結び直す",
+                "Rebind evidence to the current task and artifact graph",
             ));
         }
         let input = PhaseGateInputV1 {
@@ -726,7 +726,7 @@ pub fn evaluate_phase_transition(
             TransitionBlockerCodeV1::ChangeContractNotCurrent,
             Vec::new(),
             Vec::new(),
-            "workflow gateの保存状態を復旧する",
+            "Recover saved workflow gate state",
         )
     })
 }
@@ -826,7 +826,7 @@ fn validate_full_spec_proof(
         != expected_decisions
         || proof.decision_refs.len() != expected_decisions.len()
     {
-        return Err("full-spec proofのIdeaDecision集合が一致しません".into());
+        return Err("Full-spec proof IdeaDecision set mismatch".into());
     }
     let active = ActiveTaskRefV1 {
         task_graph: proof.task_graph.clone(),
@@ -841,19 +841,19 @@ fn validate_full_spec_proof(
         &active,
         &proof.decision_refs,
     ))
-    .map_err(|_| "full-spec proofを正規化できません")?;
+    .map_err(|_| "Cannot canonicalize the full-spec proof")?;
     if proof.basis_hash != crate::conversation_state::content_hash(&basis_bytes) {
-        return Err("full-spec proof hashが一致しません".into());
+        return Err("Full-spec proof hash mismatch".into());
     }
     for reference in &proof.decision_refs {
         let metadata = graph
             .metadata(reference)
-            .ok_or("full-spec proofのIdeaDecisionがgraphにありません")?;
+            .ok_or("A full-spec proof IdeaDecision is missing from the graph")?;
         if metadata.kind != WorkflowArtifactKindV1::IdeaDecision
             || metadata.header.status != ArtifactStatusV1::Approved
             || graph.latest(&reference.id).map(|item| item.reference()) != Some(reference.clone())
         {
-            return Err("full-spec proofのIdeaDecisionが現行Approvedではありません".into());
+            return Err("A full-spec proof IdeaDecision is not currently Approved".into());
         }
     }
     Ok(())
@@ -913,7 +913,7 @@ fn validate_saved_advanced_phase(
     let convergence = gates
         .convergence
         .as_ref()
-        .ok_or("verify/deliver phaseには現行evidenceが必要です")?;
+        .ok_or("Verify and deliver phases require current evidence")?;
     validate_convergence_binding(state, graph, convergence)?;
     let input = PhaseGateInputV1 {
         schema_version: EVIDENCE_SCHEMA_VERSION,
@@ -923,7 +923,7 @@ fn validate_saved_advanced_phase(
     match evaluate_phase_gate(&input) {
         PhaseGateEvaluationV1::Allowed(_) => Ok(()),
         PhaseGateEvaluationV1::Blocked(blocked) => Err(format!(
-            "verify/deliver phase gateが未達です: {}",
+            "Verify/deliver phase gate unmet: {}",
             blocked.next_task
         )),
     }
@@ -948,7 +948,7 @@ fn gate_proof(
         graph.revision,
         graph.basis_hash()?,
     ))
-    .map_err(|_| "phase gate basisを正規化できません")?;
+    .map_err(|_| "Cannot canonicalize the phase gate basis")?;
     Ok(TransitionGateProofV1 {
         basis_hash: crate::conversation_state::content_hash(&bytes),
     })
@@ -1029,13 +1029,13 @@ struct WorkflowReservation {
 impl Workflow {
     pub fn restore(state: WorkflowStateV1) -> Result<Self, String> {
         if state.schema_version != WORKFLOW_SCHEMA_VERSION {
-            return Err("未対応のworkflow保存形式です".into());
+            return Err("Unsupported workflow storage format".into());
         }
         if state
             .step
             .is_some_and(|step| !state.phase.accepts_step(step))
         {
-            return Err("workflow phaseとstepが一致しません".into());
+            return Err("Workflow phase and step mismatch".into());
         }
         if let Some(reference) = &state.active_change_contract {
             reference.validate()?;
@@ -1047,7 +1047,7 @@ impl Workflow {
             reference.validate()?;
         }
         if state.active_task.is_some() && state.active_feature.is_none() {
-            return Err("active taskにはactive feature参照が必要です".into());
+            return Err("An active task requires an active feature reference".into());
         }
         Ok(Self {
             state,
@@ -1085,7 +1085,7 @@ impl Workflow {
                 .state
                 .revision
                 .checked_add(1)
-                .ok_or("workflow revisionが上限に達しました")?;
+                .ok_or("Workflow revision limit reached")?;
             self.state.phase = phase;
             self.state.step = phase.default_step();
             self.state.revision = revision;
@@ -1103,7 +1103,7 @@ impl Workflow {
         // Kept for the in-memory legacy controller API. Durable session
         // callers use `start_turn` and checkpoint a pending phase first.
         if self.active {
-            return Err("作業ターンが既に実行中です".into());
+            return Err("A work turn is already running".into());
         }
         if let Some(phase) = self.pending_phase {
             self.apply_phase(phase)?;
@@ -1113,10 +1113,10 @@ impl Workflow {
     }
     fn start_turn(&mut self, manifest_hash: String) -> Result<WorkflowStateV1, String> {
         if self.active {
-            return Err("作業ターンが既に実行中です".into());
+            return Err("A work turn is already running".into());
         }
         if manifest_hash.is_empty() {
-            return Err("skill manifest hashがありません".into());
+            return Err("Missing skill manifest hash".into());
         }
         self.state.skill_manifest_hash = manifest_hash;
         self.active = true;
@@ -1175,13 +1175,13 @@ impl SessionWorkflow {
         artifact_graph: WorkflowArtifactGraphV1,
     ) -> Result<Self, String> {
         if gates.schema_version != WORKFLOW_SCHEMA_VERSION {
-            return Err("未対応のgate保存形式です".into());
+            return Err("Unsupported gate storage format".into());
         }
         if gates
             .phase_gate_schema_version
             .is_some_and(|version| version != WORKFLOW_ARTIFACT_SCHEMA_VERSION)
         {
-            return Err("未対応のphase gate保存形式です".into());
+            return Err("Unsupported phase gate storage format".into());
         }
         artifact_graph.validate()?;
         if gates.phase_gate_schema_version.is_some() {
@@ -1194,7 +1194,7 @@ impl SessionWorkflow {
         {
             approved_full_spec(&state, &artifact_graph, gates.full_spec.as_ref()).map_err(
                 |_| {
-                    "承認済みroutine contractまたは完全仕様なしで実装phaseから開始できません"
+                    "Cannot start in implement phase without an approved routine contract or full specification"
                         .to_string()
                 },
             )?;
@@ -1219,7 +1219,7 @@ impl SessionWorkflow {
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         evaluate_phase_transition(&controller.state, phase, &self.gates, &self.artifact_graph)
             .map_err(|blocker| blocker.to_string())?;
         controller.request_phase(phase)
@@ -1276,7 +1276,7 @@ impl SessionWorkflow {
         state.revision = state
             .revision
             .checked_add(1)
-            .ok_or("workflow revisionが上限に達しました")?;
+            .ok_or("Workflow revision limit reached")?;
         state.active_change_contract = Some(reference);
         state.active_feature = None;
         state.active_task = None;
@@ -1317,7 +1317,7 @@ impl SessionWorkflow {
         state.revision = state
             .revision
             .checked_add(1)
-            .ok_or("workflow revisionが上限に達しました")?;
+            .ok_or("Workflow revision limit reached")?;
         state.active_feature = Some(feature);
         state.active_task = Some(task);
         state.active_change_contract = None;
@@ -1348,7 +1348,7 @@ impl SessionWorkflow {
         state.revision = state
             .revision
             .checked_add(1)
-            .ok_or("workflow revisionが上限に達しました")?;
+            .ok_or("Workflow revision limit reached")?;
         state.skill_manifest_hash.clear();
         state.skills.clear();
         let mut gates = self.gates.clone();
@@ -1382,7 +1382,7 @@ impl SessionWorkflow {
         state.revision = state
             .revision
             .checked_add(1)
-            .ok_or("workflow revisionが上限に達しました")?;
+            .ok_or("Workflow revision limit reached")?;
         state.skill_manifest_hash.clear();
         state.skills.clear();
         let mut gates = self.gates.clone();
@@ -1398,7 +1398,7 @@ impl SessionWorkflow {
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         let mut candidates = polaris_skills::workflow_profile::recommended_bindings();
         candidates.extend_from_slice(skills);
         let phases: Vec<Phase> = match self.config.mode {
@@ -1473,7 +1473,7 @@ impl SessionWorkflow {
         let controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         let phases: Vec<Phase> = match self.config.mode {
             WorkflowMode::Manual => {
                 let mut phases = vec![controller.state.phase];
@@ -1504,7 +1504,7 @@ impl SessionWorkflow {
                 *name == skill.name || name.strip_prefix("user:") == Some(skill.name.as_str())
             }) {
                 let text = std::fs::read_to_string(&skill.path).map_err(|error| {
-                    format!("必須skill {}を読み込めません: {error}", skill.name)
+                    format!("Cannot load required skill {}: {error}", skill.name)
                 })?;
                 let (name, description, body) =
                     polaris_skills::frontmatter::parse(&text, &skill.name)
@@ -1588,7 +1588,13 @@ pub(crate) fn skill_catalog_entries(
         .iter()
         .map(|skill| {
             let source_identity = skill.path.to_string_lossy().into_owned();
-            let id = if source_identity.starts_with("builtin:") {
+            let id = if skill.name == "builtin:envkit"
+                && skill.path
+                    == std::path::Path::new(polaris_skills::builtin::ROOT)
+                        .join("skills/envkit/SKILL.md")
+            {
+                "builtin:envkit".to_owned()
+            } else if source_identity.starts_with("builtin:") {
                 format!("builtin:{}", skill.name)
             } else {
                 format!("user:{}", skill.name)
@@ -1610,12 +1616,12 @@ impl WorkflowTurn {
     /// callers must not use this after the first provider request.
     pub fn refresh_manual_profile(&mut self, gates: &WorkflowGatesV1) -> Result<(), String> {
         if self.mode != WorkflowMode::Manual {
-            return Err("adaptive modeではmanual profileを更新できません".into());
+            return Err("Cannot update a manual profile in adaptive mode".into());
         }
         let state = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?
+            .map_err(|_| "Cannot retrieve workflow state")?
             .state
             .clone();
         let frozen = self.frozen_for(state.phase)?;
@@ -1633,7 +1639,7 @@ impl WorkflowTurn {
     /// request may then evaluate the real phase gate against that exact graph.
     pub fn refresh_runtime(&mut self, workflow: &SessionWorkflow) -> Result<(), String> {
         if self.config != workflow.config || self.mode != workflow.config.mode {
-            return Err("workflow turnの設定が保存済みruntimeと一致しません".into());
+            return Err("Workflow turn configuration does not match the saved runtime".into());
         }
         let state = workflow.state();
         let frozen = self.frozen_for(state.phase)?;
@@ -1662,13 +1668,13 @@ impl WorkflowTurn {
         let state = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?
+            .map_err(|_| "Cannot retrieve workflow state")?
             .state
             .clone();
         let frozen = self
             .profiles
             .get(&state.phase)
-            .ok_or("この実ターンに固定された段階skillがありません")?;
+            .ok_or("No phase skill pinned to this actual turn")?;
         build_profile(state, frozen, gates)
     }
 
@@ -1682,7 +1688,7 @@ impl WorkflowTurn {
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         let Some(phase) = controller.pending_phase else {
             return Ok(None);
         };
@@ -1699,17 +1705,17 @@ impl WorkflowTurn {
         gates: &WorkflowGatesV1,
     ) -> Result<PreparedWorkflowTransition, String> {
         if self.mode != WorkflowMode::Adaptive {
-            return Err("manual modeではmodelによるworkflow変更はできません".into());
+            return Err("Models cannot change workflow settings in manual mode".into());
         }
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         if controller.state.revision != expected_revision {
-            return Err("workflow revisionが競合しました".into());
+            return Err("Workflow revision conflict".into());
         }
         if controller.pending_phase.is_some() {
-            return Err("手動のworkflow変更が保留中です".into());
+            return Err("A manual workflow change is pending".into());
         }
         self.prepare(&mut controller, phase, gates, false)
     }
@@ -1722,7 +1728,7 @@ impl WorkflowTurn {
         pending: bool,
     ) -> Result<PreparedWorkflowTransition, String> {
         if controller.reservation.is_some() {
-            return Err("workflow変更は保存確認待ちです".into());
+            return Err("Workflow change awaits save confirmation".into());
         }
         let previous = controller.state.clone();
         let gate_proof = evaluate_phase_transition(&previous, phase, gates, &self.artifact_graph)
@@ -1734,7 +1740,7 @@ impl WorkflowTurn {
             previous
                 .revision
                 .checked_add(1)
-                .ok_or("workflow revisionが上限に達しました")?
+                .ok_or("Workflow revision limit reached")?
         };
         let mut candidate_state = previous.clone();
         candidate_state.phase = phase;
@@ -1768,7 +1774,7 @@ impl WorkflowTurn {
         }
         resolve_profiles(&self.config, &self.candidates, &[phase])?
             .remove(&phase)
-            .ok_or_else(|| "この実ターンに固定された段階skillがありません".into())
+            .ok_or_else(|| "No phase skill pinned to this actual turn".into())
     }
 }
 
@@ -1807,12 +1813,12 @@ impl PreparedWorkflowTransition {
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         let reservation = controller
             .reservation
             .as_mut()
             .filter(|reservation| reservation.id == id)
-            .ok_or("workflow変更の予約が失効しました")?;
+            .ok_or("Workflow change reservation expired")?;
         reservation.publishing = true;
         Ok(())
     }
@@ -1822,15 +1828,15 @@ impl PreparedWorkflowTransition {
         let mut controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?;
+            .map_err(|_| "Cannot retrieve workflow state")?;
         let reservation = controller
             .reservation
             .as_ref()
             .copied()
             .filter(|reservation| reservation.id == id && reservation.publishing)
-            .ok_or("workflow変更の予約が失効しました")?;
+            .ok_or("Workflow change reservation expired")?;
         if reservation.from_revision != self.previous.revision {
-            return Err("workflow変更の保存前revisionが一致しません".into());
+            return Err("Workflow change pre-save revision mismatch".into());
         }
         controller.reservation = None;
         controller.state = self.candidate.state.clone();
@@ -1940,7 +1946,7 @@ fn build_profile(
     let tokens = crate::budget::count_tokens(&body);
     if tokens > WORKFLOW_TOKEN_LIMIT {
         return Err(format!(
-            "段階別skillと状態表示が上限を超えました: {tokens}/{WORKFLOW_TOKEN_LIMIT} tokens"
+            "Phase skills and state display exceed the limit: {tokens}/{WORKFLOW_TOKEN_LIMIT} tokens"
         ));
     }
     Ok(WorkflowProfile {

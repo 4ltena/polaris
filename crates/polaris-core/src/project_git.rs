@@ -19,7 +19,7 @@ pub struct GitReadError;
 
 impl std::fmt::Display for GitReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Git情報を取得できません")
+        f.write_str("Cannot retrieve Git information")
     }
 }
 

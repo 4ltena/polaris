@@ -28,13 +28,13 @@ impl SavedWorkflow {
         }
         if self.state.active_change_contract.is_some() {
             crate::workflow::Workflow::restore(self.state.clone())
-                .map_err(|_| StoreError::Corrupt("workflowの保存版"))?;
+                .map_err(|_| StoreError::Corrupt("Saved workflow version"))?;
             if self.gates.schema_version != crate::workflow::WORKFLOW_SCHEMA_VERSION {
-                return Err(StoreError::Corrupt("workflowの保存版"));
+                return Err(StoreError::Corrupt("Saved workflow version"));
             }
         } else {
             SessionWorkflow::restore(self.config.clone(), self.gates.clone(), self.state.clone())
-                .map_err(|_| StoreError::Corrupt("workflowの保存版"))?;
+                .map_err(|_| StoreError::Corrupt("Saved workflow version"))?;
         }
         Ok(())
     }
@@ -47,7 +47,7 @@ impl SavedWorkflow {
             self.state.clone(),
             graph.clone(),
         )
-        .map_err(|_| StoreError::Corrupt("workflow artifact参照"))?;
+        .map_err(|_| StoreError::Corrupt("Workflow artifact reference"))?;
         Ok(())
     }
 
@@ -73,6 +73,6 @@ impl SavedWorkflow {
             self.state.clone(),
             graph,
         )
-        .map_err(|_| StoreError::Corrupt("workflowの保存版"))
+        .map_err(|_| StoreError::Corrupt("Saved workflow version"))
     }
 }

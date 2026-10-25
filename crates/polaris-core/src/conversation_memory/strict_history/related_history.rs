@@ -28,7 +28,9 @@ impl StrictHistory {
         lock.check_snapshot(&expected)?;
         let current = lock.snapshot()?;
         if accepted_query(&current)? != query {
-            return Err(io::Error::other("関連検索中に受理入力が変わりました"));
+            return Err(io::Error::other(
+                "Admitted input changed during related search",
+            ));
         }
         let parts = embedded.checked_parts(accepted_query(&current)?)?;
         let memory = MemoryStore::open_read_only(database).map_err(io::Error::other)?;
@@ -103,7 +105,11 @@ impl StrictHistory {
         expected: &ConversationSnapshot,
         pending: &PendingSummary,
     ) -> io::Result<()> {
-        let invalid = || io::Error::other("関連要約の保存応答・原文・資源が一致しません");
+        let invalid = || {
+            io::Error::other(
+                "The saved related summary response, source text, and resources do not match",
+            )
+        };
         let metadata = self.embedding_metadata();
         if pending.scope.project_id != expected.state.project_id
             || pending.model != SUMMARY_MODEL
@@ -153,7 +159,9 @@ impl StrictHistory {
 
 fn accepted_query(snapshot: &ConversationSnapshot) -> io::Result<&str> {
     if snapshot.state.history_mode != HistoryMode::Structured10 {
-        return Err(io::Error::other("関連検索は構造化記憶でのみ利用できます"));
+        return Err(io::Error::other(
+            "Related search requires structured memory",
+        ));
     }
     snapshot
         .events
@@ -166,7 +174,7 @@ fn accepted_query(snapshot: &ConversationSnapshot) -> io::Result<&str> {
         })
         .map(|event| event.message.content.as_str())
         .filter(|query| !query.trim().is_empty())
-        .ok_or_else(|| io::Error::other("関連検索の受理入力がありません"))
+        .ok_or_else(|| io::Error::other("No admitted input for related search"))
 }
 
 pub(super) fn mandatory_context(

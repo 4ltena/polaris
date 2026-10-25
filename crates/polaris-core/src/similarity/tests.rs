@@ -42,7 +42,7 @@ fn two_copies_of_the_same_work_are_found_and_unrelated_folders_are_not() {
         graph.proposals[0].suggestion,
         Suggestion::SameWorkInTwoPlaces
     );
-    assert!(graph.proposals[0].because.contains("類似度"));
+    assert!(graph.proposals[0].because.contains("similarity"));
     assert_eq!(graph.omitted, 0);
 }
 

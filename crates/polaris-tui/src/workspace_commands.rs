@@ -1,184 +1,43 @@
 //! Workspace projections remain UI-only and bound to the startup source.
 use crate::{approver::KeyReader, render};
 use polaris_core::{management_effect::*, rewind_workspace::WorkspaceOwner};
-use polaris_desktop_protocol::workspace_view::{AttachmentState, ViewState};
+use polaris_desktop_protocol::workspace_view::ViewState;
 use polaris_desktop_service::{WorkspaceSourceIdentity, WorkspaceViewReader};
 use ratatui::{Terminal, backend::Backend, text::Line};
 use std::{
     cell::RefCell,
     os::unix::fs::MetadataExt,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 pub(crate) struct WorkspaceCommands {
     source: PathBuf,
     identity: WorkspaceSourceIdentity,
     reader: WorkspaceViewReader,
-    completed_recipe:
-        RefCell<Option<polaris_core::management_effect::workspace_change::GitRecipeReceiptV1>>,
 }
 
 impl WorkspaceCommands {
     pub(crate) fn new(source: PathBuf, identity: WorkspaceSourceIdentity) -> Result<Self, String> {
         let reader = WorkspaceViewReader::new(source.clone(), identity)
-            .map_err(|_| "起動時の対象フォルダを確認できません")?;
+            .map_err(|_| "Cannot verify the startup target folder")?;
         Ok(Self {
             source,
             identity,
             reader,
-            completed_recipe: RefCell::new(None),
         })
     }
 
     fn require_source(&self) -> Result<(), String> {
-        let metadata =
-            std::fs::symlink_metadata(&self.source).map_err(|_| "対象フォルダを確認できません")?;
+        let metadata = std::fs::symlink_metadata(&self.source)
+            .map_err(|_| "Cannot verify the target folder")?;
         if !metadata.is_dir()
             || metadata.dev() != self.identity.device
             || metadata.ino() != self.identity.inode
         {
-            return Err("起動時の対象フォルダが変更されました。再起動してください".into());
+            return Err("The startup target folder changed. Restart".into());
         }
         Ok(())
     }
-
-    pub(crate) fn browse(&self, request: &str) -> Result<Vec<Line<'static>>, String> {
-        self.require_source()?;
-        let request = request.trim();
-        let selected = if request.is_empty() || request == "list" {
-            None
-        } else {
-            let value = request
-                .strip_prefix("read ")
-                .ok_or("/browse [list|read <相対パス>]")?;
-            if !valid_relative(value) {
-                return Err("対象フォルダ内の相対パスを指定してください".into());
-            }
-            Some(value)
-        };
-        let view = self.reader.read(selected);
-        if view.state != ViewState::Ready {
-            return Err(view
-                .git
-                .reason
-                .unwrap_or_else(|| "対象フォルダを読み取れません".into()));
-        }
-        let mut lines = vec![Line::from(
-            "フォルダの読み取り専用表示。モデルへの送信は行いません。",
-        )];
-        if let Some(selected) = selected {
-            let file = view
-                .files
-                .iter()
-                .find(|file| file.path == selected)
-                .ok_or("対象ファイルが存在しないか、保護対象または一覧上限の範囲外です")?;
-            if let Some(reason) = &file.unavailable_reason {
-                return Err(reason.clone());
-            }
-            lines.push(Line::from(render::sanitize(&file.path)));
-            lines.extend(
-                file.body
-                    .lines()
-                    .map(|line| Line::from(render::sanitize(line))),
-            );
-            if file.body.is_empty() {
-                lines.push(Line::from("空のファイルです"));
-            }
-        } else {
-            lines.push(Line::from(format!(
-                "ファイル: {}件（最大256件）",
-                view.files.len()
-            )));
-            lines.extend(
-                view.files
-                    .iter()
-                    .map(|file| Line::from(render::sanitize(&file.path))),
-            );
-        }
-        lines.extend(
-            view.notices
-                .into_iter()
-                .map(|line| Line::from(render::sanitize(&line))),
-        );
-        if let Some(reason) = view.git.reason {
-            lines.push(Line::from(format!(
-                "Git情報: {}",
-                render::sanitize(&reason)
-            )));
-        }
-        Ok(lines)
-    }
-
-    pub(crate) fn attachment(&self, request: &str) -> Result<Vec<Line<'static>>, String> {
-        self.require_source()?;
-        let request = request
-            .trim()
-            .strip_prefix("read ")
-            .unwrap_or(request.trim());
-        if request.is_empty() || request.len() > 4096 || request.chars().any(char::is_control) {
-            return Err("/attachment <パス>（UTF-8テキスト、最大64KiB）".into());
-        }
-        let requested = Path::new(request);
-        let path = if requested.is_absolute() {
-            if !requested
-                .components()
-                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
-            {
-                return Err("添付のパスに . や .. を含められません".into());
-            }
-            requested.to_owned()
-        } else {
-            if !valid_relative(request) {
-                return Err("添付の相対パスを確認してください".into());
-            }
-            self.source.join(requested)
-        };
-        let view = WorkspaceViewReader::read_attachment(&path);
-        if view.state != AttachmentState::Ready {
-            return Err(view.reason.unwrap_or_else(|| "添付を読み取れません".into()));
-        }
-        let mut lines = vec![Line::from(format!(
-            "添付プレビュー: {}（未送信・会話には保存しません）",
-            render::sanitize(view.name.as_deref().unwrap_or("添付"))
-        ))];
-        lines.extend(
-            view.text
-                .unwrap_or_default()
-                .lines()
-                .map(|line| Line::from(render::sanitize(line))),
-        );
-        Ok(lines)
-    }
-}
-
-fn valid_relative(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 4096
-        && !value.chars().any(char::is_control)
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-        && !Path::new(value).is_absolute()
-}
-
-pub(crate) fn recipes(request: &str) -> Result<Vec<Line<'static>>, String> {
-    let request = request.trim();
-    if !request.is_empty() && request != "list" {
-        return Err("/recipe list（実行せず定義を表示）".into());
-    }
-    let mut lines = vec![Line::from(
-        "組み込みレシピ定義。インストール・設定・検証は実行しません。",
-    )];
-    for recipe in polaris_core::recipe::RECIPES {
-        lines.push(Line::from(format!(
-            "{} v{} — {}",
-            recipe.id, recipe.schema_version, recipe.manifest
-        )));
-        for step in recipe.steps {
-            lines.push(Line::from(format!("  {}: {:?}", step.id, step.kind)));
-        }
-    }
-    Ok(lines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,27 +59,31 @@ fn decided<B: Backend, R: KeyReader>(
             .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
         || at.chars().any(char::is_control)
     {
-        return Err("決定事項は空白以外の本文を8KiB以内で指定してください".into());
+        return Err("Specify non-whitespace decision text within 8 KiB".into());
     }
     if has_pending {
-        return Err("送信待ちの入力があるため決定事項を保存できません".into());
+        return Err("Cannot save decisions while input is queued".into());
     }
     let lease = workspace
         .try_mutation()
-        .map_err(|_| "実行中の操作があるため保存できません")?;
+        .map_err(|_| "Cannot save while an operation is active")?;
     workspace
         .require_quiescent_with_lease(&lease)
-        .map_err(|_| "復旧待ちの操作があります")?;
+        .map_err(|_| "An operation awaits recovery")?;
     polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
         workspace.project_root(),
         effects.state_dir(),
         &lease,
     )
     .map_err(|error| error.to_string())?;
-    let cursor = effects.cursor().map_err(|_| "管理効果を確認できません")?;
+    let cursor = effects
+        .cursor()
+        .map_err(|_| "Cannot verify the management effect")?;
     let request = PrepareManagementEffectV1 {
-        operation_id: ManagementOperationIdV1::random().map_err(|_| "操作IDを作れません")?,
-        inventory: ManagementInventoryIdV1::parse("C35").map_err(|_| "操作を確認できません")?,
+        operation_id: ManagementOperationIdV1::random()
+            .map_err(|_| "Cannot create an operation ID")?,
+        inventory: ManagementInventoryIdV1::parse("C35")
+            .map_err(|_| "Cannot verify the operation")?,
         scope: ManagementEffectScopeV1 {
             project: effects.project_scope_hash(),
             session: None,
@@ -230,31 +93,31 @@ fn decided<B: Backend, R: KeyReader>(
             account_binding: None,
         },
         request_hash: ManagementEffectHashV1::digest(
-            &serde_json::to_vec(&(at, text)).map_err(|_| "決定事項を確認できません")?,
+            &serde_json::to_vec(&(at, text)).map_err(|_| "Cannot verify decisions")?,
         ),
         rewind: ManagementRewindDispositionV1::IrreversibleLocal,
     };
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = effects
         .prepare(&lease, cursor, request)
-        .map_err(|_| "管理効果を準備できません")?
+        .map_err(|_| "Cannot prepare the management effect")?
     else {
-        return Err("同じ操作が記録されています".into());
+        return Err("The same operation is already recorded".into());
     };
     if !crate::account::confirm(
         terminal,
         reader,
-        "決定事項の保存",
+        "Save decision",
         ".polaris/decisions.csv",
         text,
     ) {
         effects
             .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
-            .map_err(|_| "取消を記録できません")?;
-        return Ok(vec![Line::from("決定事項の保存を取り消しました")]);
+            .map_err(|_| "Cannot record cancellation")?;
+        return Ok(vec![Line::from("Decision save cancelled")]);
     }
     let started = effects
         .start(&lease, &prepared)
-        .map_err(|_| "保存開始を記録できません")?;
+        .map_err(|_| "Cannot record the save start")?;
     if polaris_core::decisions::append(workspace.project_root(), at, text).is_err() {
         effects
             .mark_outcome_unknown(
@@ -262,8 +125,8 @@ fn decided<B: Backend, R: KeyReader>(
                 &started,
                 ManagementUnknownReasonV1::UnclassifiedEffect,
             )
-            .map_err(|_| "保存結果と管理効果を確認できません。再実行しないでください")?;
-        return Err("決定事項の保存結果が不明です。自動で再実行しません".into());
+            .map_err(|_| "Cannot verify the save outcome or management effect. Do not rerun")?;
+        return Err("Decision save outcome is unknown. No automatic retry will occur".into());
     }
     effects
         .complete_started(
@@ -271,9 +134,9 @@ fn decided<B: Backend, R: KeyReader>(
             &started,
             ManagementEffectHashV1::digest(b"decision append durably acknowledged"),
         )
-        .map_err(|_| "保存後の記録に失敗しました。再実行しないでください")?;
+        .map_err(|_| "Recording failed after saving. Do not rerun")?;
     Ok(vec![Line::from(
-        "決定事項を保存しました。過去の記録であり、現在の承認にはなりません。",
+        "Decision saved. This is a historical record, not current approval.",
     )])
 }
 
@@ -291,7 +154,7 @@ impl WorkspaceCommands {
     ) -> Result<Vec<Line<'static>>, String> {
         self.require_source()?;
         if workspace.project_root() != self.source {
-            return Err("保存先と起動時の対象フォルダが一致しません".into());
+            return Err("Storage location does not match the startup target folder".into());
         }
         decided(text, at, terminal, reader, workspace, effects, has_pending)
     }
@@ -308,43 +171,15 @@ impl WorkspaceCommands {
         effects: &ManagementEffectStoreV1,
         has_pending: bool,
     ) -> Result<Vec<Line<'static>>, String> {
-        use polaris_core::management_effect::workspace_change::{
-            WorkspaceChangeOwnerV1, nextjs_plan,
-        };
+        use polaris_core::management_effect::workspace_change::WorkspaceChangeOwnerV1;
         self.require_source()?;
         if workspace.project_root() != self.source {
-            return Err("対象projectが一致しません".into());
+            return Err("Target project mismatch".into());
         }
         match request.trim() {
-            "nextjs" => {
-                let plan = nextjs_plan(&self.source)?;
-                self.require_source()?;
-                let mut lines = vec![Line::from(
-                    "Next.js: 検出と計画のみ。導入・設定・起動確認は未実装です。",
-                )];
-                match plan {
-                    polaris_core::recipe::Plan::NotApplicable { reason } => {
-                        lines.push(Line::from(format!("適用不可: {reason:?}")))
-                    }
-                    polaris_core::recipe::Plan::Run { manager, steps } => {
-                        lines.push(Line::from(format!("管理ツール: {}", manager.program())));
-                        for step in steps {
-                            let command = polaris_core::recipe::command(
-                                &polaris_core::recipe::NEXT_JS,
-                                step,
-                                manager,
-                            )
-                            .map(|(program, args)| format!("{program} {}", args.join(" ")))
-                            .unwrap_or_default();
-                            lines.push(Line::from(format!("予定: {step} — {command}（未実行）")));
-                        }
-                    }
-                }
-                Ok(lines)
-            }
             "git" => {
                 if has_pending {
-                    return Err("送信待ちの入力があるためGit設定を開始できません".into());
+                    return Err("Cannot start Git setup while input is queued".into());
                 }
                 let owner = WorkspaceChangeOwnerV1 {
                     workspace,
@@ -358,17 +193,17 @@ impl WorkspaceCommands {
                     .map(|text| Line::from(render::sanitize(text)))
                     .collect::<Vec<_>>();
                 if preview.additions.is_empty() {
-                    lines.push(Line::from(".gitignoreに追加する規則はありません"));
+                    lines.push(Line::from("No rules to add to .gitignore"));
                     return Ok(lines);
                 }
                 let detail = format!(
-                    "追加する規則:\n{}\n既存の行・順序・否定規則を保持します。",
+                    "Rules to add:\n{}\nExisting lines, order, and negation rules are retained.",
                     preview.additions.join("\n")
                 );
                 let accepted = crate::account::confirm(
                     terminal,
                     reader,
-                    "Git ignore規則の追加",
+                    "Add Git ignore rules",
                     ".gitignore",
                     &detail,
                 );
@@ -380,16 +215,15 @@ impl WorkspaceCommands {
                 match owner.git(&preview, accepted, current_plan)? {
                     Some(receipt) => {
                         lines.push(Line::from(format!(
-                            "追加済み: {}",
+                            "Already added: {}",
                             receipt.additions.join(", ")
                         )));
-                        *self.completed_recipe.borrow_mut() = Some(receipt);
                     }
-                    None => lines.push(Line::from("Git設定を取り消しました")),
+                    None => lines.push(Line::from("Git setup cancelled")),
                 }
                 Ok(lines)
             }
-            _ => Err("/setting nextjs|git。Next.jsの実導入は利用できません。".into()),
+            _ => Err("Usage: /setting git".into()),
         }
     }
 
@@ -403,7 +237,7 @@ impl WorkspaceCommands {
             return Err(view
                 .git
                 .reason
-                .unwrap_or_else(|| "Gitの安全な配置を確認できません".into()));
+                .unwrap_or_else(|| "Cannot verify safe Git layout".into()));
         }
         // Ready requires this source's direct .git directory and its bounded
         // protected-tree check; external gitdirs and nested projects refuse.
@@ -417,86 +251,6 @@ impl WorkspaceCommands {
         };
         self.require_source()?;
         Ok(plan(Ok(Placement::Own { head })))
-    }
-
-    pub(crate) fn handoff(&self, request: &str) -> Result<Vec<Line<'static>>, String> {
-        self.require_source()?;
-        if request.len() > 4096 || request.chars().any(|ch| ch.is_control() && ch != '\n') {
-            return Err("引継ぎの内容が上限を超えています".into());
-        }
-        let mut parts = request.split('|').map(str::trim);
-        let summary = parts.next().unwrap_or_default();
-        let checks = parts
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if summary.is_empty() || checks.is_empty() {
-            return Err("/handoff <概要> | <実機で確認する項目> [| <追加項目>]".into());
-        }
-        let (run_id, attempt_id, paths) = if let Some(receipt) =
-            self.completed_recipe.borrow().as_ref()
-        {
-            let current = polaris_core::recipe::ignore_rules::read(&self.source)
-                .map_err(|_| "記録した変更の現在値を確認できません")?;
-            if polaris_core::conversation_state::content_hash(current.as_bytes())
-                != receipt.postimage_hash
-            {
-                return Err(
-                    "Git設定の完了記録から対象が変更されています。旧結果を引き継ぎません。".into(),
-                );
-            }
-            (
-                receipt.run_id.clone(),
-                receipt.attempt_id.clone(),
-                vec![".gitignore".into()],
-            )
-        } else {
-            let view = self.reader.read(None);
-            if view.state != ViewState::Ready
-                || view.git.state != polaris_desktop_protocol::workspace_view::GitState::Ready
-            {
-                return Err("保護対象を除いたGit変更を確認できません".into());
-            }
-            let run_id = view
-                .git
-                .head
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            if run_id.len() < 12 || !run_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(
-                    "実装世代がありません。GitのHEADまたはこのTUIで完了した設定が必要です。".into(),
-                );
-            }
-            let mut paths = view
-                .files
-                .iter()
-                .filter(|file| file.modified || file.staged)
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>();
-            if paths.len() > polaris_core::handoff::MAX_PATHS {
-                return Err("変更ファイルが32件を超えます".into());
-            }
-            paths.sort();
-            paths.dedup();
-            (run_id, "1".into(), paths)
-        };
-        let implementation = polaris_core::handoff::Implementation {
-            run_id,
-            attempt_id,
-            project_root: self.source.display().to_string(),
-            paths,
-            summary: summary.to_owned(),
-            checks,
-        };
-        let text = polaris_core::handoff::prompt(&implementation)
-            .map_err(|reason| format!("引継ぎを作成できません: {reason:?}"))?;
-        self.require_source()?;
-        Ok(text
-            .lines()
-            .map(|line| Line::from(render::sanitize(line)))
-            .collect())
     }
 }
 
@@ -533,7 +287,6 @@ mod tests {
         let source = home.join("project");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("visible.txt"), "visible body").unwrap();
-        std::fs::write(source.join("large.txt"), vec![b'x'; 65537]).unwrap();
         std::os::unix::fs::symlink(source.join("visible.txt"), source.join("link.txt")).unwrap();
         let metadata = std::fs::metadata(&source).unwrap();
         let commands = WorkspaceCommands::new(
@@ -544,20 +297,6 @@ mod tests {
             },
         )
         .unwrap();
-        let show = |lines: Vec<Line<'static>>| {
-            lines
-                .iter()
-                .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(show(commands.browse("list").unwrap()).contains("visible.txt"));
-        assert!(show(commands.browse("read visible.txt").unwrap()).contains("visible body"));
-        assert!(commands.browse("read ../visible.txt").is_err());
-        assert!(commands.browse("read large.txt").is_err());
-        assert!(show(commands.attachment("visible.txt").unwrap()).contains("未送信"));
-        assert!(commands.attachment("link.txt").is_err());
-        assert!(show(recipes("list").unwrap()).contains("nextjs"));
         let state = polaris_core::project::state_dir(&source).unwrap();
         crate::source_apply::prepare_state(&source, &state).unwrap();
         let workspace =
@@ -605,17 +344,15 @@ mod tests {
         let moved = home.join("old-project");
         std::fs::rename(&source, moved).unwrap();
         std::fs::create_dir(&source).unwrap();
-        assert!(commands.browse("list").is_err());
-        assert!(commands.attachment("visible.txt").is_err());
     }
 
     #[test]
-    fn m3f_setting_and_handoff_use_real_recipe_results() {
+    fn m3f_setting_uses_real_recipe_results() {
         if std::env::var_os("POLARIS_M3F_SETTING_CHILD").is_none() {
             let home = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "workspace_commands::tests::m3f_setting_and_handoff_use_real_recipe_results",
+                    "workspace_commands::tests::m3f_setting_uses_real_recipe_results",
                     "--exact",
                     "--nocapture",
                 ])
@@ -665,41 +402,22 @@ mod tests {
         let effects = ManagementEffectStoreV1::open_at_state_dir(&source, &state, &lease).unwrap();
         drop(lease);
         let terminal = RefCell::new(Terminal::new(TestBackend::new(160, 45)).unwrap());
-        let text = |lines: Vec<Line<'static>>| {
-            lines
-                .iter()
-                .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
         let mut no_keys = Keys(VecDeque::new());
-        let planned = text(
-            commands
-                .setting(
-                    "nextjs",
-                    &terminal,
-                    &mut no_keys,
-                    &workspace,
-                    &effects,
-                    false,
-                )
-                .unwrap(),
-        );
-        assert!(planned.contains("予定: detect") && planned.contains("未実装"));
+        for removed in ["nextjs", "nextjs --install"] {
+            assert!(
+                commands
+                    .setting(
+                        removed,
+                        &terminal,
+                        &mut no_keys,
+                        &workspace,
+                        &effects,
+                        false
+                    )
+                    .is_err()
+            );
+        }
         assert!(!source.join("node_modules").exists());
-        assert!(
-            commands
-                .setting(
-                    "nextjs --install",
-                    &terminal,
-                    &mut no_keys,
-                    &workspace,
-                    &effects,
-                    false
-                )
-                .is_err()
-        );
-        assert!(commands.handoff("概要").is_err());
         let mut cancel = Keys(VecDeque::from([KeyCode::Esc]));
         commands
             .setting("git", &terminal, &mut cancel, &workspace, &effects, false)
@@ -724,18 +442,6 @@ mod tests {
         let published = writer.snapshot().unwrap();
         assert!(published.state.runs.last().unwrap().run.state.is_terminal());
         drop(writer);
-        let handoff = text(
-            commands
-                .handoff("ignore追加 | .gitignoreを実機で確認")
-                .unwrap(),
-        );
-        assert!(
-            handoff.contains("git-tidy-")
-                && handoff.contains(".gitignore")
-                && handoff.contains("実機での合格は含まない")
-        );
-        std::fs::write(source.join(".gitignore"), format!("{after}changed\n")).unwrap();
-        assert!(commands.handoff("概要 | 確認").is_err());
         let owner = polaris_core::management_effect::workspace_change::WorkspaceChangeOwnerV1 {
             workspace: &workspace,
             effects: &effects,

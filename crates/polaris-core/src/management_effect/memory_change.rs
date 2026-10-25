@@ -56,7 +56,7 @@ fn failure(message: &str) -> String {
 }
 fn protected_snapshot() -> Result<ProtectedPathsSnapshot, String> {
     polaris_auth::protection::with_protected_paths(Clone::clone)
-        .map_err(|_| failure("認証ストアの保護情報を確認できません"))
+        .map_err(|_| failure("Cannot verify authentication store protection metadata"))
 }
 fn protected(path: &Path, metadata: &fs::Metadata, snapshot: &ProtectedPathsSnapshot) -> bool {
     snapshot
@@ -74,13 +74,13 @@ impl MemoryChangeOwnerV1<'_> {
         let project = fs::canonicalize(self.project_root).map_err(|e| e.to_string())?;
         let identity = project
             .to_str()
-            .ok_or_else(|| failure("プロジェクト名がUTF-8ではありません"))?;
+            .ok_or_else(|| failure("Project name is not UTF-8"))?;
         if !project.is_dir()
             || ManagementEffectHashV1::digest(identity.as_bytes())
                 != self.effects.project_scope_hash()
             || self.lease.store_root() != self.effects.state_dir().join("rewind-workspace")
         {
-            return Err(failure("メモリownerのプロジェクトが一致しません"));
+            return Err(failure("Memory owner project mismatch"));
         }
         let data = fs::canonicalize(self.data_root).map_err(|e| e.to_string())?;
         if data
@@ -88,7 +88,7 @@ impl MemoryChangeOwnerV1<'_> {
             .join(crate::project::project_id(&project))
             != self.effects.state_dir()
         {
-            return Err(failure("メモリ保存先が対象プロジェクトと一致しません"));
+            return Err(failure("Memory storage does not match the target project"));
         }
         Ok(identity.to_owned())
     }
@@ -104,11 +104,11 @@ impl MemoryChangeOwnerV1<'_> {
             || meta.mode() & 0o22 != 0
             || protected(self.effects.state_dir(), &meta, &snapshot)
         {
-            return Err(failure("メモリ保存先は保護されています"));
+            return Err(failure("Memory storage is protected"));
         }
         let path = self.effects.state_dir().join("memory.sqlite3");
         if snapshot.paths().contains(&path) {
-            return Err(failure("メモリ保存先は保護されています"));
+            return Err(failure("Memory storage is protected"));
         }
         let name = c"memory.sqlite3";
         let fd = unsafe {
@@ -133,7 +133,7 @@ impl MemoryChangeOwnerV1<'_> {
             || meta.uid() != unsafe { libc::geteuid() }
             || protected(&path, &meta, &snapshot)
         {
-            return Err(failure("メモリDBが通常の専用ファイルではありません"));
+            return Err(failure("Memory DB is not a regular dedicated file"));
         }
         named_identity(&directory, name.to_bytes(), &meta).map_err(|e| e.to_string())?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
@@ -149,10 +149,10 @@ impl MemoryChangeOwnerV1<'_> {
         let path = Path::new(
             store
                 .database_path()
-                .ok_or_else(|| failure("永続メモリDBが必要です"))?,
+                .ok_or_else(|| failure("A persistent memory DB is required"))?,
         );
         if path != self.effects.state_dir().join("memory.sqlite3") {
-            return Err(failure("メモリDBがownerと一致しません"));
+            return Err(failure("Memory DB does not match the owner"));
         }
         let parent =
             open_directory_nofollow(self.effects.state_dir()).map_err(|e| e.to_string())?;
@@ -164,7 +164,7 @@ impl MemoryChangeOwnerV1<'_> {
             || meta.nlink() != 1
             || protected(path, &meta, &protected_snapshot()?)
         {
-            return Err(failure("メモリDBの保護状態が変わりました"));
+            return Err(failure("Memory DB protection state changed"));
         }
         Ok(project)
     }
@@ -180,7 +180,7 @@ impl MemoryChangeOwnerV1<'_> {
             .session_id()
             .is_some_and(|s| self.active_session == Some(s))
         {
-            return Err(failure("現在使用中のセッションは削除できません"));
+            return Err(failure("Cannot delete the active session"));
         }
         let hash = store
             .validate_change(&project, &request)
@@ -188,7 +188,7 @@ impl MemoryChangeOwnerV1<'_> {
         let operation_id = request
             .operation_id
             .parse()
-            .map_err(|_| failure("操作IDが不正です"))?;
+            .map_err(|_| failure("Invalid operation ID"))?;
         let effect = PrepareManagementEffectV1 {
             operation_id,
             inventory: ManagementInventoryIdV1::parse(request.change.kind().inventory())
@@ -237,7 +237,7 @@ impl MemoryChangeOwnerV1<'_> {
             .request
             .operation_id
             .parse()
-            .map_err(|_| failure("操作IDが不正です"))?;
+            .map_err(|_| failure("Invalid operation ID"))?;
         let Some(prepared) = &change.prepared else {
             if self
                 .effects
@@ -250,7 +250,7 @@ impl MemoryChangeOwnerV1<'_> {
                 return self.reconcile(store, operation_id).map(Some);
             }
             return Err(failure(
-                "既存操作の結果は確定していません。明示的な照合が必要です",
+                "The existing operation outcome is unresolved. Explicit reconciliation is required",
             ));
         };
         if !accepted {
@@ -274,7 +274,7 @@ impl MemoryChangeOwnerV1<'_> {
             self.effects
                 .deny(self.lease, prepared, ManagementDenialReasonV1::InvalidState)
                 .map_err(|e| e.to_string())?;
-            return Err(failure("現在使用中のセッションは削除できません"));
+            return Err(failure("Cannot delete the active session"));
         }
         let _memory_lock = if change.request.change.session_id().is_some() {
             let directory =
@@ -307,7 +307,7 @@ impl MemoryChangeOwnerV1<'_> {
                     &protected_snapshot()?,
                 )
             {
-                return Err(failure("メモリ削除lockが保護されています"));
+                return Err(failure("Memory deletion lock is protected"));
             }
             file.try_lock().map_err(|e| e.to_string())?;
             Some(file)
@@ -378,7 +378,7 @@ impl MemoryChangeOwnerV1<'_> {
                         ManagementDenialReasonV1::PermissionDenied,
                     )
                     .map_err(|e| e.to_string())?;
-                return Err(failure("保管原文の所属が一致しません"));
+                return Err(failure("Archived source ownership mismatch"));
             }
         }
         let started = self
@@ -411,7 +411,7 @@ impl MemoryChangeOwnerV1<'_> {
                 )
                 .map_err(|e| e.to_string())?;
             return Err(format!(
-                "索引削除は保存済みです。保管原文の削除結果は不明です: {error}"
+                "Index deletion saved. Archived source deletion outcome is unknown: {error}"
             ));
         }
         let evidence = receipt_hash(&receipt)?;
@@ -428,7 +428,9 @@ impl MemoryChangeOwnerV1<'_> {
                     ManagementUnknownReasonV1::ReceiptPersistenceFailed,
                 )
                 .map_err(|e| e.to_string())?;
-            return Err(failure("変更は保存済みです。管理receiptの結果は不明です"));
+            return Err(failure(
+                "Changes saved. Management receipt outcome is unknown",
+            ));
         }
         Ok(Some(receipt))
     }
@@ -444,13 +446,13 @@ impl MemoryChangeOwnerV1<'_> {
             .effects
             .effect(operation)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| failure("管理receiptがありません"))?;
+            .ok_or_else(|| failure("No management receipt"))?;
         let kind = match effect.request.inventory.encoded().as_str() {
             "C14" => MemoryChangeKindV1::Import,
             "C18" => MemoryChangeKindV1::Embed,
             "C19" => MemoryChangeKindV1::Index,
             "C20" => MemoryChangeKindV1::Forget,
-            _ => return Err(failure("対象外の管理操作です")),
+            _ => return Err(failure("Unrelated management operation")),
         };
         if effect.request.scope.project != self.effects.project_scope_hash()
             || effect.request.scope.generation != 1
@@ -463,7 +465,7 @@ impl MemoryChangeOwnerV1<'_> {
                 }
             || effect.request.rewind != ManagementRewindDispositionV1::IrreversibleLocal
         {
-            return Err(failure("管理receiptの所属が一致しません"));
+            return Err(failure("Management receipt ownership mismatch"));
         }
         let receipt = store
             .change_receipt(&project, &operation.as_hex())
@@ -486,20 +488,20 @@ impl MemoryChangeOwnerV1<'_> {
                     .map_err(|e| e.to_string())?;
             }
             return Err(failure(
-                "確定したメモリ変更はありません。再実行には新しい明示操作が必要です",
+                "No finalized memory change. Rerunning requires a new explicit operation",
             ));
         };
         if receipt.kind != kind
             || receipt.request_hash != effect.request.request_hash.as_hex()
             || receipt.before_revision != effect.request.scope.revision
         {
-            return Err(failure("メモリreceiptの要求が一致しません"));
+            return Err(failure("Memory receipt request mismatch"));
         }
         if kind == MemoryChangeKindV1::Forget {
             let session = receipt
                 .session_id
                 .as_deref()
-                .ok_or_else(|| failure("削除receiptのセッションがありません"))?;
+                .ok_or_else(|| failure("Missing session in the deletion receipt"))?;
             validate_session_id(session).map_err(|e| e.to_string())?;
             if effect.request.scope.session
                 != Some(ManagementEffectHashV1::digest(session.as_bytes()))
@@ -507,7 +509,7 @@ impl MemoryChangeOwnerV1<'_> {
                     .is_session_forgotten(&project, session)
                     .map_err(|e| e.to_string())?
             {
-                return Err(failure("削除receiptの所属が一致しません"));
+                return Err(failure("Deletion receipt ownership mismatch"));
             }
             if root_present(&self.data_root.join("sessions-v2").join(session))?
                 || root_present(
@@ -519,7 +521,7 @@ impl MemoryChangeOwnerV1<'_> {
                 )?
             {
                 return Err(failure(
-                    "削除途中の保管原文があります。結果不明を維持します",
+                    "Archived source deletion is incomplete. The outcome remains unknown",
                 ));
             }
         }
@@ -533,13 +535,13 @@ impl MemoryChangeOwnerV1<'_> {
                     .effects
                     .unknown_effect(operation)
                     .map_err(|e| e.to_string())?
-                    .ok_or_else(|| failure("結果不明receiptが変わりました"))?;
+                    .ok_or_else(|| failure("The unknown-outcome receipt changed"))?;
                 self.effects
                     .complete_unknown(self.lease, &unknown, evidence)
                     .map_err(|e| e.to_string())?;
                 Ok(receipt)
             }
-            _ => Err(failure("管理操作は照合可能な状態ではありません")),
+            _ => Err(failure("The management operation is not reconcilable")),
         }
     }
 
@@ -566,13 +568,13 @@ impl MemoryChangeOwnerV1<'_> {
                 continue;
             }
             if node.path.extension().and_then(|s| s.to_str()) != Some("json") {
-                return Err(failure("保管原文に未定義のファイルがあります"));
+                return Err(failure("Archived sources contain an undefined file"));
             }
             total = total
                 .checked_add(node.file.metadata().map_err(|e| e.to_string())?.len())
-                .ok_or_else(|| failure("保管原文が上限を超えました"))?;
+                .ok_or_else(|| failure("Archived sources exceed the limit"))?;
             if total > 8 * 1024 * 1024 {
-                return Err(failure("保管原文が上限を超えました"));
+                return Err(failure("Archived sources exceed the limit"));
             }
             let mut bytes = Vec::new();
             (&node.file)
@@ -580,17 +582,15 @@ impl MemoryChangeOwnerV1<'_> {
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             if bytes.len() > 8 * 1024 * 1024 {
-                return Err(failure("保管原文が上限を超えました"));
+                return Err(failure("Archived sources exceed the limit"));
             }
             let json: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|_| failure("保管原文の所属を確認できません"))?;
+                .map_err(|_| failure("Cannot verify archived source ownership"))?;
             if json["version"] != 1
                 || json["project_id"].as_str() != Some(project)
                 || json["session_id"].as_str() != Some(session)
             {
-                return Err(failure(
-                    "保管原文のプロジェクトまたはセッションが一致しません",
-                ));
+                return Err(failure("Archived source project or session mismatch"));
             }
         }
         Ok(plan)
@@ -607,20 +607,22 @@ fn root_present(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(failure("削除対象が通常のディレクトリではありません"));
+                return Err(failure("The deletion target is not a regular directory"));
             }
             open_directory_nofollow(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut ancestor = path.parent().ok_or_else(|| failure("削除先が不正です"))?;
+            let mut ancestor = path
+                .parent()
+                .ok_or_else(|| failure("Invalid deletion destination"))?;
             loop {
                 match open_directory_nofollow(ancestor) {
                     Ok(_) => return Ok(false),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         ancestor = ancestor
                             .parent()
-                            .ok_or_else(|| failure("削除先が不正です"))?
+                            .ok_or_else(|| failure("Invalid deletion destination"))?
                     }
                     Err(error) => return Err(error.to_string()),
                 }

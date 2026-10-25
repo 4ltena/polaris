@@ -223,10 +223,27 @@ pub fn mcp_setup_spec() -> ToolSpec {
 
 /// Root-only bundled setting commands. Arguments carry an operation name
 /// and nothing else: no path, no package, no command line.
+pub fn environment_spec() -> ToolSpec {
+    ToolSpec {
+        name: "environment".into(),
+        description: "Provision one fixed development environment through the host owner. Preserve explicit versions and existing lockfiles. The host asks once for a plan, downloads pinned resources, installs offline and verifies. Do not generate shell setup steps.".into(),
+        parameters: serde_json::json!({
+            "type":"object", "additionalProperties":false,
+            "required":["operation","profile"],
+            "properties": {
+                "operation":{"type":"string","enum":["set"]},
+                "profile":{"type":"string","enum":["node","nextjs","react","vue","svelte","astro","nuxt","angular","python","rust","go"]},
+                "target":{"type":"string","maxLength":4096},
+                "version":{"type":"string","maxLength":128}
+            }
+        }),
+    }
+}
+
 pub fn setting_spec() -> ToolSpec {
     ToolSpec {
         name: "setting".into(),
-        description: "Bundled Next.js and Git setup. `plan` only reads. `tidy` appends missing ignore rules to .gitignore and asks before writing. Installing packages is never done here.".into(),
+        description: "Git configuration only. `plan` inspects Git ignore rules; `tidy` adds missing rules after approval. Use the typed environment tool for environment setup.".into(),
         parameters: serde_json::json!({
             "type":"object",
             "properties":{

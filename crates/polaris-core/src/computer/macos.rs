@@ -46,7 +46,7 @@ fn run(script: &str) -> Result<String, String> {
         .arg("-e")
         .arg(script)
         .output()
-        .map_err(|error| format!("osascript を起動できません: {error}"))?;
+        .map_err(|error| format!("Cannot start osascript: {error}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
@@ -87,7 +87,7 @@ impl Driver for MacDriver {
         };
         let (roles, labels) = (split(&roles), split(&labels));
         if roles.len() != labels.len() {
-            return Err("役割と名前の件数が一致しません".into());
+            return Err("Role and name counts do not match".into());
         }
         Ok(roles
             .into_iter()

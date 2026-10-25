@@ -103,33 +103,33 @@ pub(super) fn populate(
         let mut input = source.open_copy_source(relative)?;
         let before = input
             .metadata()
-            .map_err(|_| "Unity source fileを確認できません")?;
+            .map_err(|_| "Cannot verify the Unity source file")?;
         if !entry.source_stamp.matches(&before) {
-            return Err("copy直前にUnity sourceが変更されました".into());
+            return Err("Unity source changed immediately before copying".into());
         }
         let mut output = create_file_at(destination_directory, &entry.relative)?;
         let digest = copy_hash(&mut input, &mut output, entry.bytes)?;
         if entry.sha256.as_deref() != Some(&digest) {
-            return Err("copy中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during copying".into());
         }
         if !input
             .metadata()
             .is_ok_and(|metadata| entry.source_stamp.matches(&metadata))
         {
-            return Err("copy中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during copying".into());
         }
         output
             .set_permissions(fs::Permissions::from_mode(entry.mode))
-            .map_err(|_| "Unity runtime fileを保護できません")?;
+            .map_err(|_| "Cannot protect the Unity runtime file")?;
         let copied = output
             .metadata()
-            .map_err(|_| "Unity runtime fileを確認できません")?;
+            .map_err(|_| "Cannot verify the Unity runtime file")?;
         if !copied.is_file()
             || copied.nlink() != 1
             || copied.uid() != unsafe { libc::geteuid() }
             || copied.mode() & 0o7777 != entry.mode
         {
-            return Err("Unity runtime copyのidentityが無効です".into());
+            return Err("Invalid Unity runtime copy identity".into());
         }
     }
     source.revalidate()?;
@@ -139,7 +139,7 @@ pub(super) fn populate(
         .map(|path| {
             path.to_str()
                 .map(ToOwned::to_owned)
-                .ok_or("Unity runtimeの固定除外pathを表現できません")
+                .ok_or("Cannot represent the Unity runtime fixed exclusion path")
         })
         .collect::<Result<Vec<_>, _>>()?;
     let manifest_bytes = serde_json::to_vec(&RuntimeManifest {
@@ -155,12 +155,12 @@ pub(super) fn populate(
         fixed_exclusions,
         hardlink_copy: "exact-esbuild-pair-to-two-independent-files",
     })
-    .map_err(|_| "Unity runtime manifestを作成できません")?;
+    .map_err(|_| "Cannot create the Unity runtime manifest")?;
     let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
     let mut manifest = create_file_at(destination_directory, MANIFEST.as_bytes())?;
     manifest
         .write_all(&manifest_bytes)
-        .map_err(|_| "Unity runtime manifestを書けません")?;
+        .map_err(|_| "Cannot write the Unity runtime manifest")?;
     let installed = InstalledRuntime {
         entries,
         manifest_bytes,
@@ -168,7 +168,7 @@ pub(super) fn populate(
     };
     installed
         .verify(destination_directory)
-        .map_err(|_| "Unity runtime copyを検証できません")?;
+        .map_err(|_| "Cannot verify the Unity runtime copy")?;
     Ok(installed)
 }
 
@@ -230,30 +230,30 @@ fn installed_entry(entry: &ManifestEntry) -> InstalledEntry {
 fn copy_hash(input: &mut File, output: &mut File, expected: u64) -> Result<String, String> {
     input
         .seek(SeekFrom::Start(0))
-        .map_err(|_| "Unity source fileを読めません")?;
+        .map_err(|_| "Cannot read the Unity source file")?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
         let count = input
             .read(&mut buffer)
-            .map_err(|_| "Unity source fileを読めません")?;
+            .map_err(|_| "Cannot read the Unity source file")?;
         if count == 0 {
             break;
         }
         total = total
             .checked_add(count as u64)
-            .ok_or("Unity source fileが大きすぎます")?;
+            .ok_or("The Unity source file is too large")?;
         if total > expected {
-            return Err("copy中にUnity sourceが変更されました".into());
+            return Err("Unity source changed during copying".into());
         }
         digest.update(&buffer[..count]);
         output
             .write_all(&buffer[..count])
-            .map_err(|_| "Unity runtime fileを書けません")?;
+            .map_err(|_| "Cannot write the Unity runtime file")?;
     }
     if total != expected {
-        return Err("copy中にUnity sourceが変更されました".into());
+        return Err("Unity source changed during copying".into());
     }
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -351,20 +351,20 @@ fn require_same_named_entry(
 fn create_directory_at(root: &File, relative: &[u8]) -> Result<(), String> {
     let (parent, name) = open_parent(root, relative)?;
     let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| "Unity runtime relative pathが無効です")?;
+        .map_err(|_| "Invalid Unity runtime relative path")?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-        return Err("Unity runtime directoryを排他的に作成できません".into());
+        return Err("Cannot exclusively create the Unity runtime directory".into());
     }
     let directory = open_at(&parent, OsStr::from_bytes(name.as_bytes()), true)
-        .map_err(|_| "Unity runtime directoryをdescriptorで再確認できません")?;
+        .map_err(|_| "Cannot reverify the Unity runtime directory by descriptor")?;
     let metadata = directory
         .metadata()
-        .map_err(|_| "Unity runtime directoryを確認できません")?;
+        .map_err(|_| "Cannot verify the Unity runtime directory")?;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != 0o700
     {
-        return Err("Unity runtime directoryのidentityが無効です".into());
+        return Err("Invalid Unity runtime directory identity".into());
     }
     Ok(())
 }
@@ -372,7 +372,7 @@ fn create_directory_at(root: &File, relative: &[u8]) -> Result<(), String> {
 fn create_file_at(root: &File, relative: &[u8]) -> Result<File, String> {
     let (parent, name) = open_parent(root, relative)?;
     let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| "Unity runtime relative pathが無効です")?;
+        .map_err(|_| "Invalid Unity runtime relative path")?;
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -382,18 +382,18 @@ fn create_file_at(root: &File, relative: &[u8]) -> Result<File, String> {
         )
     };
     if fd < 0 {
-        return Err("Unity runtime fileを排他的に作成できません".into());
+        return Err("Cannot exclusively create the Unity runtime file".into());
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file
         .metadata()
-        .map_err(|_| "Unity runtime fileを確認できません")?;
+        .map_err(|_| "Cannot verify the Unity runtime file")?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
         || metadata.mode() & 0o7777 != 0o600
     {
-        return Err("Unity runtime fileのidentityが無効です".into());
+        return Err("Invalid Unity runtime file identity".into());
     }
     Ok(file)
 }
@@ -403,30 +403,30 @@ fn open_parent(root: &File, relative: &[u8]) -> Result<(File, OsString), String>
     let mut components = relative.components().peekable();
     let mut parent = root
         .try_clone()
-        .map_err(|_| "Unity runtime root descriptorを複製できません")?;
+        .map_err(|_| "Cannot duplicate the Unity runtime root descriptor")?;
     let mut leaf = None;
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
-            return Err("Unity runtime relative pathが無効です".into());
+            return Err("Invalid Unity runtime relative path".into());
         };
         if components.peek().is_none() {
             leaf = Some(name.to_os_string());
             break;
         }
         parent = open_at(&parent, name, true)
-            .map_err(|_| "Unity runtime parentをdescriptorで開けません")?;
+            .map_err(|_| "Cannot open the Unity runtime parent by descriptor")?;
         let metadata = parent
             .metadata()
-            .map_err(|_| "Unity runtime parentを確認できません")?;
+            .map_err(|_| "Cannot verify the Unity runtime parent")?;
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o7777 != 0o700
         {
-            return Err("Unity runtime parentのidentityが無効です".into());
+            return Err("Invalid Unity runtime parent identity".into());
         }
     }
     leaf.map(|leaf| (parent, leaf))
-        .ok_or_else(|| "Unity runtime relative pathが空です".into())
+        .ok_or_else(|| "The Unity runtime relative path is empty".into())
 }
 
 fn read_all(file: &mut File, expected: u64) -> Result<Vec<u8>, Error> {

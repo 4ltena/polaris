@@ -113,8 +113,8 @@ pub fn apply_agreed(
     let secrets = polaris_auth::protection::with_protected_paths(|registered| {
         RegisteredSecrets::from_auth_registry(registered).map_err(|_| ())
     })
-    .map_err(|_| io::Error::other("保護状態を確認できません"))?
-    .map_err(|_| io::Error::other("保護状態を確認できません"))?;
+    .map_err(|_| io::Error::other("Cannot verify protection state"))?
+    .map_err(|_| io::Error::other("Cannot verify protection state"))?;
     let (snapshot, shaped) = shape_copy(
         project_root,
         agreed_tree,
@@ -126,7 +126,7 @@ pub fn apply_agreed(
     let changes = planned_changes(&snapshot, &secrets, limits)?;
     if !changes.is_applicable() {
         return Err(io::Error::other(
-            "共有された変更をこのprojectへ適用できません",
+            "Cannot apply shared changes to this project",
         ));
     }
     Ok((
@@ -152,7 +152,7 @@ pub fn apply_agreed_m2a(
     let (snapshot, shaped, changes) =
         polaris_auth::protection::with_protected_paths(|registered| {
             let secrets = RegisteredSecrets::from_auth_registry(registered)
-                .map_err(|_| io::Error::other("保護状態を確認できません"))?;
+                .map_err(|_| io::Error::other("Cannot verify protection state"))?;
             let (snapshot, shaped) = shape_copy(
                 project_root,
                 agreed_tree,
@@ -163,13 +163,13 @@ pub fn apply_agreed_m2a(
             )?;
             if !shaped.deferred.is_empty() {
                 return Err(io::Error::other(
-                    "未作成ディレクトリの共有変更が残っています",
+                    "Shared changes requiring new directories remain",
                 ));
             }
             let changes = planned_changes(&snapshot, &secrets, limits)?;
             Ok::<_, io::Error>((snapshot, shaped, changes))
         })
-        .map_err(|_| io::Error::other("保護状態を確認できません"))??;
+        .map_err(|_| io::Error::other("Cannot verify protection state"))??;
     let report = owner
         .apply_c12(admission, &snapshot, &changes, limits, recovery_parent)
         .map_err(io::Error::other)?;

@@ -68,7 +68,7 @@ impl Request {
         }
     }
     fn refuse(self) {
-        let error = || io::Error::other("会話記憶の実行は停止しています");
+        let error = || io::Error::other("Conversation memory execution is stopped");
         match self {
             Self::Snapshot(r) | Self::SearchSnapshot(r) => {
                 let _ = r.send(Err(error()));
@@ -141,7 +141,9 @@ impl DesktopMemory {
             || metadata.revision != resources.embedding_revision
             || metadata.dimension != i64::from(resources.embedding_dimension)
         {
-            return Err(io::Error::other("記憶資源と埋め込みbackendが一致しません"));
+            return Err(io::Error::other(
+                "Memory resources and embedding backend do not match",
+            ));
         }
         let (tx, rx) = mpsc::channel(1);
         Ok((
@@ -163,9 +165,9 @@ impl DesktopMemory {
         self.requests
             .send(make(tx))
             .await
-            .map_err(|_| io::Error::other("記憶の保存所有者が終了しました"))?;
+            .map_err(|_| io::Error::other("The memory storage owner has ended"))?;
         rx.await
-            .map_err(|_| io::Error::other("記憶の保存応答を確認できません"))?
+            .map_err(|_| io::Error::other("Cannot verify the saved memory response"))?
     }
 
     pub async fn prepare(&self) -> io::Result<PreparedDesktopHistory> {
@@ -208,7 +210,7 @@ impl DesktopMemory {
                     }
                     None => {
                         return Err(io::Error::other(
-                            "以前の構造化抽出結果が不明です。自動再送はしていません",
+                            "A previous structured extraction outcome is unknown. No automatic resend was attempted",
                         ));
                     }
                 }
@@ -226,7 +228,7 @@ impl DesktopMemory {
                 }
                 (None, None) => {
                     return Err(io::Error::other(
-                        "以前の要約結果が不明です。自動再送はしていません",
+                        "A previous summarization outcome is unknown. No automatic resend was attempted",
                     ));
                 }
             };
@@ -234,7 +236,7 @@ impl DesktopMemory {
             scope.generation = scope
                 .generation
                 .checked_add(1)
-                .ok_or_else(|| io::Error::other("記憶世代の上限"))?;
+                .ok_or_else(|| io::Error::other("Memory generation limit reached"))?;
             let id = format!("strict10-{turn}-{}", &work.source.raw_hash[..16]);
             let pending = MemoryStore::open(&self.database)
                 .map_err(io::Error::other)?
@@ -269,7 +271,7 @@ impl DesktopMemory {
             .iter()
             .rev()
             .find(|e| e.epoch == snapshot.conversation.state.epoch && e.starts_turn)
-            .ok_or_else(|| io::Error::other("現在のユーザー入力がありません"))?
+            .ok_or_else(|| io::Error::other("No current user input"))?
             .message
             .content
             .clone();
@@ -332,7 +334,9 @@ impl DesktopMemory {
     pub async fn read(&self, uri: &str) -> io::Result<String> {
         if is_search_path(uri) {
             if uri != SEARCH_URI {
-                return Err(io::Error::other("関連検索のURIに追加指定は使えません"));
+                return Err(io::Error::other(
+                    "Related search URIs do not accept additional specifiers",
+                ));
             }
             // This snapshot must not bind resources, write status, or summarize.
             let snapshot = self.send(Request::SearchSnapshot).await?;
@@ -345,7 +349,9 @@ impl DesktopMemory {
         if uri.starts_with("conversation://structured/") {
             crate::conversation_memory::structured::sources::parse_source_uri(uri)?;
         } else if uri.len() > 1024 {
-            return Err(io::Error::other("会話原文の参照が長すぎます"));
+            return Err(io::Error::other(
+                "Conversation source reference is too long",
+            ));
         }
         self.send(|r| Request::Read(uri.into(), r)).await
     }
@@ -510,22 +516,22 @@ impl DesktopMemoryOwner {
                             status.retrieval_status = retrieval;
                             status.related_omission = omission.map(wire_omission);
                             status.detail = match retrieval {
-                                None => "会話記憶を要求へ接続しました",
+                                None => "Conversation memory attached to the request",
                                 Some(MemoryRetrievalStatus::Found) => {
-                                    "必要な記憶と出典を要求へ接続しました"
+                                    "Required memory and sources attached to the request"
                                 }
-                                Some(MemoryRetrievalStatus::NotFound) => "該当する記憶はありません",
+                                Some(MemoryRetrievalStatus::NotFound) => "No matching memory",
                                 Some(MemoryRetrievalStatus::AmbiguousEntity) => {
-                                    "同名の候補を特定できません"
+                                    "Cannot identify candidates with the same name"
                                 }
                                 Some(MemoryRetrievalStatus::PendingReconfirmation) => {
-                                    "撤回・未定・要再確認の状態があります"
+                                    "Retracted, undecided, or recheck-required states exist"
                                 }
                                 Some(MemoryRetrievalStatus::ExtractionIncomplete) => {
-                                    "最新の入力まで記憶の抽出が完了していません"
+                                    "Memory extraction has not completed through the latest input"
                                 }
                                 Some(MemoryRetrievalStatus::EvidenceBudgetExceeded) => {
-                                    "必要な記憶が参照枠を超えたため実行を停止しました"
+                                    "Execution stopped because required memory exceeds the reference budget"
                                 }
                             }
                             .into();

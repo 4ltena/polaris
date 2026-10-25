@@ -383,7 +383,9 @@ fn fork_immutable_count_and_grants_reject_commit_and_persisted_revision_changes(
     drop(child);
     assert!(matches!(
         root.open(&before.marker.project_id, &child_id()),
-        Err(StoreError::Corrupt("継承原文・固定祖先の変更"))
+        Err(StoreError::Corrupt(
+            "Inherited source text or pinned ancestor changed"
+        ))
     ));
 }
 

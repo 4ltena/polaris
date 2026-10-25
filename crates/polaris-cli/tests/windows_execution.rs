@@ -12,7 +12,8 @@ mod product_binary;
 #[path = "support/windows_fixture.rs"]
 mod windows_fixture;
 
-const UNAVAILABLE: &str = "Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。";
+const UNAVAILABLE: &str =
+    "Windows lacks the required execution and mutation protections. No changes were made.";
 
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
@@ -253,28 +254,26 @@ fn windows_native_cli_commands_refuse_before_input_or_state_io() {
         vec!["decided", "add", "fixture"],
         vec!["decided", "fixture"],
         vec!["setting", "git"],
-        vec!["setting", "nextjs"],
-        vec!["setting", "nextjs", "--install"],
         vec!["handoff", "--summary", "fixture", "--check", "fixture"],
     ] {
         let expected = match arguments[0] {
             "account" => {
-                "Windowsではアカウントの保護された保存先を利用できません。変更していません。"
+                "Protected account storage is unavailable on Windows. No changes were made."
             }
             "sync" if arguments[1] == "apply" => {
-                "Windowsでは共有内容の反映は未対応です。変更していません。"
+                "Applying shared content is unsupported on Windows. No changes were made."
             }
-            "sync" => "Windowsでは共有状態の保護機構が未対応です。変更していません。",
-            "mcp" => "WindowsではMCPの保護された保存先を利用できません。変更していません。",
+            "sync" => "Windows lacks shared-state protection support. No changes were made.",
+            "mcp" => "Protected MCP storage is unavailable on Windows. No changes were made.",
             "memory" => {
-                "このプラットフォームでは記憶の変更・出典取得・埋め込み送信に必要な保護機構が未対応です"
+                "This platform lacks the protections required for memory mutation, source retrieval, and embedding requests"
             }
-            "decided" => "Windowsでは決定事項の追記は未対応です。変更していません。",
+            "decided" => "Appending decisions is unsupported on Windows. No changes were made.",
             "setting" => {
-                "このプラットフォームでは設定の変更に必要な保護機構が未対応です。変更していません。"
+                "This platform lacks the protections required for configuration changes. No changes were made."
             }
             "handoff" => {
-                "このプラットフォームではGitからの引き継ぎ情報取得に必要な保護機構が未対応です。変更していません。"
+                "This platform lacks the protections required to retrieve Git handoff information. No changes were made."
             }
             _ => unreachable!(),
         };
@@ -393,15 +392,15 @@ fn windows_decided_and_compare_read_existing_files_without_changes() {
         let text = String::from_utf8(output.stdout).unwrap();
         if arguments[0] == "decided" {
             assert!(text.contains(&format!("{stamp}  {decision}")), "{text}");
-            assert!(text.contains("1件"), "{text}");
+            assert!(text.contains("1 items"), "{text}");
             if let Some(previous) = &decided_output {
                 assert_eq!(&text, previous);
             }
             decided_output = Some(text);
         } else {
-            assert!(text.contains("a\tb\t類似度 "), "{text}");
-            assert!(text.contains("共通 2件"), "{text}");
-            assert!(text.contains("移動も削除も行いません"), "{text}");
+            assert!(text.contains("a\tb\tsimilarity "), "{text}");
+            assert!(text.contains("2 shared items"), "{text}");
+            assert!(text.contains("Nothing is moved or deleted"), "{text}");
         }
         assert_eq!(
             windows_fixture::contents(root.path()),

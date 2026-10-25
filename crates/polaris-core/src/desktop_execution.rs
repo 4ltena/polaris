@@ -33,11 +33,14 @@ impl ExecutionCommand {
         if self.args == ["--confined-apply"] {
             match serde_json::from_str::<polaris_sandbox::Mutation>(input) {
                 Ok(polaris_sandbox::Mutation::Write { path, content }) => {
-                    return Some(format!("書き込み先: {path:?}（{} bytes）", content.len()));
+                    return Some(format!(
+                        "Write destination: {path:?} ({} bytes)",
+                        content.len()
+                    ));
                 }
                 Ok(polaris_sandbox::Mutation::Edit { path, old, new }) => {
                     return Some(format!(
-                        "編集先: {path:?}（{} → {} bytes）",
+                        "Edit destination: {path:?} ({} → {} bytes)",
                         old.len(),
                         new.len()
                     ));
@@ -45,7 +48,7 @@ impl ExecutionCommand {
                 Err(_) => {}
             }
         }
-        Some(format!("標準入力: {} bytes", input.len()))
+        Some(format!("Standard input: {} bytes", input.len()))
     }
 
     /// 表示用文字列ではなく、実際に起動する値すべてを承認へ束縛する。

@@ -269,7 +269,7 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
         return Err(AgentTypeError::InvalidMetadataValue {
             agent: dir_name.to_string(),
             key: "polaris-tier-min",
-            value: format!("{} は上限 {} を超えています", tier_min.name(), tier.name()),
+            value: format!("{} exceeds the limit {}", tier_min.name(), tier.name()),
         });
     }
     let wall_seconds = required_metadata(&metadata, dir_name, "polaris-wall-seconds")?

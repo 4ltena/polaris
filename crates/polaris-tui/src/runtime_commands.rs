@@ -47,7 +47,7 @@ fn bounded(lines: Vec<String>) -> Result<Vec<String>, String> {
             .try_fold(0usize, |n, line| n.checked_add(line.len()))
             .is_none_or(|n| n > MAX_OUTPUT)
     {
-        return Err("表示の件数またはサイズが上限を超えています".into());
+        return Err("Display count or size exceeds the limit".into());
     }
     Ok(lines)
 }
@@ -55,9 +55,9 @@ fn bounded(lines: Vec<String>) -> Result<Vec<String>, String> {
 async fn snapshot(control: &RootDelegationControlV1) -> Result<RootDelegationProjectionV1, String> {
     let snapshot = tokio::time::timeout(OWNER_TIMEOUT, control.snapshot())
         .await
-        .map_err(|_| "subagent ownerの読取りが時間切れです".to_owned())?;
+        .map_err(|_| "Subagent owner read timed out".to_owned())?;
     if snapshot.children.len() > MAX_ROWS {
-        return Err("subagentの件数が表示上限を超えています".into());
+        return Err("Subagent count exceeds the display limit".into());
     }
     Ok(snapshot)
 }
@@ -94,7 +94,7 @@ pub async fn subagents(
     mutation: Option<RuntimeMutationContext<'_>>,
 ) -> Result<Vec<String>, String> {
     if command.len() > 1024 || command.chars().any(|c| c.is_control()) {
-        return Err("subagents入力が不正です".into());
+        return Err("Invalid subagents input".into());
     }
     let words = command.split_whitespace().collect::<Vec<_>>();
     let verb = words.first().copied().unwrap_or("list");
@@ -102,13 +102,13 @@ pub async fn subagents(
         || (verb == "list" && words.len() > 1)
         || (verb != "list" && words.len() != 3)
     {
-        return Err("使い方: /subagents list | wait <child-id> <attempt-id> | cancel <child-id> <attempt-id>".into());
+        return Err("Usage: /subagents list | wait <child-id> <attempt-id> | cancel <child-id> <attempt-id>".into());
     }
     let Some(control) = control else {
         return if verb == "list" {
-            Ok(vec!["現在のrunにsubagent ownerはありません".into()])
+            Ok(vec!["The current run has no subagent owner".into()])
         } else {
-            Err("現在のrunにsubagent ownerがないため実行できません".into())
+            Err("Cannot execute because the current run has no subagent owner".into())
         };
     };
     let projection = snapshot(control).await?;
@@ -121,7 +121,7 @@ pub async fn subagents(
         )];
         lines.extend(projection.children.iter().map(child_line));
         if projection.children.is_empty() {
-            lines.push("subagentはありません".into());
+            lines.push("No subagents".into());
         }
         return bounded(lines);
     }
@@ -129,7 +129,7 @@ pub async fn subagents(
         .children
         .iter()
         .find(|child| child.logical_child_id.0 == words[1] && child.attempt_id.0 == words[2])
-        .ok_or_else(|| "このrunの現在のchild/attemptと一致しません".to_owned())?;
+        .ok_or_else(|| "Does not match a current child/attempt in this run".to_owned())?;
     let reference = ChildAttemptRefV1 {
         logical_child_id: child.logical_child_id.clone(),
         attempt_id: child.attempt_id.clone(),
@@ -141,8 +141,8 @@ pub async fn subagents(
             control.wait_children(&binding, projection.revision, None),
         )
         .await
-        .map_err(|_| "subagent waitが時間切れです".to_owned())??;
-        let waited = waited.ok_or_else(|| "subagentの状態を確認できません".to_owned())?;
+        .map_err(|_| "Subagent wait timed out".to_owned())??;
+        let waited = waited.ok_or_else(|| "Cannot verify subagent state".to_owned())?;
         let selected = waited
             .children
             .iter()
@@ -150,7 +150,7 @@ pub async fn subagents(
                 child.logical_child_id == reference.logical_child_id
                     && child.attempt_id == reference.attempt_id
             })
-            .ok_or_else(|| "child/attemptが変更されています".to_owned())?;
+            .ok_or_else(|| "The child/attempt changed".to_owned())?;
         return bounded(vec![
             format!("revision={} cursor={}", waited.revision, waited.cursor),
             child_line(selected),
@@ -159,13 +159,13 @@ pub async fn subagents(
     if child.state.is_terminal() {
         return bounded(vec![
             child_line(child),
-            "このattemptは既に終端状態です".into(),
+            "This attempt is already terminal".into(),
         ]);
     }
-    let mutation =
-        mutation.ok_or_else(|| "停止要求の保存ownerを取得できないため実行できません".to_owned())?;
+    let mutation = mutation
+        .ok_or_else(|| "Cannot execute without the stop request storage owner".to_owned())?;
     if mutation.session_id != binding.session_id {
-        return Err("停止要求のsession bindingが一致しません".into());
+        return Err("Stop request session binding mismatch".into());
     }
     let cursor = mutation
         .effects
@@ -180,7 +180,7 @@ pub async fn subagents(
         &reference.attempt_id.0,
         projection.revision,
     ))
-    .map_err(|_| "停止要求のidentityを符号化できません".to_owned())?;
+    .map_err(|_| "Cannot encode the stop request identity".to_owned())?;
     let prepared = mutation
         .effects
         .prepare_runtime(
@@ -188,7 +188,7 @@ pub async fn subagents(
             cursor,
             PrepareManagementEffectV1 {
                 operation_id: ManagementOperationIdV1::random()
-                    .map_err(|_| "停止要求のIDを予約できません".to_owned())?,
+                    .map_err(|_| "Cannot reserve a stop request ID".to_owned())?,
                 inventory: ManagementInventoryIdV1::parse("D12")
                     .map_err(|error| error.to_string())?,
                 scope: ManagementEffectScopeV1 {
@@ -207,7 +207,7 @@ pub async fn subagents(
         )
         .map_err(|error| error.to_string())?;
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
-        return Err("停止要求に既存の効果があるため再実行しません".into());
+        return Err("The stop request already has an effect and will not be repeated".into());
     };
     if !mutation.accepted {
         mutation
@@ -218,7 +218,7 @@ pub async fn subagents(
                 ManagementDenialReasonV1::UserDeclined,
             )
             .map_err(|error| error.to_string())?;
-        return Ok(vec!["停止要求を取り消しました".into()]);
+        return Ok(vec!["Stop request cancelled".into()]);
     }
     let started = mutation
         .effects
@@ -240,7 +240,7 @@ pub async fn subagents(
                     ManagementUnknownReasonV1::InterruptedAfterStart,
                 )
                 .map_err(|error| error.to_string())?;
-            return Err("停止要求の結果は不明です。自動再実行しません".into());
+            return Err("Stop request outcome is unknown. No automatic retry will occur".into());
         }
     };
     if ack.runtime_effect == RuntimeCancelEffectV1::Unavailable
@@ -255,7 +255,7 @@ pub async fn subagents(
             )
             .map_err(|error| error.to_string())?;
         return Err(
-            "停止要求は記録しましたが実行handleがありません。結果は不明で、自動再実行しません"
+            "Stop request recorded, but no execution handle exists. Outcome unknown; no automatic retry"
                 .into(),
         );
     }
@@ -265,7 +265,7 @@ pub async fn subagents(
         format!("{:?}", ack.result),
         format!("{:?}", ack.runtime_effect),
     ))
-    .map_err(|_| "停止要求のreceiptを符号化できません".to_owned())?;
+    .map_err(|_| "Cannot encode the stop request receipt".to_owned())?;
     mutation
         .effects
         .complete_started_runtime(
@@ -276,26 +276,26 @@ pub async fn subagents(
         .map_err(|error| error.to_string())?;
     let delivery = match ack.runtime_effect {
         RuntimeCancelEffectV1::Requested => {
-            "このattemptへ停止要求を届けました。終了状態は /subagents wait で確認してください"
+            "Stop request delivered to this attempt. Check its terminal state with /subagents wait"
         }
         RuntimeCancelEffectV1::Unavailable => {
-            "停止要求は記録しましたが、実行handleはありません。終了は確認できません"
+            "Stop request recorded, but no execution handle exists. Termination cannot be verified"
         }
     };
     Ok(vec![
-        format!("停止要求 revision={}", ack.revision),
+        format!("Stop request revision={}", ack.revision),
         delivery.into(),
     ])
 }
 
 pub fn roles(roles: &[AgentType], command: &str) -> Result<Vec<String>, String> {
     if !matches!(command.trim(), "" | "list") {
-        return Err("使い方: /roles list。role bindingの変更ownerは利用できません".into());
+        return Err("Usage: /roles list. No role binding mutation owner is available".into());
     }
     if roles.len() > MAX_ROWS {
-        return Err("roleの件数が表示上限を超えています".into());
+        return Err("Role count exceeds the display limit".into());
     }
-    let mut lines = vec!["現在のrunが使用するrole定義".into()];
+    let mut lines = vec!["Role definitions used by the current run".into()];
     lines.extend(roles.iter().map(|role| {
         format!(
             "{}: tier={}..{} access={:?} turns={} wall={}s",
@@ -318,7 +318,7 @@ pub fn run_settings(
     startup_max_turns: u32,
 ) -> Result<Vec<String>, String> {
     if command.len() > 1024 || command.chars().any(char::is_control) {
-        return Err("run settings入力が不正です".into());
+        return Err("Invalid run settings input".into());
     }
     let words = command.split_whitespace().collect::<Vec<_>>();
     match words.as_slice() {
@@ -326,18 +326,18 @@ pub fn run_settings(
         ["settings", "max-turns", number] => {
             let number = number
                 .parse::<u32>()
-                .map_err(|_| "max-turnsは整数です".to_owned())?;
+                .map_err(|_| "max-turns must be an integer".to_owned())?;
             if number == 0 || number > startup_max_turns {
                 return Err(format!(
-                    "max-turnsは1..={startup_max_turns}です。起動時上限を増やすには --max-turns で再起動してください"
+                    "max-turns must be 1..={startup_max_turns}. Restart with --max-turns to increase the startup limit"
                 ));
             }
             *next_max_turns = number;
         }
-        _ => return Err("使い方: /run settings [max-turns <N>]".into()),
+        _ => return Err("Usage: /run settings [max-turns <N>]".into()),
     }
     Ok(vec![format!(
-        "次のrun: max-turns={}（起動時上限={}）",
+        "Next run: max-turns={} (startup limit={})",
         next_max_turns, startup_max_turns
     )])
 }
@@ -354,18 +354,16 @@ pub fn sandbox(
     approval: ApprovalPolicy,
 ) -> Result<Vec<String>, String> {
     if !matches!(command.trim(), "" | "status") {
-        return Err(
-            "起動時sandboxの変更はできません。--sandbox を指定して再起動してください".into(),
-        );
+        return Err("The startup sandbox cannot be changed. Restart with --sandbox".into());
     }
     let description = sandbox.describe();
     if description.len() > 8192 {
-        return Err("起動時sandboxの表示がサイズ上限を超えています".into());
+        return Err("Startup sandbox display exceeds the size limit".into());
     }
     bounded(vec![
         format!("sandbox: {}", safe(&description, 8192)),
         format!("approval: {approval:?}"),
-        "変更は新しい起動にのみ適用されます".into(),
+        "Changes apply only to a new launch".into(),
     ])
 }
 
@@ -410,15 +408,15 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|s| s == "subagentはありません")
+                .any(|s| s == "No subagents")
         );
         let denied = subagents(Some(&control), "cancel foreign attempt-2", None)
             .await
             .unwrap_err();
-        assert!(denied.contains("一致しません"));
+        assert!(denied.contains("Does not match"));
         assert_eq!(control.snapshot().await.revision, 0);
         assert!(subagents(None, "wait child attempt", None).await.is_err());
-        assert!(subagents(None, "list", None).await.unwrap()[0].contains("ありません"));
+        assert!(subagents(None, "list", None).await.unwrap()[0].contains("no subagent owner"));
         use polaris_core::{
             rewind_workspace::WorkspaceOwner,
             subagent_control::{
@@ -496,7 +494,7 @@ mod tests {
             )
             .await
             .unwrap_err()
-            .contains("一致しません")
+            .contains("Does not match")
         );
         assert_eq!(live.snapshot().await, before);
         assert!(effects.effects().unwrap().is_empty());
@@ -511,7 +509,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("停止要求を届けました"))
+                .any(|line| line.contains("Stop request delivered"))
         );
         assert!(abort.is_aborted());
         let after = live.snapshot().await;
@@ -580,7 +578,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(cancelled.iter().any(|line| line.contains("既に終端")));
+        assert!(
+            cancelled
+                .iter()
+                .any(|line| line.contains("already terminal"))
+        );
         assert_eq!(control.snapshot().await, before);
     }
 

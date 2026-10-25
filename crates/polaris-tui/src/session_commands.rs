@@ -50,30 +50,30 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("保存された会話がありません")?
+        .ok_or("No saved conversation")?
         .clone();
     if std::fs::symlink_metadata(persistence.store.directory().join("raw.jsonl"))
         .map_err(|e| e.to_string())?
         .len()
         > 16 * 1024 * 1024
     {
-        return Err("会話原文が16MiBの読み取り上限を超えています".into());
+        return Err("Conversation source text exceeds the 16 MiB read limit".into());
     }
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     let saved = snapshot.state.session_settings.as_ref().unwrap_or(initial);
     if matches!(request, "session" | "session current") {
         return Ok(CommandResult::display(vec![
             line(format!(
-                "会話: {} / 世代 {}",
+                "Conversation: {} / generation {}",
                 snapshot.state.session_id, snapshot.state.generation
             )),
             line(format!(
-                "現在provider: {} / model: {}",
+                "Current provider: {} / model: {}",
                 initial.provider,
-                provider.model().unwrap_or_else(|| "未確認".into())
+                provider.model().unwrap_or_else(|| "unverified".into())
             )),
             line(format!(
-                "保存provider: {} / model: {} / effort: {} / revision: {}",
+                "Saved provider: {} / model: {} / effort: {} / revision: {}",
                 saved.provider,
                 saved.model,
                 if saved.effort.is_empty() {
@@ -84,7 +84,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
                 saved.revision
             )),
             line(format!(
-                "履歴: {} / remember: {} / tool-memory: {} / compact: {}",
+                "History: {} / remember: {} / tool-memory: {} / compact: {}",
                 history_name(snapshot.state.history_mode),
                 on_off(saved.remember),
                 tool_name(saved.tool_memory),
@@ -103,7 +103,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     }
     if request == "session history" {
         return Ok(CommandResult::display(vec![line(format!(
-            "履歴モード: {}。変更は新しい空の会話で行います。",
+            "History mode: {}. Change it in a new, empty conversation.",
             history_name(snapshot.state.history_mode)
         ))]));
     }
@@ -112,7 +112,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
             .map(CommandResult::display);
     }
     if has_pending {
-        return Err("送信待ちの入力があるためセッション設定を変更できません".into());
+        return Err("Cannot change session settings while input is queued".into());
     }
     session.check_persistence().map_err(|e| e.to_string())?;
     let command = parse(request, &snapshot, saved, initial, provider)?;
@@ -124,10 +124,10 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
         .map_err(|e| e.to_string())?;
     let lease = workspace
         .try_mutation()
-        .map_err(|_| "実行中の操作があるためセッション設定を変更できません")?;
+        .map_err(|_| "Cannot change session settings while an operation is active")?;
     workspace
         .require_quiescent_with_lease(&lease)
-        .map_err(|_| "未解決の巻き戻し操作があります")?;
+        .map_err(|_| "An unresolved rewind operation exists")?;
     polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
         workspace.project_root(),
         effects.state_dir(),
@@ -150,19 +150,21 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
         )
         .map_err(|e| e.to_string())?;
     let detail = match preview.inventory() {
-        "D20" => "goalを指定revisionで保存します。入力本文や権限にはなりません。",
-        _ => "この会話へ保存し、次の送信から適用します。",
+        "D20" => {
+            "Save the goal at the specified revision. It does not become input content or authority."
+        }
+        _ => "Save in this conversation; effective from the next send.",
     };
     if !account::confirm(
         terminal,
         reader,
-        "セッション設定を保存",
+        "Save session settings",
         preview.session_id(),
         &format!("{request}\n{detail}"),
     ) {
         owner.deny(&prepared).map_err(|e| e.to_string())?;
         return Ok(CommandResult::display(vec![line(
-            "セッション設定の変更を取り消しました",
+            "Session settings change cancelled",
         )]));
     }
     let published = owner
@@ -178,7 +180,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
         }
     }
     let mut lines = vec![line(format!(
-        "{} を保存しました（会話世代 {}）。",
+        "Saved {} (conversation generation {}).",
         preview.inventory(),
         published.state.generation
     ))];
@@ -203,19 +205,19 @@ fn parse(
         ["session", "configure", requested_provider, model] | ["session", "configure", requested_provider, model, _] => {
             let effort = words.get(4).copied().unwrap_or(&saved.effort);
             if *requested_provider != initial.provider {
-                return Err("providerの変更には再起動が必要です".into());
+                return Err("Changing the provider requires a restart".into());
             }
-            let current = provider.model().ok_or("現在のproviderのmodelを確認できません")?;
+            let current = provider.model().ok_or("Cannot verify the current provider's model")?;
             if *model != current && !(matches!(initial.provider.as_str(), "codex" | "openai") && render::MODEL_CATALOG.contains(model)) {
-                return Err("このproviderで確認済みのmodelを指定してください".into());
+                return Err("Specify a model verified for this provider".into());
             }
             if !matches!(effort, "" | "auto") && effort != initial.effort {
-                return Err("対話中に固定effortへ変更できません".into());
+                return Err("Cannot switch to a fixed effort during an interactive session".into());
             }
             Ok(SessionSettingsCommandV1::Configure { expected_revision: saved.revision, provider: requested_provider.to_string(), model: model.to_string(), effort: effort.to_string() })
         }
-        ["memory", "configure", "on"] | ["remember", "on"] => Ok(SessionSettingsCommandV1::Remember { enabled: true }),
-        ["memory", "configure", "off"] | ["remember", "off"] => Ok(SessionSettingsCommandV1::Remember { enabled: false }),
+        ["memory", "configure", "on"] => Ok(SessionSettingsCommandV1::Remember { enabled: true }),
+        ["memory", "configure", "off"] => Ok(SessionSettingsCommandV1::Remember { enabled: false }),
         ["session", "history", mode] | ["memory", "configure", mode] => Ok(SessionSettingsCommandV1::History { mode: parse_history(mode)? }),
         ["tool-memory", "off"] => Ok(SessionSettingsCommandV1::ToolMemory { mode: ToolMemoryModeV1::Off }),
         ["tool-memory", "history"] => Ok(SessionSettingsCommandV1::ToolMemory { mode: ToolMemoryModeV1::History }),
@@ -223,12 +225,12 @@ fn parse(
         ["tool-memory", "endpoint", "off"] => Ok(SessionSettingsCommandV1::EmbeddingEndpoint { embedding: None }),
         ["tool-memory", "endpoint", url, model] => Ok(SessionSettingsCommandV1::EmbeddingEndpoint { embedding: Some(SavedToolEmbeddingV1::new(url.to_string(), model.to_string()).map_err(|e| e.to_string())?) }),
         ["tool-memory", "model", model] => {
-            let pair = saved.tool_memory_embedding.as_ref().ok_or("先に /tool-memory endpoint <URL> <MODEL> で組を設定してください")?;
+            let pair = saved.tool_memory_embedding.as_ref().ok_or("Configure the pair first with /tool-memory endpoint <URL> <MODEL>")?;
             Ok(SessionSettingsCommandV1::EmbeddingModel { embedding: Some(SavedToolEmbeddingV1::new(pair.url.clone(), model.to_string()).map_err(|e| e.to_string())?) })
         }
         ["compact", "threshold", threshold] => {
-            let threshold = if *threshold == "off" { None } else { Some(threshold.parse::<usize>().map_err(|_| "compact thresholdは1000以上の整数かoffを指定してください")?) };
-            if threshold.is_some_and(|n| n < 1000) { return Err("compact thresholdは1000以上にしてください".into()); }
+            let threshold = if *threshold == "off" { None } else { Some(threshold.parse::<usize>().map_err(|_| "Specify compact threshold as an integer of at least 1000, or off")?) };
+            if threshold.is_some_and(|n| n < 1000) { return Err("compact threshold must be at least 1000".into()); }
             Ok(SessionSettingsCommandV1::CompactThreshold { threshold })
         }
         ["goal", "clear"] | ["goal", "stop"] | ["goal", "resume"] => {
@@ -239,7 +241,7 @@ fn parse(
             let text = request.strip_prefix("goal").unwrap().trim_start().strip_prefix("set").unwrap().trim_start();
             Ok(SessionSettingsCommandV1::Goal { expected_revision: snapshot.state.goal.as_ref().map_or(0, |goal| goal.revision.get()), operation: GoalOperationV1::Set { text: text.to_string() } })
         }
-        _ => Err("/session configure <provider> <model> [effort]、/session history <mode>、/memory configure on|off、/tool-memory、/compact threshold、/goal を指定してください".into()),
+        _ => Err("Specify /session configure <provider> <model> [effort], /session history <mode>, /memory configure on|off, /tool-memory, /compact threshold, or /goal".into()),
     }
 }
 
@@ -248,7 +250,7 @@ fn parse_history(value: &str) -> Result<HistoryMode, String> {
         "legacy" => Ok(HistoryMode::Legacy),
         "strict10" => Ok(HistoryMode::Strict10),
         "structured10" => Ok(HistoryMode::Structured10),
-        _ => Err("履歴モードはlegacy|strict10|structured10を指定してください".into()),
+        _ => Err("Specify history mode as legacy|strict10|structured10".into()),
     }
 }
 
@@ -256,14 +258,14 @@ fn goal_lines(snapshot: &ConversationSnapshot) -> Vec<Line<'static>> {
     match &snapshot.state.goal {
         Some(goal) => vec![
             line(format!(
-                "goal revision {} / 有効 {} / 停止 {}",
+                "goal revision {} / enabled {} / stopped {}",
                 goal.revision.get(),
                 on_off(goal.active),
                 on_off(goal.stopped)
             )),
             line(goal.text.clone()),
         ],
-        None => vec![line("保存されたgoalはありません")],
+        None => vec![line("No saved goal")],
     }
 }
 
@@ -276,13 +278,13 @@ fn history_lines(
     } else {
         offset
             .parse::<usize>()
-            .map_err(|_| "/history [message offset] を指定してください")?
+            .map_err(|_| "Specify /history [message offset]")?
     };
     if offset > snapshot.events.len() {
-        return Err("履歴offsetが保存範囲を超えています".into());
+        return Err("History offset exceeds the saved range".into());
     }
     let mut lines = vec![line(format!(
-        "原文履歴 {}..{} / {} messages",
+        "Original history {}..{} / {} messages",
         offset,
         offset
             .saturating_add(HISTORY_PAGE_MESSAGES)
@@ -302,9 +304,7 @@ fn history_lines(
             event.turn_id, event.message.content
         ));
         if text.len() > remaining {
-            return Err(
-                "履歴ページが64KiBを超えています。次のmessage offsetを指定してください".into(),
-            );
+            return Err("History page exceeds 64 KiB. Specify the next message offset".into());
         }
         remaining -= text.len();
         lines.extend(text.lines().map(|part| Line::from(part.to_string())));

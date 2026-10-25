@@ -199,33 +199,33 @@ impl ImportPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ManagedDecisionError {
-    #[error("Clef profileはpackageの受入登録が未完了です")]
+    #[error("Clef profile package acceptance registration is incomplete")]
     UnverifiedProfile,
-    #[error("Clef generationが未導入です")]
+    #[error("Clef generation is not installed")]
     NotInstalled,
-    #[error("Clef generationまたは固定lockが一致しません")]
+    #[error("Clef generation or pinned lock mismatch")]
     Integrity,
-    #[error("Clef native runtimeはこのplatformで利用できません")]
+    #[error("Clef native runtime is unavailable on this platform")]
     UnsupportedPlatform,
-    #[error("Clefのこのdeviceの容量観測は未対応です")]
+    #[error("Clef capacity observation is unsupported for this device")]
     UnsupportedDevice,
-    #[error("Clef generationの導入先が既に存在します。既存資源は変更しません")]
+    #[error("The Clef generation destination already exists. Existing resources are unchanged")]
     Conflict,
-    #[error("Clef generationの導入を取り消しました")]
+    #[error("Clef generation installation cancelled")]
     Cancelled,
-    #[error("Clef generationの導入を完了できませんでした")]
+    #[error("Could not complete Clef generation installation")]
     Install,
-    #[error("Clef generationのcopyと予備領域に必要な空き容量がありません")]
+    #[error("Insufficient free space for the Clef generation copy and reserve")]
     InsufficientSpace,
-    #[error("Clef profileの取得元・license・NOTICE・component情報が未登録です")]
+    #[error("Clef profile source, license, NOTICE, or component information is unregistered")]
     MissingDeliveryMetadata,
-    #[error("Clef profileの固定download情報が未登録または不正です")]
+    #[error("Clef profile pinned download information is missing or invalid")]
     MissingDownloadMetadata,
-    #[error("Clef artifactを取得できませんでした。固定generationは変更していません")]
+    #[error("Could not download the Clef artifact. The pinned generation is unchanged")]
     Download,
-    #[error("Clef取得・導入の期限に達しました。固定generationの状態を再検証してください")]
+    #[error("Clef download and installation timed out. Reverify the pinned generation state")]
     DownloadTimeout,
-    #[error("Clef導入計画と確認済み内容が一致しません。計画を作り直してください")]
+    #[error("The Clef installation plan does not match the confirmed content. Recreate the plan")]
     PlanChanged,
 }
 

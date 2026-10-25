@@ -21,11 +21,13 @@ use std::{collections::BTreeSet, fs};
 
 #[derive(Debug, thiserror::Error)]
 pub enum C10CompositeErrorV1 {
-    #[error("未解決の操作があります。状態を確認して照合または明示中止してください")]
+    #[error(
+        "Unresolved operations exist. Inspect state, then reconcile or explicitly abandon them"
+    )]
     Blocked,
-    #[error("管理・同期記録の整合性を確認できません")]
+    #[error("Cannot verify management and sync record consistency")]
     Invalid,
-    #[error("実行中の操作があるため状態を確認できません")]
+    #[error("Cannot inspect state while an operation is active")]
     Busy,
 }
 type Result<T> = std::result::Result<T, C10CompositeErrorV1>;

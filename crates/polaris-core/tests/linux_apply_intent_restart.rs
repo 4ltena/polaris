@@ -830,14 +830,14 @@ fn linux_apply_intent_restart_suite() {
                             assert!(
                                 output.status.success()
                                     && message.contains("OutcomeUnknown")
-                                    && message.contains("未完了"),
+                                    && message.contains("incomplete"),
                                 "{message}"
                             );
                         } else {
                             let expected = if inventory == "C12" {
-                                "適用結果が未確定"
+                                "Apply outcome is unknown"
                             } else {
-                                "Desktopの適用が未完了"
+                                "Desktop apply is incomplete"
                             };
                             assert!(
                                 !output.status.success() && message.contains(expected),

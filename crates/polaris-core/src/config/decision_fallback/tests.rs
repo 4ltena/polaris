@@ -111,7 +111,7 @@ fn fallback_disclosure_has_destinations_and_scope_without_paths_or_control_injec
     let lines = config.fallback.as_ref().unwrap().disclosure(&config);
     let text = lines.join("\n");
     assert!(text.contains("https://example.invalid"));
-    assert!(text.contains("routing") && text.contains("stateと質問"));
+    assert!(text.contains("routing") && text.contains("state and questions"));
     assert!(!text.contains("private-path"));
     assert!(lines.iter().all(|line| !line.contains('\n')));
     assert!(text.contains("fixture\\nmodel"));

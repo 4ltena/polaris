@@ -33,19 +33,21 @@ impl RoutineChangeAuthorizationV1 {
     ) -> Result<Self, String> {
         eligibility.validate()?;
         if eligibility.blocker().is_some() {
-            return Err("routine authorizationには単一componentの低影響変更が必要です".into());
+            return Err(
+                "Routine authorization requires a low-impact change within one component".into(),
+            );
         }
         if verification.is_empty() {
-            return Err("routine authorizationにはhost固定の検証基準が必要です".into());
+            return Err("Routine authorization requires host-pinned verification criteria".into());
         }
         let mut ids = BTreeSet::new();
         for criterion in &verification {
             criterion.validate()?;
             if !criterion.has_explicit_evidence_kinds() {
-                return Err("routine authorizationにはtyped検証基準が必要です".into());
+                return Err("Routine authorization requires typed verification criteria".into());
             }
             if !ids.insert(criterion.id.clone()) {
-                return Err("routine authorizationの検証基準が重複しています".into());
+                return Err("Duplicate routine authorization verification criteria".into());
             }
         }
         Ok(Self {
@@ -168,6 +170,8 @@ pub struct Session {
     /// Root-only bundled setting commands. The model passes an operation
     /// name, never a command; a real install stays the person's to confirm.
     pub setting: Option<std::sync::Arc<crate::recipe::tool::SettingTool>>,
+    #[cfg(unix)]
+    pub environment: Option<std::sync::Arc<crate::environment::tool::EnvironmentTool>>,
     /// Present when this machine can drive an application: macOS, the
     /// accessibility permission granted, and a typed decider to choose
     /// between the candidates the accessibility tree offers. Absent
@@ -222,7 +226,7 @@ pub(crate) fn desktop_request_history_bound(
         if message.role != Role::Tool {
             for id in pending.drain(..) {
                 projected.push(Message::tool_result(&id,
-                    "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。"));
+                    "The outcome is unknown due to interruption. Check external effects before continuing. No automatic retry was attempted."));
             }
         }
         match message.role {
@@ -265,7 +269,7 @@ pub(crate) fn desktop_request_history_bound(
     }
     for id in pending {
         projected.push(Message::tool_result(&id,
-            "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。"));
+            "The outcome is unknown due to interruption. Check external effects before continuing. No automatic retry was attempted."));
     }
     Ok((projected, source))
 }
@@ -281,11 +285,11 @@ impl Session {
         self.check_persistence()?;
         if self.desktop_transcript.is_some() {
             return Err(std::io::Error::other(
-                "desktop verification checkpoint ownerがありません",
+                "No desktop verification checkpoint owner",
             ));
         }
         let store = self.persistence.as_ref().ok_or_else(|| {
-            std::io::Error::other("verification checkpointには永続sessionが必要です")
+            std::io::Error::other("A verification checkpoint requires a persistent session")
         })?;
         let generation = store.snapshot()?.state.generation;
         store.publish_verification_checkpoint(generation, checkpoint.clone())?;
@@ -301,11 +305,11 @@ impl Session {
         self.check_persistence()?;
         if self.desktop_transcript.is_some() {
             return Err(std::io::Error::other(
-                "desktop verification convergence ownerがありません",
+                "No desktop verification convergence owner",
             ));
         }
         let store = self.persistence.as_ref().ok_or_else(|| {
-            std::io::Error::other("verification convergenceには永続sessionが必要です")
+            std::io::Error::other("Verification convergence requires a persistent session")
         })?;
         let generation = store.snapshot()?.state.generation;
         let (workflow, checkpoint) =
@@ -521,20 +525,20 @@ impl Session {
         let current = self
             .workflow
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("workflowがありません"))?;
+            .ok_or_else(|| std::io::Error::other("No workflow"))?;
         if !current.config.enabled
             || current.state().phase != crate::workflow::Phase::Specify
             || current.state().revision != expected_workflow_revision
         {
             return Err(std::io::Error::other(
-                "routine contractは現在のspecify revisionにだけ公開できます",
+                "A routine contract can be published only against the current specify revision",
             ));
         }
         if contract.header.status != crate::workflow::ArtifactStatusV1::Draft
             || !contract.eligibility.is_routine()
         {
             return Err(std::io::Error::other(
-                "routine条件を満たすdraftだけを公開できます",
+                "Only drafts meeting routine conditions can be published",
             ));
         }
 
@@ -542,20 +546,18 @@ impl Session {
         // dropped after commit but before ACK, no later request may overwrite
         // the durable workflow with this process's stale snapshot.
         self.persistence_error =
-            Some("routine contract保存の結果が未確認です。保存状態を復元してください".into());
+            Some("Routine contract storage outcome is unverified. Restore saved state".into());
         let next = if let Some(owner) = self.desktop_workflow.clone() {
             owner
                 .publish_and_approve_routine_contract(expected_workflow_revision, contract)
                 .await
         } else if self.desktop_transcript.is_some() {
-            Err(std::io::Error::other(
-                "workflow artifactの保存所有者がありません",
-            ))
+            Err(std::io::Error::other("No workflow artifact storage owner"))
         } else if let Some(store) = &self.persistence {
             store.publish_and_approve_routine_contract(expected_workflow_revision, contract)
         } else {
             Err(std::io::Error::other(
-                "routine contractには永続sessionが必要です",
+                "A routine contract requires a persistent session",
             ))
         };
         let next = match next {
@@ -565,10 +567,11 @@ impl Session {
                 return Err(error);
             }
         };
-        let reference =
-            next.state().active_change_contract.clone().ok_or_else(|| {
-                std::io::Error::other("active change contractが保存されませんでした")
-            })?;
+        let reference = next
+            .state()
+            .active_change_contract
+            .clone()
+            .ok_or_else(|| std::io::Error::other("The active change contract was not saved"))?;
         self.workflow = Some(next);
         self.persistence_error = None;
         Ok(reference)
@@ -590,20 +593,20 @@ impl Session {
         let current = self
             .workflow
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("workflowがありません"))?;
+            .ok_or_else(|| std::io::Error::other("No workflow"))?;
         if !current.config.enabled || current.state().revision != expected_workflow_revision {
             return Err(std::io::Error::other(
-                "convergenceは現在のworkflow revisionにだけ保存できます",
+                "Convergence can be saved only against the current workflow revision",
             ));
         }
         self.persistence_error =
-            Some("convergence保存の結果が未確認です。保存状態を復元してください".into());
+            Some("Convergence storage outcome is unverified. Restore saved state".into());
         let next = if let Some(owner) = self.desktop_workflow.clone() {
             owner
                 .publish_convergence_trusted(expected_workflow_revision, bundle)
                 .await
         } else if self.desktop_transcript.is_some() {
-            Err(std::io::Error::other("convergenceの保存所有者がありません"))
+            Err(std::io::Error::other("No convergence storage owner"))
         } else if let Some(store) = &self.persistence {
             let expected_generation = store.snapshot()?.state.generation;
             store.publish_convergence_trusted(
@@ -613,7 +616,7 @@ impl Session {
             )
         } else {
             Err(std::io::Error::other(
-                "convergenceには永続sessionが必要です",
+                "Convergence requires a persistent session",
             ))
         };
         match next {
@@ -642,14 +645,11 @@ impl Session {
             return owner.read_workflow_artifact(kind, reference).await;
         }
         if self.desktop_transcript.is_some() {
-            return Err(std::io::Error::other(
-                "workflow artifactの保存所有者がありません",
-            ));
+            return Err(std::io::Error::other("No workflow artifact storage owner"));
         }
-        let store = self
-            .persistence
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("workflow artifactには永続sessionが必要です"))?;
+        let store = self.persistence.as_ref().ok_or_else(|| {
+            std::io::Error::other("Workflow artifacts require a persistent session")
+        })?;
         let value = match kind {
             crate::workflow::WorkflowArtifactKindV1::ProjectPrinciples => {
                 serde_json::to_value(store.load_project_principles(&reference)?)
@@ -684,7 +684,7 @@ impl Session {
         // Set before awaiting: dropping the future can lose an ACK after the
         // writer committed. Only successful publication clears this latch.
         self.persistence_error =
-            Some("workflow保存の結果が未確認です。保存状態を復元してください".into());
+            Some("Workflow storage outcome is unverified. Restore saved state".into());
         let outcome = self
             .publish_workflow_inner(candidate, result, gate_basis_hash)
             .await;
@@ -707,12 +707,12 @@ impl Session {
         let current = self
             .workflow
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("workflowがありません"))?;
+            .ok_or_else(|| std::io::Error::other("No workflow"))?;
         let previous = crate::desktop_store::SavedWorkflow::capture(current);
         let phase_changed = previous.state.phase != candidate.phase;
         if phase_changed && current.gates.phase_gate_schema_version.is_some() {
             let supplied = gate_basis_hash
-                .ok_or_else(|| std::io::Error::other("workflow phase gateの根拠がありません"))?;
+                .ok_or_else(|| std::io::Error::other("Missing workflow phase gate evidence"))?;
             let proof = crate::workflow::evaluate_phase_transition(
                 &previous.state,
                 candidate.phase,
@@ -722,7 +722,7 @@ impl Session {
             .map_err(std::io::Error::other)?;
             if proof.basis_hash != supplied {
                 return Err(std::io::Error::other(
-                    "workflow phase gateの根拠が保存状態と一致しません",
+                    "Workflow phase gate evidence does not match saved state",
                 ));
             }
         } else if let Some(supplied) = gate_basis_hash {
@@ -735,7 +735,7 @@ impl Session {
             .map_err(std::io::Error::other)?;
             if proof.basis_hash != supplied {
                 return Err(std::io::Error::other(
-                    "workflow phase gateの根拠が保存状態と一致しません",
+                    "Workflow phase gate evidence does not match saved state",
                 ));
             }
         }
@@ -750,7 +750,7 @@ impl Session {
             let mut suffix = self
                 .desktop_transcript
                 .as_ref()
-                .ok_or_else(|| std::io::Error::other("workflowの原文がありません"))?
+                .ok_or_else(|| std::io::Error::other("Missing workflow source text"))?
                 .messages
                 .clone();
             if let Some(message) = &result {
@@ -772,7 +772,7 @@ impl Session {
             )
             .await?;
         } else if self.desktop_transcript.is_some() {
-            return Err(std::io::Error::other("workflowの保存所有者がありません"));
+            return Err(std::io::Error::other("No workflow storage owner"));
         } else if let Some(store) = &self.persistence {
             let messages: Vec<_> = result.iter().cloned().collect();
             store.append_batch(&messages, Some(&next))?;
@@ -852,7 +852,7 @@ impl Session {
         self.check_persistence()?;
         if self.desktop_transcript.is_some() {
             return Err(std::io::Error::other(
-                "desktop inputはdesktop writerが所有します",
+                "Desktop input is owned by the desktop writer",
             ));
         }
         let message = Message::user(content);
@@ -908,13 +908,13 @@ impl Session {
         self.check_persistence()?;
         if self.desktop_transcript.is_some() {
             return Err(std::io::Error::other(
-                "desktop admissionはdesktop writerが所有します",
+                "Desktop admission is owned by the desktop writer",
             ));
         }
         let persistence = self
             .persistence
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("sidechat admissionにはv2セッションが必要です"))?;
+            .ok_or_else(|| std::io::Error::other("Sidechat admission requires a v2 session"))?;
         let already_committed = persistence
             .snapshot()?
             .state
@@ -1000,7 +1000,7 @@ impl Session {
             self.input_source = None;
         }
         for id in pending {
-            self.push_tool_result(&id, "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。");
+            self.push_tool_result(&id, "The outcome is unknown due to interruption. Check external effects before continuing. No automatic retry was attempted.");
             self.check_persistence()?;
         }
         Ok(())
@@ -1177,14 +1177,13 @@ impl Session {
     }
 
     async fn recover_owned_history(&self, saved_only: bool) -> std::io::Result<()> {
-        let history = self
-            .strict_history
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("strict10の埋め込み・要約backendがありません"))?;
+        let history = self.strict_history.as_ref().ok_or_else(|| {
+            std::io::Error::other("No strict10 embedding or summarization backend")
+        })?;
         let saved = self
             .persistence
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("strict10には永続保存が必要です"))?;
+            .ok_or_else(|| std::io::Error::other("strict10 requires persistent storage"))?;
         let recovered = if saved_only {
             history
                 .recover_saved_structured_observed(&saved.store, &saved.database, &|snapshot| {
@@ -1225,21 +1224,20 @@ impl Session {
         if !self.uses_strict_history()? {
             return Ok(None);
         }
-        let history = self
-            .strict_history
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("strict10の埋め込み・要約backendがありません"))?;
+        let history = self.strict_history.as_ref().ok_or_else(|| {
+            std::io::Error::other("No strict10 embedding or summarization backend")
+        })?;
         let saved = self
             .persistence
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("strict10には永続保存が必要です"))?;
+            .ok_or_else(|| std::io::Error::other("strict10 requires persistent storage"))?;
         let snapshot = saved.snapshot()?;
         let query = snapshot
             .events
             .iter()
             .rev()
             .find(|event| event.epoch == snapshot.state.epoch && event.starts_turn)
-            .ok_or_else(|| std::io::Error::other("現在のユーザー入力がありません"))?
+            .ok_or_else(|| std::io::Error::other("No current user input"))?
             .message
             .content
             .clone();
@@ -1258,7 +1256,7 @@ impl Session {
         self.memory_observation = None;
         self.persistence
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("履歴保存がありません"))?
+            .ok_or_else(|| std::io::Error::other("No history storage"))?
             .accept_prepared(&prepared.snapshot)?;
         let request = match &prepared.structured {
             Some(context) => crate::conversation_memory::observation::prepare_structured(context)?,
@@ -1346,7 +1344,7 @@ mod desktop_transcript_tests {
         assert_eq!(raw.len(), 2);
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[1].tool_call_id.as_deref(), Some("missing"));
-        assert!(projected[1].content.contains("結果は不明"));
+        assert!(projected[1].content.contains("outcome is unknown"));
         assert_eq!(projected[2].content, raw[1].content);
         assert!(desktop_request_history(&[Message::tool_result("orphan", "value")]).is_err());
     }

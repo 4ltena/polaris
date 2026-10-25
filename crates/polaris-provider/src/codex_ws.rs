@@ -463,9 +463,9 @@ pub(crate) fn delta(
 fn why_refused(held: Option<&Continuation>, kept: usize, input: &[serde_json::Value]) -> String {
     let Some(held) = held else {
         return if kept == 0 {
-            "前の応答がない".to_owned()
+            "no previous response".to_owned()
         } else {
-            format!("この形の継続がない（保持 {kept}形）")
+            format!("no continuation in this form ({kept} forms retained)")
         };
     };
     let at = held
@@ -476,12 +476,12 @@ fn why_refused(held: Option<&Continuation>, kept: usize, input: &[serde_json::Va
     match at {
         Some(at) => match first_difference(&held.baseline[at], &input[at], "") {
             Some((path, was, now)) => {
-                format!("{at}件目の{path}が違う\n      保持: {was}\n      今回: {now}")
+                format!("Item {at} differs at {path}\n      retained: {was}\n      current: {now}")
             }
-            None => format!("{at}件目が違う（差が見つかりません）"),
+            None => format!("Item {at} differs (difference not located)"),
         },
         None => format!(
-            "短い（保持 {}件 / 今回 {}件）",
+            "shorter ({} retained / {} current)",
             held.baseline.len(),
             input.len()
         ),
@@ -507,7 +507,7 @@ fn first_difference(
         (serde_json::Value::Object(was), serde_json::Value::Object(now)) => {
             now.iter().find_map(|(key, value)| match was.get(key) {
                 Some(other) => first_difference(other, value, &format!("{path}.{key}")),
-                None => Some((format!("{path}.{key}"), "（無し）".to_owned(), cut(value))),
+                None => Some((format!("{path}.{key}"), "(none)".to_owned(), cut(value))),
             })
         }
         (serde_json::Value::Array(was), serde_json::Value::Array(now)) => {
@@ -519,8 +519,8 @@ fn first_difference(
             (was.len() != now.len()).then(|| {
                 (
                     path.to_owned(),
-                    format!("{}件", was.len()),
-                    format!("{}件", now.len()),
+                    format!("{} items", was.len()),
+                    format!("{} items", now.len()),
                 )
             })
         }

@@ -748,7 +748,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
         return blocker(
             PhaseGateBlockerCodeV1::InvalidEvidenceInput,
             vec!["phase_gate_schema_version".into()],
-            "phase gateの保存形式を復旧する",
+            "Recover the phase gate storage format",
         );
     }
 
@@ -772,7 +772,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
                 return blocker(
                     code,
                     vec!["implementation_receipt".into()],
-                    "記録済みの実装結果をtrusted ownerで固定する",
+                    "Pin the recorded implementation outcome with a trusted owner",
                 );
             }
         }
@@ -781,7 +781,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
                 return blocker(
                     PhaseGateBlockerCodeV1::MissingReviewRecord,
                     vec!["review_record".into()],
-                    "現行basisに紐づくreview recordをtrusted ownerで保存する",
+                    "Save a review record bound to the current basis with a trusted owner",
                 );
             }
             let open = report
@@ -794,7 +794,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
                 return blocker(
                     PhaseGateBlockerCodeV1::ReviewFindingsOpen,
                     open,
-                    "review findingを解消、taskへ割当、またはriskを受容する",
+                    "Resolve review findings, assign them to tasks, or accept the risk",
                 );
             }
             if report.gaps.iter().any(|gap| {
@@ -812,7 +812,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
                         .iter()
                         .map(|gap| gap.reference.clone())
                         .collect(),
-                    "review recordのbindingとIDを復旧する",
+                    "Recover review record bindings and IDs",
                 );
             }
         }
@@ -825,7 +825,7 @@ pub fn evaluate_phase_gate(input: &PhaseGateInputV1) -> PhaseGateEvaluationV1 {
                         .iter()
                         .map(|gap| gap.reference.clone())
                         .collect(),
-                    "required evidenceとconvergenceを現行basisで揃える",
+                    "Provide required evidence and convergence against the current basis",
                 );
             }
         }

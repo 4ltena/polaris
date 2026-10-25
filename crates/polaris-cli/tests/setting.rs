@@ -75,7 +75,7 @@ fn a_directory_with_no_repository_is_left_alone() {
     let project = Project::new();
     let (ok, text) = project.run(&["git"]);
     assert!(ok, "{text}");
-    assert!(text.contains("Git リポジトリがありません"), "{text}");
+    assert!(text.contains("No Git repository"), "{text}");
     assert!(
         !project.root.join(".git").exists(),
         "nothing may be initialized on the person's behalf"
@@ -91,7 +91,7 @@ fn a_repository_with_no_commits_is_tidied_rather_than_initialized() {
 
     let (ok, text) = project.run(&["git"]);
     assert!(ok, "{text}");
-    assert!(text.contains("コミットなし"), "{text}");
+    assert!(text.contains("no commits"), "{text}");
     assert_eq!(
         fs::read_to_string(project.root.join(".git/HEAD")).expect("HEAD"),
         head_before,
@@ -113,7 +113,7 @@ fn existing_rules_keep_their_order_and_a_negation_holds_a_rule_back() {
 
     let (ok, text) = project.run(&["git"]);
     assert!(ok, "{text}");
-    assert!(text.contains("衝突するため保留"), "{text}");
+    assert!(text.contains("deferred due to conflict"), "{text}");
     let after = project.gitignore();
     assert!(after.starts_with(before), "{after:?}");
     assert!(
@@ -124,7 +124,7 @@ fn existing_rules_keep_their_order_and_a_negation_holds_a_rule_back() {
     // Running it again adds nothing: the ledger and the file agree.
     let (ok, text) = project.run(&["git"]);
     assert!(ok, "{text}");
-    assert!(text.contains("足すものはありません"), "{text}");
+    assert!(text.contains("No additions needed"), "{text}");
     assert_eq!(project.gitignore(), after);
 }
 
@@ -152,71 +152,6 @@ fn a_subdirectory_of_another_repository_is_refused() {
 }
 
 #[test]
-fn next_js_stops_before_installing_until_it_is_confirmed() {
-    let project = Project::new();
-    fs::write(project.root.join("package.json"), r#"{"name":"demo"}"#).expect("a manifest");
-
-    let (ok, text) = project.run(&["nextjs"]);
-    assert!(ok, "{text}");
-    assert!(text.contains("detect"), "{text}");
-    assert!(
-        !text.contains("npm install"),
-        "the install step must not be planned without confirmation: {text}"
-    );
-
-    let (ok, text) = project.run(&["nextjs", "--install"]);
-    assert!(ok, "{text}");
-    assert!(text.contains("npm install next react react-dom"), "{text}");
-    // Planning is not running: the project is untouched either way.
-    assert!(!project.root.join("node_modules").exists());
-    assert!(!project.root.join(".next").exists());
-}
-
-#[test]
-fn a_file_the_project_already_has_is_never_listed_as_one_to_write() {
-    let project = Project::new();
-    fs::write(project.root.join("package.json"), r#"{"name":"demo"}"#).expect("a manifest");
-    let mine = "// 自分で書いた設定\n";
-    fs::write(project.root.join("next.config.mjs"), mine).expect("my config");
-
-    let (ok, text) = project.run(&["nextjs", "--install"]);
-    assert!(ok, "{text}");
-    assert!(
-        text.contains("next.config.mjs\t既にあるので触りません"),
-        "{text}"
-    );
-    assert!(
-        !text.contains("書き込む雛形: next.config.mjs"),
-        "a file the project owns must not be listed for writing: {text}"
-    );
-    // Planning never writes, so the file is the same either way.
-    assert_eq!(
-        fs::read_to_string(project.root.join("next.config.mjs")).expect("my config"),
-        mine
-    );
-}
-
-#[test]
-fn a_project_without_a_manifest_is_not_a_next_js_project() {
-    let project = Project::new();
-    let (ok, text) = project.run(&["nextjs"]);
-    assert!(ok, "{text}");
-    assert!(text.contains("package.json がない"), "{text}");
-}
-
-#[test]
-fn two_lockfiles_leave_the_project_alone_rather_than_choosing_one() {
-    let project = Project::new();
-    fs::write(project.root.join("package.json"), r#"{"name":"demo"}"#).expect("a manifest");
-    for lockfile in ["package-lock.json", "pnpm-lock.yaml"] {
-        fs::write(project.root.join(lockfile), "").expect("a lockfile");
-    }
-    let (ok, text) = project.run(&["nextjs", "--install"]);
-    assert!(ok, "{text}");
-    assert!(text.contains("lockfile が複数"), "{text}");
-}
-
-#[test]
 fn a_second_run_on_the_same_project_waits_rather_than_opening_a_second_ledger() {
     // Two terminals in the same project must not each hold their own record
     // of what is finished.
@@ -236,7 +171,7 @@ fn a_second_run_on_the_same_project_waits_rather_than_opening_a_second_ledger() 
 
     let (ok, text) = project.run(&["git"]);
     assert!(!ok, "a second writer must not open: {text}");
-    assert!(text.contains("別の場所で実行中"), "{text}");
+    assert!(text.contains("setup is running elsewhere"), "{text}");
 
     drop(held);
     unsafe {

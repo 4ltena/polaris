@@ -57,17 +57,19 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
     if request.is_empty() || request == "list" {
         let mut lines = crate::account_list_lines()?;
         lines.push(Line::from(match binding.and_then(|b| b.current()) {
-            Some((id, generation)) => format!("使用登録: {id}（世代 {generation}）"),
-            None => "使用登録: 登録への明示的な束縛なし".into(),
+            Some((id, generation)) => {
+                format!("Active registration: {id} (generation {generation})")
+            }
+            None => "Active registration: no explicit registration binding".into(),
         }));
         return Ok(lines);
     }
     if has_pending {
-        return Err("送信待ちの入力があるため認証操作を開始できません".into());
+        return Err("Cannot start authentication operations while input is queued".into());
     }
     let lease = workspace
         .try_mutation()
-        .map_err(|_| "実行中の操作があるため認証状態を変更できません")?;
+        .map_err(|_| "Cannot change authentication state while an operation is active")?;
     polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
         workspace.project_root(),
         effects.state_dir(),
@@ -78,29 +80,28 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         .split_once(char::is_whitespace)
         .unwrap_or((request, ""));
     if command == "bind" {
-        let binding = binding.ok_or("このproviderは登録アカウント切替に対応していません")?;
+        let binding =
+            binding.ok_or("This provider does not support registered account switching")?;
         if extra.is_empty() || extra.split_whitespace().count() != 1 {
-            return Err("/account bind <登録ID>".into());
+            return Err("/login use <registration-id>".into());
         }
         if !confirm(
             terminal,
             reader,
-            "使用アカウントの切替",
+            "Switch active account",
             extra,
-            "次の送信から使用します。登録自体は変更しません。",
+            "Used from the next send. The registration itself remains unchanged.",
         ) {
-            return Ok(vec![Line::from("アカウント切替を取り消しました")]);
+            return Ok(vec![Line::from("Account switch cancelled")]);
         }
         let id = binding.bind(extra)?;
-        return Ok(vec![Line::from(format!(
-            "使用アカウントを切り替えました: {id}"
-        ))]);
+        return Ok(vec![Line::from(format!("Active account switched: {id}"))]);
     }
-    let home = std::env::var_os("HOME").ok_or("HOMEを特定できません")?;
+    let home = std::env::var_os("HOME").ok_or("Cannot determine HOME")?;
     polaris_auth::protection::use_trusted_home(std::path::Path::new(&home))
-        .map_err(|_| "認証保存先を確認できません")?;
+        .map_err(|_| "Cannot verify authentication storage")?;
     let auth = polaris_auth::accounts::owner::AccountOwner::open(polaris_auth::ISSUER)
-        .map_err(|_| "アカウントを開けません")?;
+        .map_err(|_| "Cannot open accounts")?;
     let owner = AccountChangeOwnerV1 {
         auth,
         effects,
@@ -112,7 +113,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         },
         "reauth" | "unlink" => {
             if extra.split_whitespace().count() != 1 {
-                return Err(format!("/account {command} <登録ID>"));
+                return Err(if command == "reauth" { "/login reauth <registration-id>" } else { "/logout <registration-id>" }.into());
             }
             let target = owner.target(extra)?;
             if command == "reauth" {
@@ -130,7 +131,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         "label" => {
             let (id, label) = extra
                 .split_once(char::is_whitespace)
-                .ok_or("/account label <登録ID> <表示名>")?;
+                .ok_or("/login label <registration-id> <display-name>")?;
             let target = owner.target(id)?;
             AccountChangeV1::Label {
                 registration: target.registration_id,
@@ -146,16 +147,16 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
                 }
             } else {
                 let path = polaris_auth::store::default_path()
-                    .map_err(|_| "既存の認証保存先を確認できません")?;
+                    .map_err(|_| "Cannot verify existing authentication storage")?;
                 let Some(identity) = polaris_auth::store::credential_identity(&path)
-                    .map_err(|_| "既存認証を確認できません")?
+                    .map_err(|_| "Cannot verify existing authentication")?
                 else {
-                    return Ok(vec![Line::from("解除する認証はありません")]);
+                    return Ok(vec![Line::from("No authentication to unlink")]);
                 };
                 AccountChangeV1::LegacyLogout { identity }
             }
         }
-        _ => return Err("/account list|login|reauth|unlink|label|bind".into()),
+        _ => return Err("/login [new [label]|reauth <registration-id>|use <registration-id>|label <registration-id> <display-name>], /logout [registration-id], /status".into()),
     };
     execute_change(
         &owner,
@@ -182,10 +183,12 @@ where
 {
     let prepared = owner.prepare(change)?;
     let operation = match prepared.change() {
-        AccountChangeV1::Login { .. } => "アカウントを登録",
-        AccountChangeV1::Reauth { .. } => "同じアカウントを再認証",
-        AccountChangeV1::Unlink { .. } | AccountChangeV1::LegacyLogout { .. } => "認証を解除",
-        AccountChangeV1::Label { .. } => "アカウント表示名を変更",
+        AccountChangeV1::Login { .. } => "Register account",
+        AccountChangeV1::Reauth { .. } => "Reauthenticate the same account",
+        AccountChangeV1::Unlink { .. } | AccountChangeV1::LegacyLogout { .. } => {
+            "Unlink authentication"
+        }
+        AccountChangeV1::Label { .. } => "Change account display name",
     };
     let accepted = confirm(
         terminal,
@@ -194,9 +197,9 @@ where
         prepared.change().target(),
         &match prepared.change() {
             AccountChangeV1::Label { label, .. } => {
-                format!("新しい表示名: {label}。会話の巻き戻しで取り消せません。")
+                format!("New display name: {label}. Conversation rewind cannot undo this.")
             }
-            _ => "会話の巻き戻しで取り消せません。登録だけでは使用アカウントを切り替えません。"
+            _ => "Conversation rewind cannot undo this. Registration alone does not switch the active account."
                 .into(),
         },
     );
@@ -210,12 +213,12 @@ where
                 .draw(|f| {
                     render::render_management_confirmation(
                         f,
-                        "ブラウザで認可してください",
+                        "Authorize in your browser",
                         prepared.change().target(),
-                        "Escで中止。認可URL・code・tokenは会話へ保存しません。",
+                        "Esc: cancel. Authorization URLs, codes, and tokens are not saved to the conversation.",
                     );
                 })
-                .map_err(|_| "端末へ表示できません")?;
+                .map_err(|_| "Cannot display in the terminal")?;
         }
         owner
             .apply_browser(&prepared, accepted, callback, cancel)
@@ -224,8 +227,8 @@ where
         owner.apply_local(&prepared, accepted)?
     };
     Ok(vec![Line::from(match result {
-        Some(id) => format!("{operation}を完了しました: {id}"),
-        None => "認証操作を取り消しました".into(),
+        Some(id) => format!("Completed {operation}: {id}"),
+        None => "Authentication operation cancelled".into(),
     })])
 }
 
@@ -513,7 +516,7 @@ mod tests {
         );
         assert_eq!(binding.current().unwrap().0, "explicit-target");
         assert!(
-            matches!(crate::slash::parse("/login label"),Some(crate::slash::Action::Account(request)) if request=="login label")
+            matches!(crate::slash::parse("/login new label"),Some(crate::slash::Action::Account(request)) if request=="login label")
         );
     }
 
@@ -583,7 +586,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(output.iter().any(|line| line.to_string().contains("完了")));
+        assert!(
+            output
+                .iter()
+                .any(|line| line.to_string().contains("Completed"))
+        );
         assert_eq!(
             store.snapshot().unwrap().accounts[0].label.as_deref(),
             Some("named-account")
@@ -687,7 +694,7 @@ mod tests {
         assert!(!confirm(
             &terminal,
             &mut Keys(VecDeque::from([KeyCode::Char('y')])),
-            "解除",
+            "Unlink",
             "exact-target",
             "irreversible"
         ));
@@ -794,7 +801,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(output.iter().any(|line| line.to_string().contains("完了")));
+        assert!(
+            output
+                .iter()
+                .any(|line| line.to_string().contains("Completed"))
+        );
         assert!(
             !output
                 .iter()

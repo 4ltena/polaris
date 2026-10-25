@@ -28,7 +28,9 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
         let mut workflow_artifacts = None;
         while let Some(name) = key(&mut map, self.budget)? {
             if !seen.insert(name.clone()) {
-                return Err(serde::de::Error::custom("固定記憶の付随field重複"));
+                return Err(serde::de::Error::custom(
+                    "Duplicate pinned memory sidecar field",
+                ));
             }
             match name.as_str() {
                 "desktop_sidecar_schema_version" => {
@@ -151,16 +153,20 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                         Ok(())
                     },
                 )?,
-                _ => return Err(serde::de::Error::custom("固定記憶の未知の付随field")),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "Unknown pinned memory sidecar field",
+                    ));
+                }
             }
         }
         if let Some(reference) = saved_workflow
             .as_ref()
             .and_then(|workflow| workflow.state.active_change_contract.as_ref())
         {
-            let graph = workflow_artifacts
-                .as_ref()
-                .ok_or_else(|| serde::de::Error::custom("固定記憶のactive artifact graph不在"))?;
+            let graph = workflow_artifacts.as_ref().ok_or_else(|| {
+                serde::de::Error::custom("Missing pinned memory active artifact graph")
+            })?;
             graph
                 .approved_routine_contract(reference)
                 .map_err(serde::de::Error::custom)?;
@@ -193,7 +199,7 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
         for required in required {
             if !seen.contains(required) {
                 return Err(serde::de::Error::custom(format!(
-                    "固定記憶の必須field不在: {required}"
+                    "Missing required pinned memory field: {required}"
                 )));
             }
         }
@@ -218,7 +224,7 @@ impl<'de> Visitor<'de> for MemorySeed<'_, '_> {
         f.write_str("saved memory projection")
     }
     fn visit_none<E: serde::de::Error>(self) -> Result<(), E> {
-        Err(E::custom("固定記憶がありません"))
+        Err(E::custom("Missing pinned memory"))
     }
     fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
         d.deserialize_map(self)
@@ -227,7 +233,7 @@ impl<'de> Visitor<'de> for MemorySeed<'_, '_> {
         let mut seen = BTreeSet::new();
         while let Some(name) = key(&mut map, self.budget)? {
             if !seen.insert(name.clone()) {
-                return Err(serde::de::Error::custom("固定記憶のfield重複"));
+                return Err(serde::de::Error::custom("Duplicate pinned memory field"));
             }
             match name.as_str() {
                 "schema_version" => {
@@ -263,7 +269,7 @@ impl<'de> Visitor<'de> for MemorySeed<'_, '_> {
                         Ok(())
                     },
                 )?,
-                _ => return Err(serde::de::Error::custom("固定記憶の未知のfield")),
+                _ => return Err(serde::de::Error::custom("Unknown pinned memory field")),
             }
         }
         for required in [
@@ -276,7 +282,7 @@ impl<'de> Visitor<'de> for MemorySeed<'_, '_> {
         ] {
             if !seen.contains(required) {
                 return Err(serde::de::Error::custom(format!(
-                    "固定記憶の必須field不在: {required}"
+                    "Missing required pinned memory field: {required}"
                 )));
             }
         }

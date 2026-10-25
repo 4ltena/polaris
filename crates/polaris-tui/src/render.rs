@@ -300,7 +300,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
                     for dl in &hunk.lines {
                         if shown >= MAX_DIFF_LINES_SHOWN {
                             lines.push(HistoryLine::plain(Line::from(Span::styled(
-                                "  ...(省略)",
+                                "  ...(omitted)",
                                 Style::default().add_modifier(Modifier::DIM),
                             ))));
                             break 'hunks;
@@ -369,7 +369,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
         } => {
             vec![HistoryLine::plain(Line::from(Span::styled(
                 sanitize(&format!(
-                    "⏺ 会話履歴を要約しました ({messages_before}件→{messages_after}件、{tokens_before}tok→{tokens_after}tok)"
+                    "⏺ Conversation history summarized ({messages_before}→{messages_after} messages, {tokens_before}→{tokens_after} tokens)"
                 )),
                 Style::default().add_modifier(Modifier::DIM),
             )))]
@@ -979,10 +979,14 @@ fn header_lines_with_mode(header: &HeaderInfo, read_only: bool) -> Vec<Line<'sta
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("polaris", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         if read_only {
-            Line::from("mode:      Windows 閲覧専用 (/help)")
+            Line::from("mode:      Windows browsing only (/help)")
         } else {
             Line::from(vec![
                 Span::styled("model:     ", dim),
@@ -997,7 +1001,7 @@ fn header_lines_with_mode(header: &HeaderInfo, read_only: bool) -> Vec<Line<'sta
             Span::raw(sanitize(header.cwd)),
         ]),
         if read_only {
-            Line::from("session:   未開始・保存なし・モデル接続なし")
+            Line::from("session:   not started; no persistence; no model connection")
         } else {
             Line::from(vec![
                 Span::styled("tokens:    ", dim),
@@ -1124,7 +1128,7 @@ fn composer_cursor_position(
     cursor: usize,
 ) -> Position {
     let prefix_width: u16 = 2;
-    let typed_width = sanitize(&input[..cursor]).width() as u16;
+    let typed_width = sanitize(&crate::file_input::displayed_prefix(input, cursor)).width() as u16;
     let cursor_x = input_area
         .x
         .saturating_add(prefix_width)
@@ -1313,7 +1317,7 @@ pub(crate) fn render_footer_with_mode(
             ),
             Span::styled(
                 if read_only {
-                    "/help で閲覧コマンドを表示"
+                    "Use /help to list browsing commands"
                 } else {
                     "Ask polaris to do anything"
                 },
@@ -1321,13 +1325,23 @@ pub(crate) fn render_footer_with_mode(
             ),
         ])
     } else {
-        Line::from(vec![
-            Span::styled(
-                "\u{203a} ",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-            ),
-            Span::raw(sanitize(input)),
-        ])
+        let mut spans = vec![Span::styled(
+            "\u{203a} ",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+        )];
+        let mut after = 0;
+        for block in crate::file_input::blocks(input) {
+            spans.push(Span::raw(sanitize(&input[after..block.range.start])));
+            spans.push(Span::styled(
+                sanitize(&block.label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            after = block.range.end;
+        }
+        spans.push(Span::raw(sanitize(&input[after..])));
+        Line::from(spans)
     };
     // Paint the composer as one solid three-row surface before adding its
     // text. Rendering three independent paragraphs allowed a terminal's
@@ -1370,7 +1384,7 @@ pub(crate) fn render_footer_with_mode(
     // a warm tan, the working directory in a soft green, separated by a
     // dim middle dot.
     let model_and_effort = if read_only {
-        "Windows 閲覧専用".to_owned()
+        "Windows browsing only".to_owned()
     } else if header.effort_name.is_empty() {
         sanitize(header.model_name)
     } else {
@@ -1529,7 +1543,7 @@ pub fn render_transcript_viewer(
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("会話の閲覧（実行不可）");
+        .title("View conversation (execution unavailable)");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -1559,7 +1573,7 @@ pub fn render_transcript_viewer(
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
-                    "↑↓/PgUp/PgDnで移動 · Escで戻る",
+                    "↑↓/PgUp/PgDn: move · Esc: back",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]),
@@ -1718,23 +1732,23 @@ pub fn render_management_confirmation(
     let lines = if ready {
         vec![
             Line::from(operation),
-            Line::from("対象:"),
+            Line::from("Target:"),
             Line::from(target),
             Line::from(""),
             Line::from(detail),
             Line::from(""),
-            Line::from("y: 実行 / Esc: 取消"),
+            Line::from("y: execute / Esc: cancel"),
         ]
     } else {
         vec![
-            Line::from("対象をすべて表示できません。端末を広げてください。"),
-            Line::from("Esc: 取消"),
+            Line::from("Cannot display the entire target. Widen the terminal."),
+            Line::from("Esc: cancel"),
         ]
     };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("確認")),
+            .block(Block::default().borders(Borders::ALL).title("Confirm")),
         frame.area(),
     );
     ready
@@ -1758,7 +1772,7 @@ pub fn render_c10_preview(frame: &mut Frame, view: &C10ConfirmView) {
             .take(frame.area().height.saturating_sub(4) as usize)
             .map(|row| row.line),
     );
-    text.push(Line::from("確定の確認はprepare後に表示します"));
+    text.push(Line::from("Final confirmation is shown after preparation"));
     frame.render_widget(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("C10 preview")),
         frame.area(),
@@ -1766,7 +1780,7 @@ pub fn render_c10_preview(frame: &mut Frame, view: &C10ConfirmView) {
 }
 
 pub fn render_c10_wait(frame: &mut Frame) {
-    frame.render_widget(Paragraph::new("C10操作を処理中です。\n送信・照合の結果を待っています。\nEscは送信取消にはなりません。\nCtrl-Cは処理終了後に終了します。")
+    frame.render_widget(Paragraph::new("Processing the C10 operation.\nWaiting for send or reconciliation results.\nEsc does not cancel the send.\nCtrl-C exits after processing finishes.")
         .block(Block::default().borders(Borders::ALL).title("C10")), frame.area());
 }
 
@@ -1796,9 +1810,9 @@ pub fn render_c10_confirmation(frame: &mut Frame, view: &C10ConfirmView, offset:
             .map(|row| row.line.clone()),
     );
     lines.push(Line::from(if complete {
-        "y: 確定 · esc: 中止 · ↑↓: 詳細"
+        "y: confirm · Esc: cancel · ↑↓: details"
     } else {
-        "↑↓: 全詳細を確認 · esc: 中止"
+        "↑↓: review all details · Esc: cancel"
     }));
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("C10")),
@@ -1917,11 +1931,11 @@ pub fn render_workflow_change_confirmation(
 /// Fixed hosted choices for `/model`. Local runtimes are discovered only
 /// after the separate local-model row is chosen.
 pub const MODEL_CATALOG: &[&str] = &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"];
-pub const RECOMMENDED_MODEL: &str = "gpt-6-astra";
+pub const RECOMMENDED_MODEL: &str = "gpt-6.1-sol";
 pub const LOCAL_MODEL_LABEL: &str = "Local model";
 
 /// The `/model` picker: numbered options, arrow-key navigable, the
-/// currently-active one marked `(current)` and Astra marked
+/// currently-active one marked `(current)` and Sol marked
 /// `(recommended)` — the same layout
 /// `render_permissions_picker` uses, both modeled on a screenshot of
 /// codex's real `/model` picker. Unlike codex's, this carries no
@@ -2533,6 +2547,54 @@ mod tests {
     }
 
     #[test]
+    fn startup_title_places_the_gray_package_version_after_polaris() {
+        let lines = header_history_lines(&test_header(), 60);
+        let title = &lines[1].line;
+        let expected = format!(" v{}", env!("CARGO_PKG_VERSION"));
+        assert!(title.to_string().contains(&format!("polaris{expected}")));
+        let version = title
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == expected.as_str())
+            .expect("the framed startup title must retain the version span");
+        assert_eq!(version.style.fg, Some(Color::DarkGray));
+        assert!(!version.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn composer_displays_file_name_and_places_the_caret_after_the_whole_block() {
+        let input = "確認 [file](file:///tmp/%E8%B3%87%E6%96%99.txt)";
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_footer(
+                    frame,
+                    frame.area(),
+                    input,
+                    input.len(),
+                    &Status::Idle,
+                    &test_header(),
+                    &[],
+                    0,
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.replace(' ', "").contains("[資料.txt]"));
+        assert!(!content.contains("file:///"));
+        let position =
+            composer_cursor_position(ratatui::layout::Rect::new(0, 0, 80, 1), input, input.len());
+        assert_eq!(position.x, 2 + "確認 [資料.txt]".width() as u16);
+    }
+
+    #[test]
     fn a_user_message_appears_unlabeled_and_shaded() {
         // No "you:" label — the full-row gray shading (`shaded: true`) is
         // the only marker, matching codex's own unlabeled user line.
@@ -3123,7 +3185,8 @@ mod tests {
 
     #[test]
     fn empty_rewind_picker_explains_the_reason_at_narrow_and_wide_widths() {
-        let reason = "中断したターンは巻き戻し対象外です（保存境界が未完了）\ncontrol\x1b[31m";
+        let reason =
+            "Interrupted turns cannot be rewound (save boundary incomplete)\ncontrol\x1b[31m";
         for width in [42, 100] {
             let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
             terminal
@@ -3135,7 +3198,7 @@ mod tests {
                 .collect::<String>();
             let compact = content.split_whitespace().collect::<String>();
             assert!(
-                compact.contains("中断したターンは巻き戻し対象外です（保存境界が未完了）"),
+                compact.contains("Interruptedturnscannotberewound(saveboundaryincomplete)"),
                 "width={width}: {content:?}"
             );
             assert!(compact.contains("control�[31m"), "{content:?}");
@@ -3180,7 +3243,7 @@ mod tests {
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_model_picker(f, "gpt-6-astra", false, 0))
+            .draw(|f| render_model_picker(f, "gpt-6.1-sol", false, 1))
             .expect("draw");
 
         let buffer = terminal.backend().buffer();
@@ -3193,9 +3256,9 @@ mod tests {
             .collect();
         assert!(
             rows.iter()
-                .any(|r| r.contains("gpt-6-astra (recommended, current)"))
+                .any(|r| r.contains("gpt-6.1-sol (recommended, current)"))
         );
-        assert!(rows.iter().any(|r| r.contains("gpt-6.1-sol")));
+        assert!(rows.iter().any(|r| r.contains("gpt-6-astra")));
         assert!(rows.iter().any(|r| r.contains("gpt-6-luna")));
         assert!(rows.iter().any(|r| r.contains("Local model")));
         assert!(!rows.iter().any(|r| r.contains("terra")));
@@ -3216,7 +3279,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("gpt-6-astra (recommended)"));
+        assert!(content.contains("gpt-6.1-sol (recommended)"));
         assert!(content.contains("Local model (current)"));
     }
 
@@ -3954,7 +4017,7 @@ mod tests {
         // itself carries.
         assert!(lines.len() < 100);
         let joined = live_print_text(&event);
-        assert!(joined.contains("省略"));
+        assert!(joined.contains("omitted"));
     }
 
     #[test]
@@ -4630,7 +4693,7 @@ mod memory_observation_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(actual, expected);
-        assert!(actual.contains("要再確認") && actual.contains("40 tokens"));
+        assert!(actual.contains("recheck required") && actual.contains("40 reference tokens"));
         assert!(!actual.contains('\u{1b}'));
     }
 }

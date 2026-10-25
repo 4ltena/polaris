@@ -655,7 +655,7 @@ fn enforce_final_budget(
 ) -> Result<(), String> {
     let serialized_tokens = |value: &WorkflowContextSliceV1| -> Result<usize, String> {
         Ok(serde_json::to_vec(value)
-            .map_err(|_| "workflow context sliceを直列化できません")?
+            .map_err(|_| "Cannot serialize the workflow context slice")?
             .len()
             .div_ceil(4))
     };
@@ -670,7 +670,7 @@ fn enforce_final_budget(
     for _ in 0..3 {
         let actual = serialized_tokens(slice)?;
         if actual > slice.token_budget {
-            return Err("workflow context sliceの最小失敗表現がtoken budgetを超えました".into());
+            return Err("The workflow context slice's minimal failure representation exceeds the token budget".into());
         }
         slice.estimated_tokens = actual;
         slice.basis_hash = context_basis_hash(slice, state, graph, bodies)?;
@@ -678,7 +678,7 @@ fn enforce_final_budget(
             return Ok(());
         }
     }
-    Err("workflow context sliceのtoken見積りが安定しません".into())
+    Err("Workflow context slice token estimates are unstable".into())
 }
 
 fn compact_failed_slice(
@@ -753,7 +753,7 @@ fn context_basis_hash(
         body_basis,
         canonical,
     ))
-    .map_err(|_| "workflow context sliceを正規化できません")?;
+    .map_err(|_| "Cannot canonicalize the workflow context slice")?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -801,7 +801,7 @@ fn project_evidence(
         validate_context_text(&record.summary)?;
         super::validate_hash(&record.artifact_hash)?;
         if !seen.insert(record.id.clone()) {
-            return Err("evidence IDが重複しています".into());
+            return Err("Duplicate evidence ID".into());
         }
         if pack_record(slice, &record)? {
             packed.push(record);
@@ -1049,7 +1049,7 @@ fn pack_record<T: Serialize>(
     slice: &mut WorkflowContextSliceV1,
     record: &T,
 ) -> Result<bool, String> {
-    let bytes = serde_json::to_vec(record).map_err(|_| "context recordを正規化できません")?;
+    let bytes = serde_json::to_vec(record).map_err(|_| "Cannot canonicalize the context record")?;
     let tokens = bytes.len().div_ceil(4);
     if slice.estimated_tokens.saturating_add(tokens) > slice.token_budget {
         return Ok(false);
@@ -1088,7 +1088,7 @@ fn record_omission(
 
 fn validate_context_text(value: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > MAX_CONTEXT_TEXT_BYTES || value.contains('\0') {
-        Err("context textが空または上限超過です".into())
+        Err("Context text is empty or exceeds the limit".into())
     } else {
         Ok(())
     }
@@ -1096,7 +1096,7 @@ fn validate_context_text(value: &str) -> Result<(), String> {
 
 fn validate_reason(value: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > MAX_CONTEXT_REASON_BYTES || value.contains('\0') {
-        Err("context status reasonが空または上限超過です".into())
+        Err("Context status reason is empty or exceeds the limit".into())
     } else {
         Ok(())
     }

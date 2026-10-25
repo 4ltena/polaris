@@ -75,12 +75,14 @@ pub(super) fn validate_sources(
         .collect();
     let inputs = user_inputs(snapshot);
     for (id, requires_user) in source_requirements(delta)? {
-        let source = sources
-            .get(id)
-            .ok_or_else(|| io::Error::other("保存済み構造化応答の出典が抽出範囲外です"))?;
+        let source = sources.get(id).ok_or_else(|| {
+            io::Error::other(
+                "A source in the saved structured response is outside the extraction range",
+            )
+        })?;
         if requires_user && !inputs.contains(&source.sequence) {
             return Err(io::Error::other(
-                "構造化状態の変更に利用者入力の原文根拠がありません",
+                "A structured state change has no evidence in original user input",
             ));
         }
     }

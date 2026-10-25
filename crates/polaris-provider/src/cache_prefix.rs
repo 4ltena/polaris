@@ -106,7 +106,7 @@ impl CachePrefixProfile {
             Some(value) if value == OsStr::new("stable") => Ok(Self::Stable),
             Some(value) if value == OsStr::new("inert") => Ok(Self::Inert),
             Some(_) => Err(ProviderError::Decode(format!(
-                "{PROFILE_ENV} は compact、stable、inert のいずれかを指定してください"
+                "Set {PROFILE_ENV} to compact, stable, or inert"
             ))),
         }
     }

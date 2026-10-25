@@ -265,7 +265,7 @@ impl RegistrationRelay {
             ),
             state: PendingApprovalState::Pending,
             display: ApprovalDisplay {
-                title: "MCPサーバの登録".into(),
+                title: "Register MCP server".into(),
                 description: display.description.clone(),
                 choices: vec![ApprovalDecision::Allow, ApprovalDecision::Deny],
             },

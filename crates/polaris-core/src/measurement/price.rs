@@ -100,10 +100,15 @@ impl Rates {
     }
 
     pub fn parse(body: &str) -> Result<Self, &'static str> {
-        let raw: RawTable = serde_json::from_str(body).map_err(|_| "単価表を読めません")?;
+        let raw: RawTable =
+            serde_json::from_str(body).map_err(|_| "Cannot read the pricing table")?;
         let mut models = BTreeMap::new();
         for (name, model) in raw.models {
-            let rate = |text: &str| micro_usd(text).map(Rate).ok_or("単価の桁が扱えません");
+            let rate = |text: &str| {
+                micro_usd(text)
+                    .map(Rate)
+                    .ok_or("Unsupported price precision")
+            };
             models.insert(
                 name,
                 ModelRates {
@@ -113,7 +118,7 @@ impl Rates {
                         Some("not_applicable") => false,
                         // A word nobody defined must not be read as "it has
                         // one" or as "it has none".
-                        Some(_) => return Err("cacheの扱いを読めません"),
+                        Some(_) => return Err("Cannot read cache accounting rules"),
                     },
                     billed_input: rate(&model.api_per_million.billed_input)?,
                     cache_read: rate(&model.api_per_million.cache_read)?,
@@ -121,9 +126,9 @@ impl Rates {
                     output: rate(&model.api_per_million.output)?,
                     long_context_above: model.long_context.input_tokens_above,
                     long_input_multiplier: micro_usd(&model.long_context.input_multiplier)
-                        .ok_or("倍率の桁が扱えません")?,
+                        .ok_or("Unsupported multiplier precision")?,
                     long_output_multiplier: micro_usd(&model.long_context.output_multiplier)
-                        .ok_or("倍率の桁が扱えません")?,
+                        .ok_or("Unsupported multiplier precision")?,
                 },
             );
         }

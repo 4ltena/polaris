@@ -203,7 +203,7 @@ fn linux_sync_apply_uses_shared_owner_and_preserves_local_files() {
     let before = tree_snapshot(&unjoined.root);
     let (ok, message) = unjoined.run(&["apply"]);
     assert!(
-        !ok && message.contains("共有に参加していません"),
+        !ok && message.contains("has not joined a share"),
         "{message}"
     );
     assert_eq!(before, tree_snapshot(&unjoined.root));
@@ -227,8 +227,8 @@ fn linux_sync_apply_uses_shared_owner_and_preserves_local_files() {
     assert!(ok, "{message}");
     receiver.write("keep.txt", "local content\n");
     let (ok, message) = receiver.run(&["apply"]);
-    assert!(ok && message.contains("反映しました"), "{message}");
-    assert!(!message.contains("未接続"));
+    assert!(ok && message.contains("Applied"), "{message}");
+    assert!(!message.contains("disconnected"));
     assert_eq!(
         fs::read(receiver.root.join("incoming.txt")).unwrap(),
         b"remote content\n"
@@ -263,7 +263,7 @@ fn linux_sync_apply_uses_shared_owner_and_preserves_local_files() {
     run_owner_fixture(&receiver, "inspect");
     let before = tree_snapshot(&receiver.root);
     let (ok, message) = receiver.run(&["apply"]);
-    assert!(ok && message.contains("反映済み"), "{message}");
+    assert!(ok && message.contains("already been applied"), "{message}");
     assert_eq!(before, tree_snapshot(&receiver.root));
     assert_eq!(
         fs::read_dir(state.join("apply-intents-v1/archive"))
@@ -398,7 +398,7 @@ fn sync_owner_fixture_child() {
                     // owner. Receive/apply/leave still exercise the held lease.
                     message.starts_with("c10_unavailable_platform:")
                 } else {
-                    message.contains("共有操作を開始できません")
+                    message.contains("Cannot start the sharing operation")
                 };
                 assert!(!output.status.success() && refused, "{command}: {message}");
                 assert_eq!(before, tree_snapshot(&project));
@@ -432,7 +432,7 @@ fn linux_sync_apply_refuses_deferred_directories_without_intent_or_source_effect
     let effects_before = management.exists().then(|| tree_snapshot(&management));
     let before = tree_snapshot(&receiver.root);
     let (ok, message) = receiver.run(&["apply"]);
-    assert!(!ok && message.contains("未作成ディレクトリ"), "{message}");
+    assert!(!ok && message.contains("new directories"), "{message}");
     assert_eq!(before, tree_snapshot(&receiver.root));
     assert!(!state.join("apply-intents-v1").exists());
     assert_eq!(
@@ -483,7 +483,7 @@ fn linux_sync_apply_refuses_cross_device_recovery_before_creation() {
     let before = tree_snapshot(&receiver.root);
     let participation = fs::read(state.join("sync/participation.json")).unwrap();
     let (ok, message) = receiver.run(&["apply"]);
-    assert!(!ok && message.contains("同じファイルシステム"), "{message}");
+    assert!(!ok && message.contains("same filesystem"), "{message}");
     assert_eq!(before, tree_snapshot(&receiver.root));
     assert_eq!(
         participation,
@@ -522,7 +522,7 @@ fn linux_sync_apply_refuses_symlink_recovery_before_publication() {
     let participation = fs::read(state.join("sync/participation.json")).unwrap();
     let foreign_before = tree_snapshot(foreign.path());
     let (ok, message) = receiver.run(&["apply"]);
-    assert!(!ok && message.contains("復旧"), "{message}");
+    assert!(!ok && message.contains("Recovered"), "{message}");
     assert_eq!(before, tree_snapshot(&receiver.root));
     assert_eq!(foreign_before, tree_snapshot(foreign.path()));
     assert_eq!(
@@ -560,14 +560,14 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
     {
         let (ok, message) = first.run(&["push"]);
         assert!(ok, "{message}");
-        assert!(message.contains("送信しました: 1件"), "{message}");
+        assert!(message.contains("Sent: 1 items"), "{message}");
     }
 
     let second = Device::new();
     second.join(&remote);
     let (ok, message) = second.run(&["pull"]);
     assert!(ok, "{message}");
-    assert!(message.contains("受け取りました: 1件"), "{message}");
+    assert!(message.contains("Received: 1"), "{message}");
     // A credential file is never shared.
     let (_, status) = second.run(&["status"]);
     assert!(!status.contains("SECRET"), "{status}");
@@ -583,7 +583,7 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
     first.write("src/main.rs", "fn main() { first() }\n");
     let (ok, message) = first.run(&["pull"]);
     assert!(ok, "{message}");
-    assert!(message.contains("双方の内容を残しました"), "{message}");
+    assert!(message.contains("Both versions retained"), "{message}");
     assert!(message.contains("src/main.rs"), "{message}");
 
     // The project keeps what this device wrote; nothing was overwritten.
@@ -592,11 +592,11 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
         "fn main() { first() }\n"
     );
     let (_, status) = first.run(&["status"]);
-    assert!(status.contains("解消待ち: src/main.rs"), "{status}");
+    assert!(status.contains("Unresolved: src/main.rs"), "{status}");
 
     // With something unresolved, applying is refused outright.
     let (ok, message) = first.run(&["apply"]);
-    assert!(!ok && message.contains("解消待ちが1件"), "{message}");
+    assert!(!ok && message.contains("1 unresolved items"), "{message}");
 
     // A device with nothing unresolved takes the shared content into its
     // project, and what it never shared stays where it is.
@@ -643,7 +643,7 @@ fn applying_needs_an_agreed_state_and_never_removes_what_was_never_shared() {
     second.write("src/own.rs", "手元のもの\n");
     let (ok, message) = second.run(&["apply"]);
     assert!(
-        !ok && message.contains("まだ合意した内容がありません"),
+        !ok && message.contains("No agreed content yet"),
         "{message}"
     );
     assert!(second.root.join("src/own.rs").exists(), "{message}");
@@ -662,7 +662,7 @@ fn applying_needs_an_agreed_state_and_never_removes_what_was_never_shared() {
 
     // The same agreed state is never applied a second time.
     let (ok, message) = second.run(&["apply"]);
-    assert!(ok && message.contains("反映済み"), "{message}");
+    assert!(ok && message.contains("already been applied"), "{message}");
     assert_eq!(
         fs::read_to_string(second.root.join("notes.md")).unwrap(),
         "反映のあとに書いた\n"
@@ -777,7 +777,7 @@ fn every_env_variant_and_generated_output_stays_on_this_device() {
     {
         let (ok, message) = device.run(&["push"]);
         assert!(ok, "{message}");
-        assert!(message.contains("送信しました: 1件"), "{message}");
+        assert!(message.contains("Sent: 1 items"), "{message}");
     }
 
     // Read the shared history back from the remote itself.

@@ -604,7 +604,7 @@ pub fn is_build_cache(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
             component.as_os_str().to_str(),
-            Some("target" | "node_modules" | ".build" | ".cache" | "DerivedData")
+            Some("target" | "node_modules" | ".venv" | ".build" | ".cache" | "DerivedData")
         )
     })
 }

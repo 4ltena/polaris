@@ -38,7 +38,7 @@ pub(in crate::desktop_store) fn project(
     p: &Published,
     target: &RunTarget,
 ) -> StoreResult<RunDetails> {
-    let mismatch = || StoreError::Corrupt("run詳細の対応不一致");
+    let mismatch = || StoreError::Corrupt("Run details association mismatch");
     let inputs: Vec<&RawEventV2> = p.raw.iter().filter(|event| event.starts_turn).collect();
     let inherited =
         usize::try_from(p.state.inherited_turn_count.get()).map_err(|_| StoreError::Overflow)?;

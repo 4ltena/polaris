@@ -12,6 +12,8 @@ pub(super) struct ConversationViewState {
     printed_local_lines: usize,
     pub(super) scroll_offset: usize,
     pub(super) selection: Option<selection::Selection>,
+    #[cfg(target_os = "macos")]
+    pub(super) file_click: crate::file_reveal::FileClick,
     activity_rows: AgentActivityRows,
 }
 
@@ -24,6 +26,8 @@ impl ConversationViewState {
             printed_local_lines: 0,
             scroll_offset: 0,
             selection: None,
+            #[cfg(target_os = "macos")]
+            file_click: crate::file_reveal::FileClick::default(),
             activity_rows: AgentActivityRows::default(),
         }
     }
@@ -63,6 +67,8 @@ impl ConversationViewState {
         self.printed_local_lines = 0;
         self.scroll_offset = 0;
         self.selection = None;
+        #[cfg(target_os = "macos")]
+        self.file_click.cancel();
         self.activity_rows = AgentActivityRows::default();
     }
 
@@ -148,7 +154,7 @@ struct AgentActivityRows {
 impl AgentActivityRows {
     fn tool_detail_lines(&self) -> Vec<String> {
         if self.tools.is_empty() {
-            return vec!["この実行でtoolイベントは観測されていません".into()];
+            return vec!["No tool events observed in this run".into()];
         }
         self.tools
             .iter()
@@ -159,7 +165,7 @@ impl AgentActivityRows {
     fn observe_tool(&mut self, event: &polaris_core::AgentEvent) {
         let (name, detail, state) = match event {
             polaris_core::AgentEvent::ToolStarted { name, detail } => {
-                (name, detail, "開始を観測・完了未確認")
+                (name, detail, "start observed; completion unverified")
             }
             polaris_core::AgentEvent::ToolFinished {
                 name, detail, ok, ..
@@ -167,9 +173,9 @@ impl AgentActivityRows {
                 name,
                 detail,
                 if *ok {
-                    "成功を観測"
+                    "success observed"
                 } else {
-                    "失敗を観測"
+                    "failure observed"
                 },
             ),
             _ => return,
@@ -177,11 +183,9 @@ impl AgentActivityRows {
         let name = name.chars().take(256).collect::<String>();
         let detail = detail.chars().take(256).collect::<String>();
         if matches!(event, polaris_core::AgentEvent::ToolFinished { .. })
-            && let Some(row) = self
-                .tools
-                .iter_mut()
-                .rev()
-                .find(|(n, d, s)| n == &name && d == &detail && *s == "開始を観測・完了未確認")
+            && let Some(row) = self.tools.iter_mut().rev().find(|(n, d, s)| {
+                n == &name && d == &detail && *s == "start observed; completion unverified"
+            })
         {
             row.2 = state;
             return;
@@ -397,7 +401,7 @@ mod tests {
             name: "read".into(),
             detail: "one".into(),
         });
-        assert!(view.tool_detail_lines()[0].contains("完了未確認"));
+        assert!(view.tool_detail_lines()[0].contains("completion unverified"));
         view.append_live_event(&polaris_core::AgentEvent::ToolFinished {
             name: "read".into(),
             detail: "one".into(),
@@ -405,7 +409,7 @@ mod tests {
             result: "private body".into(),
             diff: None,
         });
-        assert!(view.tool_detail_lines()[0].contains("失敗を観測"));
+        assert!(view.tool_detail_lines()[0].contains("failure observed"));
         assert!(!view.tool_detail_lines()[0].contains("private body"));
         for n in 0..130 {
             view.append_live_event(&polaris_core::AgentEvent::ToolStarted {
@@ -417,10 +421,10 @@ mod tests {
         assert!(
             view.tool_detail_lines()
                 .iter()
-                .all(|line| line.contains("完了未確認"))
+                .all(|line| line.contains("completion unverified"))
         );
         view.reset(&header(), 80);
         assert!(view.activity_rows.tools.is_empty());
-        assert!(view.tool_detail_lines()[0].contains("観測されていません"));
+        assert!(view.tool_detail_lines()[0].contains("No tool events observed"));
     }
 }

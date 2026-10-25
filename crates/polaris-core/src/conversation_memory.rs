@@ -29,7 +29,7 @@ pub use structured_owner::{
 fn number(value: u64) -> io::Result<i64> {
     value
         .try_into()
-        .map_err(|_| io::Error::other("保存世代・ターン番号がSQLite上限を超えました"))
+        .map_err(|_| io::Error::other("Storage generation or turn number exceeds SQLite limits"))
 }
 
 pub fn published_view(state: &ConversationStateV2) -> io::Result<PublishedView> {
@@ -87,7 +87,7 @@ fn publish_summary_snapshot(
         .state
         .generation
         .checked_add(1)
-        .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+        .ok_or_else(|| io::Error::other("Storage generation limit reached"))?;
     let expected_scope = Scope {
         project_id: expected.state.project_id.clone(),
         session_id: expected.state.session_id.clone(),
@@ -98,7 +98,7 @@ fn publish_summary_snapshot(
         .source
         .start_turn
         .try_into()
-        .map_err(|_| io::Error::other("原文ターン番号が不正です"))?;
+        .map_err(|_| io::Error::other("Invalid original turn number"))?;
     if pending.scope != expected_scope
         || pending.source.start_turn != pending.source.end_turn
         || !expected.expired_turns().contains(&turn)
@@ -106,7 +106,7 @@ fn publish_summary_snapshot(
         || expected.state.visible_summary_ids.contains(&pending.id)
     {
         return Err(io::Error::other(
-            "要約の世代・原文範囲が処理対象と一致しません",
+            "Summary generation or source range does not match the target",
         ));
     }
     expected.validate_complete_turn(turn)?;

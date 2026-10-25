@@ -83,7 +83,7 @@ fn parse(request: &str) -> Result<Command, String> {
                     "--batch" if batch.is_none() => {
                         let number = value.parse::<usize>().map_err(|_| USAGE.to_owned())?;
                         if !(1..=MAX_CHANGE_RECORDS).contains(&number) {
-                            return Err("索引は1回1〜100件で指定してください".into());
+                            return Err("Index 1–100 records per operation".into());
                         }
                         batch = Some(number);
                     }
@@ -110,11 +110,9 @@ fn parse(request: &str) -> Result<Command, String> {
             if parts.next().is_some() {
                 return Err(USAGE.into());
             }
-            Ok(Command::Reconcile(
-                target
-                    .parse()
-                    .map_err(|_| "照合には32桁の操作IDが必要です")?,
-            ))
+            Ok(Command::Reconcile(target.parse().map_err(
+                |_| "Reconciliation requires a 32-digit operation ID",
+            )?))
         }
         _ => Err(USAGE.into()),
     }
@@ -140,27 +138,27 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         return Ok(vec![Line::from(USAGE)]);
     }
     if request.len() > 4096 || request.chars().any(char::is_control) {
-        return Err("メモリ操作は4096バイト以内の1行で指定してください".into());
+        return Err("Specify a memory operation as one line within 4096 bytes".into());
     }
     let operation = request.split_whitespace().next().unwrap_or("");
     let data_root = state_dir
         .parent()
         .and_then(Path::parent)
-        .ok_or("メモリ保存先が不正です")?;
+        .ok_or("Invalid memory storage location")?;
     if matches!(operation, "search" | "get" | "source") {
         return crate::memory_read_lines(cwd, state_dir, &data_root.join("sessions"), request);
     }
     let command = parse(request)?;
     if queue_busy {
-        return Err("送信待ちの入力があるためメモリ変更を開始できません".into());
+        return Err("Cannot start memory changes while input is queued".into());
     }
     let project = persist::project_identity(cwd).map_err(|e| e.to_string())?;
     if workspace.project_root() != Path::new(&project) || effects.state_dir() != state_dir {
-        return Err("メモリ操作のプロジェクトと保存先が一致しません".into());
+        return Err("Memory operation project and storage mismatch".into());
     }
     let lease = workspace
         .try_mutation()
-        .map_err(|_| "実行中の操作があるためメモリ変更を開始できません")?;
+        .map_err(|_| "Cannot start memory changes while an operation is active")?;
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|e| e.to_string())?;
@@ -173,7 +171,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             if effect.request.inventory.encoded() != "C10"
                 && effect.request.operation_id == operation)
     {
-        return Err("未解決の管理操作があります。先に照合してください".into());
+        return Err("Unresolved management operations exist. Reconcile them first".into());
     }
     let owner = MemoryChangeOwnerV1 {
         effects,
@@ -191,9 +189,9 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             if !account::confirm(
                 terminal,
                 reader,
-                "メモリ変更結果の照合",
+                "Reconcile memory change outcome",
                 &operation.as_hex(),
-                "保存済みreceiptと対象を照合します。変更や削除を再実行しません。",
+                "Reconcile the saved receipt with the target. Changes and deletions will not be repeated.",
             ) {
                 return Ok(cancelled());
             }
@@ -213,10 +211,10 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             let accepted = account::confirm(
                 terminal,
                 reader,
-                "C14 記録の取り込み",
+                "C14 import records",
                 &render::sanitize(&source.display().to_string()),
                 &format!(
-                    "対象プロジェクト: {project}\n{count}件を索引へ保存します。本文をモデルへ送信しません。"
+                    "Target project: {project}\nSave {count} records to the index. Bodies are not sent to a model."
                 ),
             );
             let receipt = owner.apply(&mut store, &prepared, accepted)?;
@@ -238,10 +236,10 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             let accepted = account::confirm(
                 terminal,
                 reader,
-                "C20 セッションの記憶削除",
+                "C20 delete session memory",
                 &session,
                 &format!(
-                    "対象プロジェクト: {project}\nこのセッションの本文・ベクトル・検証済み保管原文を削除します。再取り込みは禁止されます。元に戻せません。"
+                    "Target project: {project}\nDelete this session's bodies, vectors, and verified archived source text. Reimport is prohibited. This cannot be undone."
                 ),
             );
             let receipt = owner.apply(&mut store, &prepared, accepted)?;
@@ -254,7 +252,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
                 store
                     .get(&project, &session, &id)
                     .map_err(|e| e.to_string())?
-                    .ok_or("指定した記録がありません")?,
+                    .ok_or("The specified record does not exist")?,
             ];
             embed_records(
                 &owner, &mut store, &project, revision, records, false, embedding, terminal, reader,
@@ -270,7 +268,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
                 .records_page(&project, &session, after.as_deref(), batch)
                 .map_err(|e| e.to_string())?;
             if records.is_empty() {
-                return Err("索引対象の記録がありません".into());
+                return Err("No records to index".into());
             }
             let next = records.last().map(|r| r.id.clone()).unwrap_or_default();
             let mut lines = embed_records(
@@ -279,10 +277,10 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             .await?;
             if lines
                 .first()
-                .is_some_and(|line| line.to_string().contains("保存しました"))
+                .is_some_and(|line| line.to_string().contains("Saved"))
             {
                 lines.push(Line::from(render::sanitize(&format!(
-                    "続きは /memory index {session} --batch {batch} --after {next}"
+                    "Continue with /memory index {session} --batch {batch} --after {next}"
                 ))));
             }
             Ok(lines)
@@ -305,38 +303,38 @@ fn new_request(
     })
 }
 fn cancelled() -> Vec<Line<'static>> {
-    vec![Line::from("メモリ操作を取り消しました")]
+    vec![Line::from("Memory operation cancelled")]
 }
 fn receipt_lines(receipt: &MemoryChangeReceiptV1, reconciled: bool) -> Vec<Line<'static>> {
     let result = if reconciled {
-        "保存済みの変更結果を照合しました"
+        "Saved change outcome reconciled"
     } else if receipt.kind == polaris_memory::management::MemoryChangeKindV1::Forget {
-        "対象セッションの記憶と検証済み保管原文を削除しました"
+        "Target session memory and verified archived source text deleted"
     } else {
-        "記録の変更を保存しました"
+        "Saved record changes"
     };
     vec![
         Line::from(format!(
-            "{result}。記録{}件、v2索引削除{}件。",
+            "{result}. {} records, {} v2 index entries deleted.",
             receipt.records_changed, receipt.conversation_rows_deleted
         )),
         Line::from(format!(
-            "操作ID: {} / revision {} → {}",
+            "Operation ID: {} / revision {} → {}",
             receipt.operation_id, receipt.before_revision, receipt.after_revision
         )),
     ]
 }
 
 fn read_import(path: &Path, project: &str) -> Result<Vec<Record>, String> {
-    let parent = path.parent().ok_or("取り込み元が不正です")?;
+    let parent = path.parent().ok_or("Invalid import source")?;
     let directory = open_directory_nofollow(parent)
-        .map_err(|_| "取り込み元の親ディレクトリをnofollowで確認できません")?;
-    let name = CString::new(path.file_name().ok_or("取り込み元が不正です")?.as_bytes())
-        .map_err(|_| "取り込み元が不正です")?;
+        .map_err(|_| "Cannot verify the import source parent directory with nofollow")?;
+    let name = CString::new(path.file_name().ok_or("Invalid import source")?.as_bytes())
+        .map_err(|_| "Invalid import source")?;
     let protection = polaris_auth::protection::with_protected_paths(Clone::clone)
-        .map_err(|_| "保護されたファイルの一覧を確認できません")?;
+        .map_err(|_| "Cannot verify the protected file inventory")?;
     if protection.paths().contains(path) {
-        return Err("保護されたファイルは取り込めません".into());
+        return Err("Protected files cannot be imported".into());
     }
     let fd = unsafe {
         libc::openat(
@@ -346,7 +344,7 @@ fn read_import(path: &Path, project: &str) -> Result<Vec<Record>, String> {
         )
     };
     if fd < 0 {
-        return Err("取り込み元を通常ファイルとして開けません".into());
+        return Err("Cannot open the import source as a regular file".into());
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -359,7 +357,7 @@ fn read_import(path: &Path, project: &str) -> Result<Vec<Record>, String> {
                 ino: meta.ino(),
             })
     {
-        return Err("取り込み元が保護対象または8 MiBを超えています".into());
+        return Err("The import source is protected or exceeds 8 MiB".into());
     }
     let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
@@ -371,36 +369,36 @@ fn read_import(path: &Path, project: &str) -> Result<Vec<Record>, String> {
         )
     } != 0
     {
-        return Err("取り込み元を再確認できません".into());
+        return Err("Cannot reverify the import source".into());
     }
     let named = unsafe { named.assume_init() };
     if named.st_dev as u64 != meta.dev()
         || named.st_ino != meta.ino()
         || named.st_mode & libc::S_IFMT != libc::S_IFREG
     {
-        return Err("取り込み元が変更されました".into());
+        return Err("The import source changed".into());
     }
     let mut contents = String::new();
     file.take(MAX_CHANGE_BYTES as u64 + 1)
         .read_to_string(&mut contents)
-        .map_err(|_| "取り込み元をUTF-8 JSONLとして読めません")?;
+        .map_err(|_| "Cannot read the import source as UTF-8 JSONL")?;
     if contents.len() > MAX_CHANGE_BYTES {
-        return Err("取り込み元が8 MiBを超えています".into());
+        return Err("The import source exceeds 8 MiB".into());
     }
     let mut records = Vec::new();
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         if records.len() >= MAX_CHANGE_RECORDS {
-            return Err("取り込みは1回100件までです".into());
+            return Err("Import at most 100 records per operation".into());
         }
-        let record: Record =
-            serde_json::from_str(line).map_err(|_| "取り込み元に不正な記録JSONがあります")?;
+        let record: Record = serde_json::from_str(line)
+            .map_err(|_| "The import source contains invalid record JSON")?;
         if record.project_id != project {
-            return Err("別プロジェクトの記録は取り込めません".into());
+            return Err("Records from another project cannot be imported".into());
         }
         records.push(record);
     }
     if records.is_empty() {
-        return Err("取り込み元に記録がありません".into());
+        return Err("The import source contains no records".into());
     }
     Ok(records)
 }
@@ -417,14 +415,14 @@ async fn embed_records<B: Backend, R: KeyReader>(
     terminal: &RefCell<Terminal<B>>,
     reader: &mut R,
 ) -> Result<Vec<Line<'static>>, String> {
-    let (url,model)=configured.ok_or("埋め込みURLとモデルが設定されていません。--tool-memory-embedding-urlと--tool-memory-embedding-modelを指定して起動してください")?;
+    let (url,model)=configured.ok_or("No embedding URL or model configured. Start with --tool-memory-embedding-url and --tool-memory-embedding-model")?;
     let encoder = Encoder::new(&url, model.clone()).map_err(|e| e.to_string())?;
     let total = records
         .iter()
         .try_fold(0usize, |total, r| total.checked_add(r.text.len()))
-        .ok_or("埋め込み本文が上限を超えました")?;
+        .ok_or("Embedding text exceeds the limit")?;
     if records.is_empty() || records.len() > MAX_CHANGE_RECORDS || total > MAX_CHANGE_BYTES {
-        return Err("埋め込み本文は1回100件・8 MiBまでです".into());
+        return Err("Embedding text is limited to 100 records and 8 MiB per operation".into());
     }
     let frozen_hashes: Vec<_> = records
         .iter()
@@ -439,13 +437,13 @@ async fn embed_records<B: Backend, R: KeyReader>(
         terminal,
         reader,
         if index {
-            "C19 セッションの索引作成"
+            "C19 index session"
         } else {
-            "C18 記録の埋め込み"
+            "C18 embed records"
         },
         &target,
         &format!(
-            "対象プロジェクト: {project}\n{}件・{total} bytesを設定済みループバックAPIへ送信します。モデル: {}\n取得したベクトルを保存します。通信の合計上限は120秒です。",
+            "Target project: {project}\nSend {} records ({total} bytes) to the configured loopback API. Model: {}\nSave returned vectors. Total network time limit: 120 seconds.",
             records.len(),
             render::sanitize(&model)
         ),
@@ -467,18 +465,21 @@ async fn embed_records<B: Backend, R: KeyReader>(
         Ok::<_, String>(updates)
     })
     .await
-    .map_err(|_| "通信が120秒を超えました。メモリDBは変更していません")?
-    .map_err(|e| format!("埋め込みを取得できません。メモリDBは変更していません: {e}"))?;
+    .map_err(|_| "Network requests exceeded 120 seconds. The memory DB is unchanged")?
+    .map_err(|e| format!("Cannot retrieve embeddings. The memory DB is unchanged: {e}"))?;
     if store.project_revision(project).map_err(|e| e.to_string())? != revision {
-        return Err("記憶が更新されたため埋め込みを保存しません。新しい明示操作が必要です".into());
+        return Err(
+            "Memory changed; embeddings will not be saved. A new explicit operation is required"
+                .into(),
+        );
     }
     for (record, hash) in records.iter().zip(frozen_hashes) {
         let current = store
             .get(project, &record.session_id, &record.id)
             .map_err(|e| e.to_string())?
-            .ok_or("対象の記録が変わりました")?;
+            .ok_or("The target record changed")?;
         if current != *record || ManagementEffectHashV1::digest(current.text.as_bytes()) != hash {
-            return Err("対象の記録が変わったため埋め込みを保存しません".into());
+            return Err("The target record changed; embeddings will not be saved".into());
         }
     }
     let change = if index {
@@ -491,7 +492,7 @@ async fn embed_records<B: Backend, R: KeyReader>(
     let prepared = owner.prepare(store, new_request(project, revision, change)?)?;
     let receipt = owner
         .apply(store, &prepared, true)?
-        .ok_or("メモリ操作が取り消されました")?;
+        .ok_or("Memory operation cancelled")?;
     Ok(receipt_lines(&receipt, false))
 }
 
@@ -618,7 +619,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(lines[0].to_string().contains("保存しました"));
+        assert!(lines[0].to_string().contains("Saved"));
         let store = MemoryStore::open_read_only(state.join("memory.sqlite3")).unwrap();
         assert!(
             store
@@ -699,7 +700,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(cancelled[0].to_string().contains("取り消"));
+        assert!(cancelled[0].to_string().contains("cancelled"));
         assert!(
             !store
                 .has_embedding(project.to_str().unwrap(), "stored", "one", "fixture-local")
@@ -719,7 +720,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(embedded[0].to_string().contains("保存しました"));
+        assert!(embedded[0].to_string().contains("Saved"));
         assert!(
             store
                 .has_embedding(project.to_str().unwrap(), "stored", "one", "fixture-local")
@@ -739,7 +740,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(indexed[0].to_string().contains("保存しました"));
+        assert!(indexed[0].to_string().contains("Saved"));
         server.join().unwrap();
         assert!(
             handle(
@@ -787,7 +788,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(cancelled[0].to_string().contains("取り消"));
+        assert!(cancelled[0].to_string().contains("cancelled"));
         assert!(
             !store
                 .is_session_forgotten(project.to_str().unwrap(), "stored")
@@ -807,7 +808,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(forgotten[0].to_string().contains("削除しました"));
+        assert!(forgotten[0].to_string().contains("deleted"));
         assert!(
             store
                 .is_session_forgotten(project.to_str().unwrap(), "stored")

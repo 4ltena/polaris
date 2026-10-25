@@ -814,7 +814,8 @@ impl TrustedRunFactory for ConfiguredRunFactory {
     }
 
     fn decision_status(&self) -> Option<Vec<String>> {
-        let mut lines = vec!["このservice owner全体の観測（会話別の使用量ではありません）".into()];
+        let mut lines =
+            vec!["Observations for this entire service owner (not per-conversation usage)".into()];
         lines.extend(polaris_core::decision_diagnostics::display(
             &self.resources.decision_config,
             self.resources.decider.as_deref(),

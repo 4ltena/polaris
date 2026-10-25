@@ -144,12 +144,13 @@ pub mod achieved {
             "achieved".to_owned(),
             Question::Noul {
                 instructions: format!(
-                    "この目標は達成されたか。目標: {goal}\n直前の実行が返したもの: {}",
+                    "Has this goal been achieved? Goal: {goal}\nLatest run output: {}",
                     bounded(evidence)
                 ),
             },
         );
-        let state = serde_json::json!({ "purpose": "目標が達成されたかを判定する" });
+        let state =
+            serde_json::json!({ "purpose": "Determine whether the goal has been achieved" });
         tokio::pin!(cancelled);
         let answered = tokio::select! {
             biased;

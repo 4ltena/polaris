@@ -47,7 +47,7 @@ fn registry_commands_keep_values_out_of_output_and_setup_needs_a_terminal() {
     };
     let listed = polaris(home.path(), project.path(), &["mcp", "list"], "");
     assert!(listed.status.success(), "{}", text(&listed));
-    assert!(text(&listed).contains("登録済みのサーバーはありません"));
+    assert!(text(&listed).contains("No registered servers"));
 
     let saved = polaris(
         home.path(),
@@ -73,7 +73,7 @@ fn registry_commands_keep_values_out_of_output_and_setup_needs_a_terminal() {
     assert!(!missing.status.success());
     let setup = polaris(home.path(), project.path(), &["mcp", "setup"], "y\n");
     assert!(!setup.status.success());
-    assert!(text(&setup).contains("対話端末"));
+    assert!(text(&setup).contains("interactive terminal"));
     assert!(!home.path().join(".polaris/mcp/servers.json").exists());
 }
 
@@ -177,22 +177,22 @@ fn list_and_check_show_the_saved_server_and_its_catalog_state() {
     let text = |output: &Output| String::from_utf8_lossy(&output.stdout).into_owned();
     let listed = polaris(home.path(), project.path(), &["mcp", "list"], "");
     assert!(
-        text(&listed).contains("docs\t有効\tカタログ未確認"),
+        text(&listed).contains("docs\tenabled\tcatalog unverified"),
         "{}",
         text(&listed)
     );
     let checked = polaris(home.path(), project.path(), &["mcp", "check", "docs"], "");
     assert!(checked.status.success(), "{:?}", checked);
-    assert!(text(&checked).contains("docs: ツール1件"));
+    assert!(text(&checked).contains("docs: 1 tools"));
     let listed = polaris(home.path(), project.path(), &["mcp", "list"], "");
     assert!(
-        text(&listed).contains("docs\t有効\tツール1件"),
+        text(&listed).contains("docs\tenabled\t1 tools"),
         "{}",
         text(&listed)
     );
     let other = tempfile::tempdir().unwrap();
     let elsewhere = polaris(home.path(), other.path(), &["mcp", "list"], "");
-    assert!(text(&elsewhere).contains("docs\t無効"));
+    assert!(text(&elsewhere).contains("docs\tdisabled"));
 }
 
 /// An OpenAI-compatible provider that searches, selects, calls the MCP tool,

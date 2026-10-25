@@ -27,7 +27,7 @@ fn an_install_that_left_the_manifest_alone_is_not_complete() {
     assert_eq!(
         confirm(dir.path(), &condition, ""),
         Verdict::NotMet {
-            missing: "package.json に無い依存: next, react, react-dom".into()
+            missing: "Dependencies missing from package.json: next, react, react-dom".into()
         }
     );
 
@@ -57,7 +57,7 @@ fn a_name_without_a_version_is_not_a_dependency() {
     assert_eq!(
         confirm(dir.path(), &condition, ""),
         Verdict::NotMet {
-            missing: "package.json に無い依存: next".into()
+            missing: "Dependencies missing from package.json: next".into()
         }
     );
 }
@@ -172,7 +172,7 @@ mod settling {
         let held = terminal(
             ended(Some(0)),
             Verdict::NotMet {
-                missing: "package.json に無い依存: next".into(),
+                missing: "Dependencies missing from package.json: next".into(),
             },
             None,
         );
@@ -180,7 +180,7 @@ mod settling {
         assert_eq!(held.exit_code, Some(0), "how it ended is still recorded");
         assert_eq!(
             held.evidence.as_deref(),
-            Some("package.json に無い依存: next"),
+            Some("Dependencies missing from package.json: next"),
             "what was read is kept, so a person can see why"
         );
     }
@@ -198,7 +198,7 @@ mod settling {
         let held = terminal(
             ended(Some(0)),
             Verdict::Unknown {
-                reason: "package.json を読めませんでした".into(),
+                reason: "Could not read package.json".into(),
             },
             None,
         );
@@ -206,7 +206,7 @@ mod settling {
         assert_eq!(held.outcome, StepOutcome::Unknown);
         assert_eq!(
             held.evidence.as_deref(),
-            Some("package.json を読めませんでした")
+            Some("Could not read package.json")
         );
     }
 

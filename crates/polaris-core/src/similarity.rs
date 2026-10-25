@@ -93,7 +93,7 @@ pub fn graph(folders: &[Folder]) -> Graph {
                 Suggestion::SharedPart
             },
             because: format!(
-                "共通するファイル名が{}件、類似度{}%",
+                "{} shared filenames, {}% similarity",
                 edge.shared.len(),
                 edge.similarity
             ),

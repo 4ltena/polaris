@@ -17,15 +17,11 @@ pub fn refusal(error: &StoreError) -> &'static str {
     match error {
         // The same project is already being set up somewhere else. Waiting
         // is the answer; a second writer would be a second ledger.
-        StoreError::Busy => {
-            "この project の設定は別の場所で実行中です。終わってから実行してください。"
-        }
-        StoreError::RecoveryRequired => {
-            "前回の設定が中断しています。もう一度実行すると続きから始めます。"
-        }
-        StoreError::Deleted => "この project の設定記録は削除されています。",
-        StoreError::UnsupportedPlatform => "この OS では設定記録を保存できません。",
-        _ => "設定記録を読み書きできません。",
+        StoreError::Busy => "This project's setup is running elsewhere. Wait for it to finish.",
+        StoreError::RecoveryRequired => "Previous setup was interrupted. Run again to resume.",
+        StoreError::Deleted => "This project's setup records were deleted.",
+        StoreError::UnsupportedPlatform => "Setup records cannot be stored on this OS.",
+        _ => "Cannot read or write setup records.",
     }
 }
 

@@ -32,7 +32,7 @@ impl WorkflowArtifactStore {
     #[cfg(unix)]
     pub fn open(data_root: &Path, project_id: &str) -> io::Result<Self> {
         if project_id.trim().is_empty() || project_id.contains('\0') {
-            return Err(invalid("project IDが不正です"));
+            return Err(invalid("Invalid project ID"));
         }
         let root = data_root.join(STORE_DIRECTORY);
         ensure_private_directory(&root)?;
@@ -47,7 +47,7 @@ impl WorkflowArtifactStore {
     pub fn open(_data_root: &Path, _project_id: &str) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformではartifact保存の保護を確認できません",
+            "Cannot verify artifact storage protections on this platform",
         ))
     }
 
@@ -75,9 +75,9 @@ impl WorkflowArtifactStore {
         reference.validate().map_err(invalid_string)?;
         let metadata = graph
             .metadata(reference)
-            .ok_or_else(|| invalid("artifact referenceが現在のgraphにありません"))?;
+            .ok_or_else(|| invalid("The artifact reference is missing from the current graph"))?;
         if metadata.kind != WorkflowArtifactKindV1::ChangeContract {
-            return Err(invalid("artifact種別がchange contractではありません"));
+            return Err(invalid("The artifact is not a change contract"));
         }
         let path = self.object_path(&reference.content_hash)?;
         let bytes = read_private_regular_file(&path)?;
@@ -87,7 +87,7 @@ impl WorkflowArtifactStore {
             || contract.header != metadata.header
             || contract.eligibility != metadata.eligibility
         {
-            return Err(invalid("change contract本文とgraph metadataが一致しません"));
+            return Err(invalid("Change contract body and graph metadata mismatch"));
         }
         Ok(contract)
     }
@@ -195,12 +195,12 @@ impl WorkflowArtifactStore {
             ImplementationPlanV1::reference,
             |artifact| &artifact.header,
         )?;
-        let feature = graph
-            .metadata(&plan.feature_spec)
-            .ok_or_else(|| invalid("implementation planのfeature specがgraphにありません"))?;
+        let feature = graph.metadata(&plan.feature_spec).ok_or_else(|| {
+            invalid("The implementation plan's feature spec is missing from the graph")
+        })?;
         if feature.kind != WorkflowArtifactKindV1::FeatureSpec {
             return Err(invalid(
-                "implementation planの参照先はfeature specではありません",
+                "The implementation plan does not reference a feature spec",
             ));
         }
         Ok(plan)
@@ -268,16 +268,16 @@ impl WorkflowArtifactStore {
         reference.validate().map_err(invalid_string)?;
         let metadata = graph
             .metadata(reference)
-            .ok_or_else(|| invalid("artifact referenceが現在のgraphにありません"))?;
+            .ok_or_else(|| invalid("The artifact reference is missing from the current graph"))?;
         if metadata.kind != expected_kind {
-            return Err(invalid("artifact種別がexpected kindと一致しません"));
+            return Err(invalid("Artifact kind does not match the expected kind"));
         }
         let path = self.object_path(&reference.content_hash)?;
         let bytes = read_private_regular_file(&path)?;
         let artifact: T = serde_json::from_slice(&bytes)?;
         validate(&artifact).map_err(invalid_string)?;
         if artifact_reference(&artifact) != *reference || header(&artifact) != &metadata.header {
-            return Err(invalid("artifact本文とgraph metadataが一致しません"));
+            return Err(invalid("Artifact body and graph metadata mismatch"));
         }
         Ok(artifact)
     }
@@ -384,12 +384,12 @@ impl WorkflowArtifactStore {
     ) -> io::Result<()> {
         let bytes = read_private_regular_file(path)?;
         if bytes != expected {
-            return Err(invalid("同じartifact hashの本文が一致しません"));
+            return Err(invalid("Different bodies for the same artifact hash"));
         }
         let parsed: ChangeContractV1 = serde_json::from_slice(&bytes)?;
         parsed.validate().map_err(invalid_string)?;
         if &parsed != contract {
-            return Err(invalid("保存済みchange contractが一致しません"));
+            return Err(invalid("Saved change contract mismatch"));
         }
         Ok(())
     }
@@ -406,12 +406,12 @@ impl WorkflowArtifactStore {
     {
         let bytes = read_private_regular_file(path)?;
         if bytes != expected {
-            return Err(invalid("同じartifact hashの本文が一致しません"));
+            return Err(invalid("Different bodies for the same artifact hash"));
         }
         let parsed: T = serde_json::from_slice(&bytes)?;
         validate(&parsed).map_err(invalid_string)?;
         if &parsed != artifact {
-            return Err(invalid("保存済みartifact本文が一致しません"));
+            return Err(invalid("Saved artifact body mismatch"));
         }
         Ok(())
     }
@@ -442,7 +442,7 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
             Ok(()) => {
                 sync_directory(
                     path.parent()
-                        .ok_or_else(|| invalid("artifact保存先が不正です"))?,
+                        .ok_or_else(|| invalid("Invalid artifact storage location"))?,
                 )?;
                 validate_private_directory(path)
             }
@@ -472,7 +472,7 @@ fn private_create_new(path: &Path) -> io::Result<File> {
 fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     validate_private_regular_file(path)?;
     if fs::symlink_metadata(path)?.len() > MAX_WORKFLOW_ARTIFACT_BODY_BYTES as u64 {
-        return Err(invalid("artifact本文が上限を超えました"));
+        return Err(invalid("Artifact body exceeds the limit"));
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -484,7 +484,7 @@ fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = options.open(path)?;
     let length = file.metadata()?.len();
     if length > MAX_WORKFLOW_ARTIFACT_BODY_BYTES as u64 {
-        return Err(invalid("artifact本文が上限を超えました"));
+        return Err(invalid("Artifact body exceeds the limit"));
     }
     let mut bytes = Vec::with_capacity(length as usize);
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -495,13 +495,13 @@ fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
 fn validate_private_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid("artifact保存先のdirectoryが不正です"));
+        return Err(invalid("Invalid artifact storage directory"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-            return Err(invalid("artifact保存先の所有者または権限が不正です"));
+            return Err(invalid("Invalid artifact storage owner or permissions"));
         }
     }
     Ok(())
@@ -510,7 +510,7 @@ fn validate_private_directory(path: &Path) -> io::Result<()> {
 fn validate_private_regular_file(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(invalid("artifact本文が通常fileではありません"));
+        return Err(invalid("Artifact body is not a regular file"));
     }
     #[cfg(unix)]
     {
@@ -519,7 +519,9 @@ fn validate_private_regular_file(path: &Path) -> io::Result<()> {
             || metadata.mode() & 0o077 != 0
             || metadata.nlink() != 1
         {
-            return Err(invalid("artifact本文の所有者、権限またはlink数が不正です"));
+            return Err(invalid(
+                "Invalid artifact body owner, permissions, or link count",
+            ));
         }
     }
     Ok(())

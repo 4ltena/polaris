@@ -503,7 +503,7 @@ async fn r33_picker_refuses_override_without_management_store() {
     )
     .await;
     assert!(
-        matches!(&status, Status::Notice(message) if message.contains("管理操作の記録がありません"))
+        matches!(&status, Status::Notice(message) if message.contains("No management operation record"))
     );
     assert_eq!(session.messages.len(), 1);
     assert_eq!(session.messages[0].content, "previous legacy window");
@@ -641,7 +641,7 @@ async fn f15_resume_confirmation_cancellation_is_byte_invariant_then_records_the
     assert_eq!(path, original_path);
     assert_eq!(effects.effects().unwrap().len(), 0);
     assert!(
-        matches!(&status, Status::Notice(message) if message.contains("取り消")),
+        matches!(&status, Status::Notice(message) if message.contains("cancelled")),
         "unexpected resume status: {}",
         match &status {
             Status::Notice(message) | Status::Error(message) => message.as_str(),

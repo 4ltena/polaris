@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use tokio::net::unix::pipe::{Receiver, Sender};
     if std::env::args_os().len() != 1 {
-        return Err("引数は受け付けません".into());
+        return Err("Arguments are not accepted".into());
     }
     let reader = Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
     let writer = Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
@@ -21,6 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(unix))]
 fn main() {
-    eprintln!("このOSのfake service pipeは未対応です");
+    eprintln!("Fake service pipes are unsupported on this OS");
     std::process::exit(1);
 }

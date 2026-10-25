@@ -37,19 +37,19 @@ impl MemoryObservation {
 
     pub fn display_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
-            "記憶: {} / {} / 参照 {} tokens / 出典 {}件",
+            "Memory: {} / {} / {} reference tokens / {} sources",
             self.mode_name(),
             self.status_label(),
             self.reference_tokens,
             self.source_uris.len()
         )];
         if let Some(budget) = self.related_omission {
-            lines.push(format!("補足検索を省略: {budget}"));
+            lines.push(format!("Supplementary search skipped: {budget}"));
         }
         // JSON escaping prevents URI control characters becoming terminal output.
         lines.extend(self.source_uris.iter().map(|uri| {
             format!(
-                "出典: {}",
+                "Source: {}",
                 serde_json::to_string(uri).expect("String serialization is infallible")
             )
         }));
@@ -76,13 +76,15 @@ impl MemoryObservation {
     }
     fn status_label(&self) -> &'static str {
         match self.retrieval_status {
-            None => "準備済み",
-            Some(RetrievalStatus::Found) => "取得済み",
-            Some(RetrievalStatus::NotFound) => "該当なし",
-            Some(RetrievalStatus::AmbiguousEntity) => "対象を特定できません",
-            Some(RetrievalStatus::PendingReconfirmation) => "要再確認",
-            Some(RetrievalStatus::ExtractionIncomplete) => "抽出不足・送信停止",
-            Some(RetrievalStatus::EvidenceBudgetExceeded) => "参照枠超過・送信停止",
+            None => "ready",
+            Some(RetrievalStatus::Found) => "retrieved",
+            Some(RetrievalStatus::NotFound) => "no match",
+            Some(RetrievalStatus::AmbiguousEntity) => "target unidentified",
+            Some(RetrievalStatus::PendingReconfirmation) => "recheck required",
+            Some(RetrievalStatus::ExtractionIncomplete) => "insufficient extraction; send blocked",
+            Some(RetrievalStatus::EvidenceBudgetExceeded) => {
+                "reference budget exceeded; send blocked"
+            }
         }
     }
 }
@@ -158,7 +160,9 @@ pub(crate) fn prepare_strict(hits: &[ConversationHit]) -> io::Result<PreparedMem
         .join("\n");
     let tokens = crate::budget::count_tokens(&text);
     if tokens > 768 {
-        return Err(io::Error::other("取得した会話記憶が768tokensを超えました"));
+        return Err(io::Error::other(
+            "Retrieved conversation memory exceeds 768 tokens",
+        ));
     }
     let source_uris = hits
         .iter()

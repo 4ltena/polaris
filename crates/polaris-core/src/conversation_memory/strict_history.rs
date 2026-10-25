@@ -293,15 +293,19 @@ impl StrictHistory {
                 .len()
                 > 128
         {
-            return Err(io::Error::other("関連検索の入力が上限外です"));
+            return Err(io::Error::other("Related search input is outside bounds"));
         }
         let metadata = self.embedder.metadata().clone();
         if !(1..=4096).contains(&metadata.dimension) {
-            return Err(io::Error::other("関連検索の埋め込み次元が上限外です"));
+            return Err(io::Error::other(
+                "Related search embedding dimensions are outside bounds",
+            ));
         }
         let vectors = self.embedder.embed_query(query).await?;
         if vectors.is_empty() || vectors.len() > 32 || &metadata != self.embedder.metadata() {
-            return Err(io::Error::other("関連検索の埋め込み応答が不正です"));
+            return Err(io::Error::other(
+                "Invalid related search embedding response",
+            ));
         }
         let mut parts = Vec::with_capacity(vectors.len());
         for values in vectors {
@@ -735,7 +739,11 @@ fn verify_structured_summary_source(
     source: &ConversationSnapshot,
     reference: &polaris_memory::conversation::SourceReference,
 ) -> io::Result<String> {
-    let invalid = || io::Error::other("過去の原文参照が構造化保存記録と一致しません");
+    let invalid = || {
+        io::Error::other(
+            "The historical source reference does not match structured storage records",
+        )
+    };
     let turn = u64::try_from(reference.source.start_turn).map_err(|_| invalid())?;
     let response = source_store
         .bound_structured_attempt(source, turn)?
@@ -965,7 +973,7 @@ impl LocalStdioEmbedder {
         else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "この埋め込みモデルは同梱helperの許可一覧にありません",
+                "This embedding model is not allowlisted by the bundled helper",
             ));
         };
         if !python.is_absolute()
@@ -1095,7 +1103,7 @@ impl LocalStdioEmbedder {
             })
         {
             return Err(io::Error::other(
-                "埋め込み資源の準備結果が契約と一致しません",
+                "Embedding resource preparation does not match the contract",
             ));
         }
         Ok(receipt)

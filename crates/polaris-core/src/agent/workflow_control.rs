@@ -99,7 +99,7 @@ pub(super) fn adaptive(session: &Session) -> bool {
 }
 
 pub(super) fn parse(call: &polaris_provider::ToolCall) -> Result<StateOperation, String> {
-    serde_json::from_value(call.arguments.clone()).map_err(|_| "stateの引数が不正です".into())
+    serde_json::from_value(call.arguments.clone()).map_err(|_| "Invalid state arguments".into())
 }
 
 fn snapshot(session: &Session, status: &str) -> String {
@@ -137,25 +137,25 @@ pub(super) async fn publish_observed_gates(session: &mut Session) -> Result<(), 
 /// store and keeps only the revision it was last given.
 pub(super) async fn window(session: &Session, since: Option<u64>) -> Result<String, String> {
     let Some(owner) = session.desktop_workflow.as_ref() else {
-        return Err("state windowはこの実行経路では使えません".into());
+        return Err("The state window is unavailable on this execution path".into());
     };
     let delta = owner
         .window(since)
         .await
-        .map_err(|_| "state windowを取得できません".to_string())?;
+        .map_err(|_| "Cannot retrieve the state window".to_string())?;
     // Keep the existing Delta shape intact and add the current, owner-derived
     // workflow projection.  `Delta` is deliberately unaware of M27 artifacts;
     // it remains the durable UI window rather than a second workflow store.
-    let mut value = serde_json::to_value(delta).map_err(|_| "state windowを表せません")?;
+    let mut value = serde_json::to_value(delta).map_err(|_| "Cannot represent the state window")?;
     let object = value
         .as_object_mut()
-        .ok_or_else(|| "state windowを表せません".to_string())?;
+        .ok_or_else(|| "Cannot represent the state window".to_string())?;
     object.insert(
         "workflow".into(),
         serde_json::to_value(workflow_projection(session.workflow.as_ref()))
-            .map_err(|_| "workflow状態を表せません")?,
+            .map_err(|_| "Cannot represent workflow state")?,
     );
-    serde_json::to_string(&value).map_err(|_| "state windowを表せません".to_string())
+    serde_json::to_string(&value).map_err(|_| "Cannot represent the state window".to_string())
 }
 
 fn workflow_projection(workflow: Option<&SessionWorkflow>) -> WorkflowProjection {

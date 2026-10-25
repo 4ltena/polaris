@@ -99,13 +99,7 @@ fn the_plan_says_what_would_happen_and_changes_nothing() {
             .call(serde_json::json!({"op":"plan"}), Decision::Allow)
             .expect("the plan"),
     );
-    assert_eq!(answer["nextjs"]["applicable"], true);
-    assert_eq!(answer["nextjs"]["manager"], "npm");
-    assert_eq!(
-        answer["nextjs"]["install_requires_person"], true,
-        "the tool must never be the thing that confirms an install"
-    );
-    assert_eq!(answer["nextjs"]["execution_unimplemented"], true);
+    assert!(answer.get("nextjs").is_none());
     assert_eq!(answer["git"]["applicable"], true);
     assert!(
         answer["git"]["rules_to_add"]
@@ -198,114 +192,13 @@ fn an_operation_nobody_defined_is_refused() {
     }
 }
 
-/// `nextjs_setting` applies only where a Node project already is, so the
-/// manifest is what makes the fixture eligible.
-fn node_project(fixture: &Fixture) {
-    std::fs::write(
-        fixture.root.join("package.json"),
-        "{\"name\":\"fixture\",\"private\":true}\n",
-    )
-    .expect("a manifest");
-}
-
 #[test]
-fn a_scaffold_writes_what_is_missing_and_records_the_step() {
+fn legacy_next_scaffold_is_rejected_without_writing() {
     let fixture = Fixture::new();
-    fixture.git(&["init"]);
-    node_project(&fixture);
-    let answer = fixture
-        .call(serde_json::json!({ "op": "scaffold" }), Decision::Allow)
-        .expect("the scaffold runs");
-    let answer: serde_json::Value = serde_json::from_str(&answer).expect("JSON");
-    assert_eq!(answer["written"], true, "{answer}");
-    assert!(
-        fixture.root.join("app/page.tsx").is_file(),
-        "a nested template creates its directory"
-    );
-    // Writing the files does not make the project build; saying so stops
-    // the model treating the scaffold as a finished setup.
-    assert_eq!(answer["install_requires_person"], true);
-
-    // Running again finds nothing missing rather than rewriting.
-    let again = fixture
-        .call(serde_json::json!({ "op": "scaffold" }), Decision::Allow)
-        .expect("the second call answers");
-    let again: serde_json::Value = serde_json::from_str(&again).expect("JSON");
-    assert_eq!(again["written"], false);
-    assert_eq!(again["reason"], "nothing_missing");
-}
-
-#[test]
-fn a_scaffold_never_overwrites_what_is_already_there() {
-    let fixture = Fixture::new();
-    fixture.git(&["init"]);
-    node_project(&fixture);
-    let kept = "// 利用者が書いたもの\n";
-    std::fs::write(fixture.root.join("next.config.mjs"), kept).expect("an existing file");
-    let answer = fixture
-        .call(serde_json::json!({ "op": "scaffold" }), Decision::Allow)
-        .expect("the scaffold runs");
-    let answer: serde_json::Value = serde_json::from_str(&answer).expect("JSON");
-    assert_eq!(
-        std::fs::read_to_string(fixture.root.join("next.config.mjs")).expect("still readable"),
-        kept,
-        "overwriting what someone already put there is the one thing a scaffold must not do"
-    );
-    assert!(
-        answer["templates_left_alone"]
-            .as_array()
-            .expect("a list")
-            .iter()
-            .any(|held| held == "next.config.mjs"),
-        "{answer}"
-    );
-}
-
-#[test]
-fn a_refused_scaffold_writes_nothing() {
-    let fixture = Fixture::new();
-    fixture.git(&["init"]);
-    node_project(&fixture);
     assert!(
         fixture
-            .call(serde_json::json!({ "op": "scaffold" }), Decision::Deny)
-            .is_err(),
-        "a refused write is a refusal, not a quiet skip"
+            .call(serde_json::json!({"op":"scaffold"}), Decision::Allow)
+            .is_err()
     );
-    assert!(!fixture.root.join("next.config.mjs").exists());
     assert!(!fixture.root.join("app").exists());
-}
-
-#[test]
-fn what_the_reply_lists_as_written_is_what_is_on_disk() {
-    // The read-back inside `record_scaffold` cannot be made to fail from
-    // out here: `template::plan` already excludes every path it cannot
-    // write, so by the time the write runs there is nothing left to
-    // obstruct. It stays because the gap between planning and writing is
-    // a real one — a path can appear in it — and a guard against a race
-    // is not dead code merely because a test cannot produce the race.
-    // What is checkable is the weaker property: the reply does not claim
-    // a file it did not write.
-    let fixture = Fixture::new();
-    fixture.git(&["init"]);
-    node_project(&fixture);
-    std::fs::write(fixture.root.join("app"), "not a directory").expect("an obstruction");
-    let answer = fixture
-        .call(serde_json::json!({ "op": "scaffold" }), Decision::Allow)
-        .expect("the scaffold answers");
-    let answer: serde_json::Value = serde_json::from_str(&answer).expect("JSON");
-    for path in answer["templates_written"].as_array().expect("a list") {
-        let path = path.as_str().expect("a path");
-        assert!(
-            fixture.root.join(path).is_file(),
-            "{path} was reported written: {answer}"
-        );
-    }
-    for path in answer["templates_left_alone"].as_array().expect("a list") {
-        let path = path.as_str().expect("a path");
-        assert!(
-            !fixture.root.join(path).is_file(),
-            "{path} was reported left alone but exists: {answer}"
-        );
-    }
 }

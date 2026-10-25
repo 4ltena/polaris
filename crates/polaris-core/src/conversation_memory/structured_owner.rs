@@ -51,11 +51,11 @@ fn read_receipt_delta(
 ) -> polaris_memory::Result<StructuredDelta> {
     let convert = |value| {
         u64::try_from(value)
-            .map_err(|_| polaris_memory::Error::InvalidInput("構造化記憶の範囲が不正です"))
+            .map_err(|_| polaris_memory::Error::InvalidInput("Invalid structured memory range"))
     };
     if scope.project_id != owner.project_id {
         return Err(polaris_memory::Error::InvalidInput(
-            "構造化記憶のprojectが一致しません",
+            "Structured memory project mismatch",
         ));
     }
     let epoch = convert(scope.epoch)?;
@@ -79,7 +79,7 @@ pub fn begin_structured_summary(
     turn: u64,
 ) -> io::Result<StructuredSummaryWork> {
     structured_summary_work(store, database, expected, turn, true)?
-        .ok_or_else(|| io::Error::other("構造化抽出の開始結果がありません"))
+        .ok_or_else(|| io::Error::other("Missing structured extraction start result"))
 }
 
 pub(super) fn resume_structured_summary(
@@ -105,7 +105,7 @@ fn structured_summary_work(
             .state
             .generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("保存世代が上限です"))?,
+            .ok_or_else(|| io::Error::other("Storage generation limit reached"))?,
     )?;
     let structured_view = structured::sources::publication_view(&expected.state)?;
     let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;
@@ -128,7 +128,7 @@ fn structured_summary_work(
                     let (receipt, newly_started) = lock.begin_structured_attempt(expected, turn)?;
                     if !newly_started && receipt.response.is_none() {
                         return Err(polaris_memory::Error::InvalidInput(
-                            "構造化抽出の結果が不明です。再送しません",
+                            "Structured extraction outcome is unknown. It will not be resent",
                         ));
                     }
                     work = Some(StructuredSummaryWork {
@@ -188,7 +188,7 @@ pub(crate) fn reject_unpublished_structured_attempt(
             .is_some()
     {
         return Err(io::Error::other(
-            "未公開の構造化抽出を復旧してから会話を更新してください",
+            "Recover unpublished structured extraction before updating the conversation",
         ));
     }
     Ok(())
@@ -219,16 +219,16 @@ pub(super) fn publish_structured_summary_snapshot(
     pending: &PendingSummary,
 ) -> io::Result<ConversationSnapshot> {
     let turn = u64::try_from(pending.source.start_turn)
-        .map_err(|_| io::Error::other("構造化要約turnが不正です"))?;
+        .map_err(|_| io::Error::other("Invalid structured summary turn"))?;
     let mut lock = store.lock()?;
     lock.check_structured_turn(expected, turn)?;
     // Reopen the existing result, never create an intent during publication.
     let receipt = store
         .bound_structured_attempt(expected, turn)?
-        .ok_or_else(|| io::Error::other("構造化抽出の保存記録がありません"))?;
+        .ok_or_else(|| io::Error::other("Missing structured extraction storage record"))?;
     let response = receipt
         .response
-        .ok_or_else(|| io::Error::other("構造化抽出の応答がありません"))?;
+        .ok_or_else(|| io::Error::other("Missing structured extraction response"))?;
     let evidence = summary_evidence(expected, turn, &response.summary)?;
     if expected.state.history_mode != HistoryMode::Structured10
         || pending.scope != evidence.scope
@@ -237,7 +237,7 @@ pub(super) fn publish_structured_summary_snapshot(
         || pending.summary != response.summary
     {
         return Err(io::Error::other(
-            "構造化要約の公開内容が保存応答と一致しません",
+            "Published structured summary does not match the saved response",
         ));
     }
     let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;

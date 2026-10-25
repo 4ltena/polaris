@@ -112,7 +112,7 @@ async fn a_server_that_exits_immediately_is_reported_rather_than_waited_out() {
         Ok(_) => panic!("a dead child was treated as a live one"),
     };
     assert!(
-        error.to_string().contains("終了"),
+        error.to_string().contains("exited"),
         "the message does not say the child exited: {error}"
     );
     assert!(

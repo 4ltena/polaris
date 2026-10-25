@@ -2467,13 +2467,15 @@ pub fn join(
 ) -> io::Result<Participation> {
     share
         .accept(now_unix_seconds)
-        .map_err(|_| io::Error::other("この共有リンクは使えません"))?;
+        .map_err(|_| io::Error::other("This sharing link cannot be used"))?;
     if let Some(held) = read(state_dir).map_err(io::Error::other)?.participation()
         && held.share.share_id != share.share_id
     {
         // One project belongs to one share; joining a second would mix two
         // histories into the same folder.
-        return Err(io::Error::other("このprojectは別の共有に参加しています"));
+        return Err(io::Error::other(
+            "This project has joined a different share",
+        ));
     }
     let participation = Participation {
         share,
@@ -2545,7 +2547,7 @@ pub(crate) fn prepare_join(
 ) -> io::Result<Participation> {
     share
         .accept(now_unix_seconds)
-        .map_err(|_| io::Error::other("この共有リンクは使えません"))?;
+        .map_err(|_| io::Error::other("This sharing link cannot be used"))?;
     Ok(Participation {
         share,
         manifest,
@@ -2577,7 +2579,7 @@ pub(crate) fn join_under_owner(
             ));
         };
         if held.share.share_id != participation.share.share_id {
-            return Err(io::Error::other("このprojectは別の共有に参加しています").into());
+            return Err(io::Error::other("This project has joined a different share").into());
         }
     }
     owner.publish_normal(ParticipationPublicationV1::Join, Some(&body))?;

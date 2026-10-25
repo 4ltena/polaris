@@ -30,7 +30,7 @@ use crate::decision_bands::Refused;
 /// Nineteen tokens an iteration to say the map has been consulted is the
 /// cheap side of that trade by three orders of magnitude.
 pub const HEADING: &str =
-    "## 関係しそうなファイル（docs/filemap.md から選定済み。再読の必要はない）";
+    "## Relevant files (already selected from docs/filemap.md; no need to reread)";
 
 /// The most files named in the injected section.
 ///
@@ -145,8 +145,7 @@ fn chunk_size(entries: &[Entry], query: &str, phase: &str) -> usize {
     let mut held = 0usize;
     for entry in entries {
         let question =
-            match crate::decision_bands::question(query, "ファイル", &entry.path, &entry.summary)
-            {
+            match crate::decision_bands::question(query, "file", &entry.path, &entry.summary) {
                 polaris_provider::decision::Question::Noul { instructions } => {
                     crate::budget::count_tokens(&instructions)
                 }
@@ -197,7 +196,7 @@ pub async fn route<'a>(
             decider,
             &state,
             query,
-            "ファイル",
+            "file",
             &candidates,
             std::future::pending(),
         )

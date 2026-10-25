@@ -59,12 +59,12 @@ impl SourceApplyClock for Clock {
 pub(super) fn prepare_state(project: &Path, state: &Path) -> Result<(), String> {
     let expected = polaris_core::project::state_dir(project).map_err(|e| e.to_string())?;
     if fs::canonicalize(&expected).map_err(|e| e.to_string())? != state {
-        return Err("projectと保存場所が一致しません".into());
+        return Err("Project and storage location mismatch".into());
     }
     let fd = open_directory_nofollow(state).map_err(|e| e.to_string())?;
     let m = fd.metadata().map_err(|e| e.to_string())?;
     if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o7000 != 0 {
-        return Err("保存場所の所有者またはmodeが不正です".into());
+        return Err("Invalid storage owner or mode".into());
     }
     fd.set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
@@ -73,7 +73,7 @@ pub(super) fn prepare_state(project: &Path, state: &Path) -> Result<(), String> 
         .and_then(|f| f.metadata())
         .map_err(|e| e.to_string())?;
     if (fresh.dev(), fresh.ino()) != (m.dev(), m.ino()) || fresh.mode() & 0o7777 != 0o700 {
-        return Err("保存場所が変更されました".into());
+        return Err("Storage location changed".into());
     }
     Ok(())
 }
@@ -290,12 +290,15 @@ impl Frontend {
     }
     async fn request(&mut self, body: RequestBody) -> Result<SuccessResult, String> {
         if !self.usable {
-            return Err("IPC応答は結果不明です。この接続では再操作せず、再起動して保存済み状態を確認してください".into());
+            return Err("IPC response outcome is unknown. Do not issue further operations on this connection; restart and inspect saved state".into());
         }
         if self.service.is_finished() {
-            return Err("D27 ownerは停止しています。再起動してください".into());
+            return Err("The D27 owner is stopped. Restart".into());
         }
-        self.sequence = self.sequence.checked_add(1).ok_or("要求IDの上限です")?;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or("Request ID limit reached")?;
         let request = Request {
             protocol_version: Default::default(),
             client_id: self.client.clone(),
@@ -314,7 +317,7 @@ impl Frontend {
                     .map_err(|e| e.to_string())?;
                 let size = u32::from_be_bytes(header) as usize;
                 if size > codec::MAX_FRAME_BYTES {
-                    return Err("IPC frameが上限を超えました".into());
+                    return Err("IPC frame exceeds the limit".into());
                 }
                 let mut bytes = vec![0; size];
                 self.io
@@ -324,12 +327,12 @@ impl Frontend {
                 if let Ok(response) = codec::from_json::<Response>(&bytes) {
                     response
                         .validate_for(&request)
-                        .map_err(|_| "IPC応答の相関が一致しません")?;
+                        .map_err(|_| "IPC response correlation mismatch")?;
                     return Ok(response.outcome);
                 }
                 let event: Event = codec::from_json(&bytes).map_err(|e| e.to_string())?;
                 if event.session_id != self.session {
-                    return Err("IPC eventのsessionが一致しません".into());
+                    return Err("IPC event session mismatch".into());
                 }
             }
         })
@@ -340,10 +343,10 @@ impl Frontend {
                 self.usable = false;
                 let reason: String = match failed {
                     Ok(Err(reason)) => reason,
-                    _ => "応答期限を超えました".into(),
+                    _ => "Response deadline exceeded".into(),
                 };
                 Err(format!(
-                    "IPCは結果不明です（{reason}）。この接続を失効しました。再起動して確認してください"
+                    "IPC outcome is unknown ({reason}). This connection was invalidated. Restart and inspect state"
                 ))
             }
         }
@@ -351,7 +354,7 @@ impl Frontend {
     async fn snapshot(&mut self) -> Result<Box<Snapshot>, String> {
         if !self.hello {
             let SuccessResult::Hello(_) = self.request(RequestBody::Hello).await? else {
-                return Err("Hello応答が不正です".into());
+                return Err("Invalid Hello response".into());
             };
             self.hello = true;
         }
@@ -360,7 +363,7 @@ impl Frontend {
             .await?
         {
             SuccessResult::SessionSnapshot(s) => Ok(s),
-            _ => Err("snapshot応答が不正です".into()),
+            _ => Err("Invalid snapshot response".into()),
         }
     }
     pub(super) async fn shutdown(self) -> Result<(), String> {
@@ -368,8 +371,8 @@ impl Frontend {
         drop(io);
         tokio::time::timeout(Duration::from_secs(120), service)
             .await
-            .map_err(|_| "D27 ownerの停止を確認できません。保存済み証拠を再起動で確認してください")?
-            .map_err(|_| "D27 ownerのjoinに失敗しました")?
+            .map_err(|_| "Cannot verify D27 owner termination. Restart to inspect saved evidence")?
+            .map_err(|_| "Failed to join the D27 owner")?
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -394,10 +397,10 @@ impl Frontend {
                     match page.next_offset {
                         Some(next) if next.get() > offset.get() => offset = next,
                         None => return Ok((revision, items)),
-                        _ => return Err("候補pageが進みません".into()),
+                        _ => return Err("Candidate pagination is not advancing".into()),
                     }
                 }
-                _ => return Err("候補一覧の応答が不正です".into()),
+                _ => return Err("Invalid candidate list response".into()),
             }
         }
     }
@@ -409,7 +412,7 @@ impl Frontend {
         let item = items
             .into_iter()
             .find(|i| i.approval_id.as_str() == id)
-            .ok_or("表示された正確な承認IDを指定してください")?;
+            .ok_or("Specify the exact displayed approval ID")?;
         let mut offset = DecimalU64::new(0);
         let mut lines = vec![
             format!("D27 source: {}", item.source_path),
@@ -445,10 +448,10 @@ impl Frontend {
                     match page.next_offset {
                         Some(next) if next.get() > offset.get() => offset = next,
                         None => return Ok((revision, item, lines)),
-                        _ => return Err("変更pageが進みません".into()),
+                        _ => return Err("Change pagination is not advancing".into()),
                     }
                 }
-                _ => return Err("変更一覧の応答が不正です".into()),
+                _ => return Err("Invalid change list response".into()),
             }
         }
     }
@@ -459,25 +462,25 @@ impl Frontend {
         reader: &mut R,
     ) -> Result<String, String> {
         if !self.writable {
-            return Err("read-onlyでは隔離コピーの変更を開始できません".into());
+            return Err("Cannot start isolated-copy changes in read-only mode".into());
         }
         if task.trim().is_empty() {
-            return Err("使い方: /apply run <隔離コピーで実行する指示>".into());
+            return Err("Usage: /apply run <instruction-for-isolated-copy>".into());
         }
         if !confirm(
             terminal,
             reader,
             &[
-                "隔離コピーで実行します。元projectへはまだ適用しません。".into(),
-                "コピー内のread/writeのみ。build・外部MCPは許可しません。".into(),
+                "Run in an isolated copy. The original project is not yet modified.".into(),
+                "Read/write within the copy only. Builds and external MCP are not allowed.".into(),
                 task.into(),
             ],
         ) {
-            return Ok("隔離runを取り消しました".into());
+            return Ok("Isolated run cancelled".into());
         }
         let snapshot = self.snapshot().await?;
         if snapshot.runs.iter().any(|r| !r.state.is_terminal()) {
-            return Err("既存の隔離runが実行中です".into());
+            return Err("An existing isolated run is active".into());
         }
         let updated = self
             .request(RequestBody::DraftUpdate(
@@ -490,7 +493,7 @@ impl Frontend {
             ))
             .await?;
         let SuccessResult::DraftUpdate(updated) = updated else {
-            return Err("下書き応答が不正です".into());
+            return Err("Invalid draft response".into());
         };
         let started = self
             .request(RequestBody::RunStart(
@@ -504,7 +507,7 @@ impl Frontend {
             ))
             .await?;
         let SuccessResult::RunStart(started) = started else {
-            return Err("run開始応答が不正です".into());
+            return Err("Invalid run start response".into());
         };
         let target = RunTarget {
             run_id: started.run_id,
@@ -517,18 +520,18 @@ impl Frontend {
                 .runs
                 .iter()
                 .find(|r| r.run_id == target.run_id && r.attempt_id == target.attempt_id)
-                .ok_or("runの座標が見つかりません")?;
+                .ok_or("Run coordinates not found")?;
             if run.state.is_terminal() {
                 return Ok(format!(
-                    "隔離run: {:?}。変更候補は /apply list で確認できます",
+                    "Isolated run: {:?}. Inspect proposed changes with /apply list",
                     run.state
                 ));
             }
             draw(
                 terminal,
                 &[
-                    format!("隔離run {}: {:?}", target.run_id.as_str(), run.state),
-                    "Escで取消。元projectは未適用です".into(),
+                    format!("Isolated run {}: {:?}", target.run_id.as_str(), run.state),
+                    "Esc: cancel. The original project is unchanged".into(),
                 ],
             )?;
             for approval in snapshot.unresolved_approvals {
@@ -585,7 +588,10 @@ impl Frontend {
             [] | ["list"] | ["status"] => {
                 let (_, items) = self.list().await?;
                 if items.is_empty() {
-                    return Ok("D27候補なし。/apply run <指示> で隔離実行します".into());
+                    return Ok(
+                        "No D27 candidates. Start isolated execution with /apply run <instruction>"
+                            .into(),
+                    );
                 }
                 Ok(items
                     .iter()
@@ -612,12 +618,14 @@ impl Frontend {
             ["view", id] => Ok(self.preview(id).await?.2.join("\n")),
             ["resolve", id, decision] if *decision == "allow" || *decision == "deny" => {
                 if *decision == "allow" && !self.writable {
-                    return Err("sourceへの書込み許可がありません".into());
+                    return Err("No source write permission".into());
                 }
                 let (revision, item, mut lines) = self.preview(id).await?;
-                lines.push("IrreversibleLocal。yで表示した要求だけを確定、Escで取消".into());
+                lines.push(
+                    "IrreversibleLocal. y: confirm only the displayed request; Esc: cancel".into(),
+                );
                 if !confirm(terminal, reader, &lines) {
-                    return Ok("D27承認を取り消しました".into());
+                    return Ok("D27 approval cancelled".into());
                 }
                 self.request(RequestBody::SourceApplyResolve(
                     self.session.clone(),
@@ -636,11 +644,15 @@ impl Frontend {
                     },
                 ))
                 .await?;
-                Ok("承認応答を受理しました。適用成功は /apply list の保存済み結果で確認してください".into())
+                Ok(
+                    "Approval response accepted. Verify apply success in saved /apply list results"
+                        .into(),
+                )
             }
-            _ => {
-                Err("使い方: /apply run <指示> | list | view <ID> | resolve <ID> allow|deny".into())
-            }
+            _ => Err(
+                "Usage: /apply run <instruction> | list | view <ID> | resolve <ID> allow|deny"
+                    .into(),
+            ),
         }
     }
 }
@@ -662,7 +674,10 @@ fn draw<B: ratatui::backend::Backend>(
                 .collect::<Vec<_>>();
             f.render_widget(
                 Paragraph::new(text)
-                    .block(Block::bordered().title("D27 — 隔離実行と元projectへの適用"))
+                    .block(
+                        Block::bordered()
+                            .title("D27 — isolated execution and original project apply"),
+                    )
                     .wrap(Wrap { trim: false }),
                 f.area(),
             );
@@ -676,7 +691,7 @@ fn confirm<B: ratatui::backend::Backend, R: KeyReader>(
     lines: &[String],
 ) -> bool {
     let mut lines = lines.to_vec();
-    lines.push("y: 確定 / Esc: 取消 / ↑↓: 全項目を確認".into());
+    lines.push("y: confirm / Esc: cancel / ↑↓: review all items".into());
     let mut offset = 0;
     loop {
         if draw(terminal, &lines[offset..]).is_err() {
@@ -1035,7 +1050,7 @@ mod tests {
                         )
                         .await
                         .unwrap()
-                        .contains("取り消し")
+                        .contains("cancelled")
                 );
                 assert_eq!(
                     fs::read_to_string(source.join("ordinary")).unwrap(),

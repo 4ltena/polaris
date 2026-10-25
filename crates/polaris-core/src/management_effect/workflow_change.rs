@@ -174,7 +174,7 @@ impl WorkflowChangeOwner<'_> {
         after.generation = after
             .generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+            .ok_or_else(|| io::Error::other("Storage generation limit reached"))?;
         after.raw_commit_offset = before.raw_offset;
         after.raw_commit_hash = before.raw_hash.clone();
         after.recent_turn_ids = before.active_turns().into_iter().rev().take(10).collect();

@@ -26,7 +26,7 @@ impl TurnAffinityMode {
             Ok(value) if value == "on" => Ok(Self::On),
             Ok(value) if value == "off" => Ok(Self::Off),
             Ok(_) | Err(std::env::VarError::NotUnicode(_)) => Err(crate::ProviderError::Decode(
-                "POLARIS_TURN_AFFINITY は off または on を指定してください".into(),
+                "Set POLARIS_TURN_AFFINITY to off or on".into(),
             )),
             Err(std::env::VarError::NotPresent) => Ok(Self::Off),
         }

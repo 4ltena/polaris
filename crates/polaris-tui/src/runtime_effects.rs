@@ -40,7 +40,7 @@ pub(crate) fn begin(
         )
         .map_err(|e| e.to_string())?;
     let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
-        return Err("既存のruntime効果を再実行しません".into());
+        return Err("Existing runtime effects will not be repeated".into());
     };
     if !context.accepted {
         context

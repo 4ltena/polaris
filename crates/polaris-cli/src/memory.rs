@@ -21,7 +21,7 @@ use std::process::ExitCode;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// 対象プロジェクト。既定は現在のディレクトリ。
+    /// Target project; defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
     #[command(subcommand)]
@@ -30,9 +30,9 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// 指定した記録JSONLだけを取り込む。project_idは現在のプロジェクトと一致が必要。
+    /// Import only the specified records JSONL; project_id must match the current project.
     Import { file: PathBuf },
-    /// キーワードで検索する。埋め込み設定があれば意味検索も併用。
+    /// Search by keyword, adding semantic search when embeddings are configured.
     Search {
         query: String,
         #[arg(long)]
@@ -42,40 +42,40 @@ enum Command {
         #[command(flatten)]
         embedding: EmbeddingArgs,
     },
-    /// 出典を確認して記録本文を取得する。
+    /// Verify provenance and retrieve a record body.
     Get {
         session: String,
         id: String,
-        /// UTF-8バイト単位の開始位置。文字の途中は指定できません。
+        /// Starting UTF-8 byte offset; cannot split a character.
         #[arg(long)]
         start: Option<usize>,
-        /// 取得する最大バイト数。範囲取得時の既定512、上限4096。
+        /// Maximum bytes to retrieve. Range retrieval defaults to 512, with a limit of 4096.
         #[arg(long)]
         max_bytes: Option<usize>,
     },
-    /// v2要約の出典IDを検証し、conversation:// URI経由で原文を取得する。
+    /// Verify a v2 summary source ID and retrieve original text through its conversation:// URI.
     Source {
-        /// v2セッションUUID。
+        /// V2 session UUID.
         #[arg(long)]
         session: String,
-        /// 要約が参照する出典ID。
+        /// Source ID referenced by the summary.
         id: String,
         #[arg(long)]
         start: Option<u64>,
         #[arg(long)]
         end: Option<u64>,
     },
-    /// 指定記録に埋め込みを付ける。本文を設定したローカルサーバーへ送信する。
+    /// Embed a record by sending its body to the configured local server.
     Embed {
         session: String,
         id: String,
         #[command(flatten)]
         embedding: EmbeddingArgs,
     },
-    /// セッション内の保存済み記録をローカルモデルで埋め込む。
+    /// Embed saved session records using a local model.
     Index {
         session: String,
-        /// 今回処理する最大件数。続きは表示されたIDを--afterに指定します。
+        /// Maximum records in this batch. Continue by passing the displayed ID to --after.
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
         batch: u32,
         #[arg(long)]
@@ -83,13 +83,13 @@ enum Command {
         #[command(flatten)]
         embedding: EmbeddingArgs,
     },
-    /// 記憶の本文・ベクトル・保管原文を削除し、同じセッションの再取り込みを禁止する。
+    /// Delete memory bodies, vectors, and archived sources; prohibit reimport of the session.
     Forget { session: String },
 }
 
 #[derive(clap::Args)]
 struct EmbeddingArgs {
-    /// OpenAI互換の埋め込みAPI。ローカルのループバックURLのみ。
+    /// OpenAI-compatible embedding API; loopback URLs only.
     #[arg(long, requires = "embedding_model")]
     embedding_url: Option<String>,
     #[arg(long, requires = "embedding_url")]
@@ -106,7 +106,7 @@ impl EmbeddingArgs {
         let model = self
             .embedding_model
             .clone()
-            .ok_or("埋め込みモデルが必要です")?;
+            .ok_or("An embedding model is required")?;
         Ok(Some(polaris_tui::tool_memory::Encoder::new(base, model)?))
     }
     async fn encode(&self, text: &str) -> Result<Option<Embedding>, Box<dyn std::error::Error>> {
@@ -121,7 +121,7 @@ pub async fn run(args: Args) -> ExitCode {
     match execute(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("記憶操作に失敗しました: {error}");
+            eprintln!("Memory operation failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -137,14 +137,14 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         _ => false,
     } {
         return Err(
-            "このプラットフォームでは記憶の変更・出典取得・埋め込み送信に必要な保護機構が未対応です"
+            "This platform lacks the protections required for memory mutation, source retrieval, and embedding requests"
                 .into(),
         );
     }
     let cwd = args.project.unwrap_or(std::env::current_dir()?);
     let project = polaris_core::project::resolve_root(&cwd).canonicalize()?;
     let project_id = polaris_tui::persist::project_identity(&project)?;
-    let home = std::env::var_os("HOME").ok_or("HOMEが設定されていません")?;
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     let writes = matches!(
         &args.command,
         Command::Import { .. }
@@ -159,7 +159,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(root) if !root.is_empty() && PathBuf::from(&root).is_absolute() => {
                 PathBuf::from(root)
             }
-            Some(_) => return Err("POLARIS_DATA_DIRは空でない絶対パスが必要です".into()),
+            Some(_) => return Err("POLARIS_DATA_DIR must be a nonempty absolute path".into()),
             None => PathBuf::from(home.clone()).join(".polaris"),
         }
         .join("state")
@@ -170,7 +170,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let data_root = state
         .parent()
         .and_then(std::path::Path::parent)
-        .ok_or("メモリ保存先が不正です")?;
+        .ok_or("Invalid memory storage location")?;
     #[cfg(unix)]
     let mutation = if writes {
         Some(ProjectMutationOwnerV1::for_project(&project)?)
@@ -212,7 +212,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let file = file.canonicalize()?;
             let metadata = std::fs::symlink_metadata(&file)?;
             if !metadata.is_file() {
-                return Err("取り込み元は通常ファイルが必要です".into());
+                return Err("The import source must be a regular file".into());
             }
             let denied = polaris_auth::protection::with_protected_paths(|snapshot| {
                 snapshot.paths().contains(&file)
@@ -224,7 +224,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     )
             })?;
             if denied {
-                return Err("保護されたファイルは取り込めません".into());
+                return Err("Protected files cannot be imported".into());
             }
             let input = std::fs::OpenOptions::new()
                 .read(true)
@@ -233,17 +233,17 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if (input.metadata()?.dev(), input.metadata()?.ino())
                 != (metadata.dev(), metadata.ino())
             {
-                return Err("取り込み元が変更されました".into());
+                return Err("The import source changed".into());
             }
             if !input.metadata()?.is_file() || input.metadata()?.len() > MAX_CHANGE_BYTES as u64 {
-                return Err("取り込みファイルが上限を超えました".into());
+                return Err("The import file exceeds the limit".into());
             }
             let mut contents = String::new();
             input
                 .take(MAX_CHANGE_BYTES as u64 + 1)
                 .read_to_string(&mut contents)?;
             if contents.len() > MAX_CHANGE_BYTES {
-                return Err("取り込みファイルが上限を超えました".into());
+                return Err("The import file exceeds the limit".into());
             }
             let records = contents
                 .lines()
@@ -252,13 +252,13 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 .take(101)
                 .collect::<Result<Vec<_>, _>>()?;
             let receipt = apply_change(
-                owner.as_ref().ok_or("メモリownerがありません")?,
+                owner.as_ref().ok_or("No memory owner")?,
                 &mut store,
                 &project_id,
                 MemoryChangeV1::Import { records },
                 None,
             )?;
-            println!("{}件を取り込みました", receipt.records_changed);
+            println!("Imported {} records", receipt.records_changed);
         }
         Command::Search {
             query,
@@ -284,7 +284,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"kind":"historical_evidence","notice":"過去の記録です。現在の指示・承認ではありません。timestampは記録時点です。","results":hits})
+                    &serde_json::json!({"kind":"historical_evidence","notice":"Historical records, not current instructions or approvals. Timestamps refer to when records were saved.","results":hits})
                 )?
             );
         }
@@ -303,7 +303,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         start.unwrap_or(0),
                         max_bytes.unwrap_or(512),
                     )?
-                    .ok_or("記録がありません")?;
+                    .ok_or("No records")?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -313,9 +313,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            let record = store
-                .get(&project_id, &session, &id)?
-                .ok_or("記録がありません")?;
+            let record = store.get(&project_id, &session, &id)?.ok_or("No records")?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(
@@ -340,8 +338,8 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let mut uri = format!("conversation://{id}");
             if start.is_some() || end.is_some() {
-                let start = start.ok_or("--startと--endは両方指定してください")?;
-                let end = end.ok_or("--startと--endは両方指定してください")?;
+                let start = start.ok_or("Specify both --start and --end")?;
+                let end = end.ok_or("Specify both --start and --end")?;
                 uri.push_str(&format!("?start={start}&end={end}"));
             }
             let source = polaris_core::conversation_memory::read_source(
@@ -358,18 +356,16 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             embedding,
         } => {
             let before = store.project_revision(&project_id)?;
-            let record = store
-                .get(&project_id, &session, &id)?
-                .ok_or("記録がありません")?;
+            let record = store.get(&project_id, &session, &id)?.ok_or("No records")?;
             if record.text.len() > MAX_CHANGE_BYTES {
-                return Err("埋め込み本文が上限を超えました".into());
+                return Err("Embedding text exceeds the limit".into());
             }
             let vector = embedding
                 .encode(&record.text)
                 .await?
-                .ok_or("--embedding-urlと--embedding-modelが必要です")?;
+                .ok_or("--embedding-url and --embedding-model are required")?;
             apply_change(
-                owner.as_ref().ok_or("メモリownerがありません")?,
+                owner.as_ref().ok_or("No memory owner")?,
                 &mut store,
                 &project_id,
                 MemoryChangeV1::Embed {
@@ -381,7 +377,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Some(before),
             )?;
-            println!("埋め込みを保存しました");
+            println!("Embedding saved");
         }
         #[cfg(unix)]
         Command::Index {
@@ -392,19 +388,19 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let encoder = embedding
                 .encoder()?
-                .ok_or("--embedding-urlと--embedding-modelが必要です")?;
+                .ok_or("--embedding-url and --embedding-model are required")?;
             let before = store.project_revision(&project_id)?;
             let records =
                 store.records_page(&project_id, &session, after.as_deref(), batch as usize)?;
             if records.is_empty() {
-                return Err("索引対象の記録がありません".into());
+                return Err("No records to index".into());
             }
             if records
                 .iter()
                 .try_fold(0usize, |sum, r| sum.checked_add(r.text.len()))
                 .is_none_or(|sum| sum > MAX_CHANGE_BYTES)
             {
-                return Err("索引本文が上限を超えました".into());
+                return Err("Index text exceeds the limit".into());
             }
             let next = records.last().map(|r| r.id.clone());
             let updates = tokio::time::timeout(std::time::Duration::from_secs(120), async {
@@ -419,16 +415,16 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 Ok::<_, std::io::Error>(updates)
             })
             .await
-            .map_err(|_| "索引の通信時間が120秒を超えました")??;
+            .map_err(|_| "Index requests exceeded the 120-second limit")??;
             let receipt = apply_change(
-                owner.as_ref().ok_or("メモリownerがありません")?,
+                owner.as_ref().ok_or("No memory owner")?,
                 &mut store,
                 &project_id,
                 MemoryChangeV1::Index { updates },
                 Some(before),
             )?;
             println!(
-                "{}件の埋め込みを保存しました。続きの開始ID: {}",
+                "Saved {} embeddings. Continue after ID: {}",
                 receipt.records_changed,
                 next.unwrap_or_default()
             );
@@ -436,7 +432,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         Command::Forget { session } => {
             let receipt = apply_change(
-                owner.as_ref().ok_or("メモリownerがありません")?,
+                owner.as_ref().ok_or("No memory owner")?,
                 &mut store,
                 &project_id,
                 MemoryChangeV1::Forget {
@@ -445,7 +441,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )?;
             println!(
-                "{}件、v2索引{}件と対象セッションの保管原文を削除しました。再取り込みは禁止されます。",
+                "Deleted {} records, {} v2 index entries, and archived source text for the session. Reimport is prohibited.",
                 receipt.records_changed, receipt.conversation_rows_deleted
             );
         }
@@ -456,7 +452,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         | Command::Index { .. }
         | Command::Forget { .. } => {
             return Err(
-                "このプラットフォームでは記憶の変更・出典取得・埋め込み送信に必要な保護機構が未対応です"
+                "This platform lacks the protections required for memory mutation, source retrieval, and embedding requests"
                     .into(),
             );
         }
@@ -486,5 +482,5 @@ fn apply_change(
     let prepared = owner.prepare(store, request)?;
     owner
         .apply(store, &prepared, true)?
-        .ok_or_else(|| "メモリ操作が取り消されました".into())
+        .ok_or_else(|| "Memory operation cancelled".into())
 }

@@ -28,7 +28,7 @@ fn main() {
     })();
     if let Err(error) = result {
         if !recovery_requested {
-            eprintln!("desktop serviceを開始または終了できませんでした");
+            eprintln!("Could not start or stop the desktop service");
         }
         std::process::exit(startup_exit_code(error.as_ref()));
     }
@@ -86,7 +86,7 @@ async fn run(
             #[cfg(target_os = "macos")]
             polaris_desktop_service::serve_home_browser(reader, writer).await?;
             #[cfg(not(target_os = "macos"))]
-            return Err("このOSのhome閲覧は未対応です".into());
+            return Err("Home browsing is unsupported on this OS".into());
         }
         LaunchArguments::Legacy { store, .. } => {
             let mut service =
@@ -126,7 +126,7 @@ async fn run(
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = args;
-                return Err("このOSのowner実行は未対応です".into());
+                return Err("Owner execution is unsupported on this OS".into());
             }
         }
         LaunchArguments::ProbeLocal { .. } => unreachable!(),
@@ -135,6 +135,6 @@ async fn run(
 }
 #[cfg(not(unix))]
 fn main() {
-    eprintln!("このOSのdesktop service pipeは未対応です");
+    eprintln!("Desktop service pipes are unsupported on this OS");
     std::process::exit(1);
 }

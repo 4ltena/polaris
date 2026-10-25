@@ -36,27 +36,58 @@ pub fn apply_key(buffer: &mut String, cursor: &mut usize, key: KeyEvent) -> Inpu
             InputAction::Submit(text)
         }
         KeyCode::Backspace => {
-            if let Some(prev) = prev_char_boundary(buffer, *cursor) {
+            if let Some(block) = crate::file_input::blocks(buffer)
+                .into_iter()
+                .find(|block| block.range.start < *cursor && *cursor <= block.range.end)
+            {
+                buffer.replace_range(block.range.clone(), "");
+                *cursor = block.range.start;
+            } else if let Some(prev) = prev_char_boundary(buffer, *cursor) {
                 buffer.replace_range(prev..*cursor, "");
                 *cursor = prev;
             }
             InputAction::Continue
         }
         KeyCode::Left => {
-            if let Some(prev) = prev_char_boundary(buffer, *cursor) {
+            if let Some(block) = crate::file_input::blocks(buffer)
+                .into_iter()
+                .find(|block| block.range.start < *cursor && *cursor <= block.range.end)
+            {
+                *cursor = block.range.start;
+            } else if let Some(prev) = prev_char_boundary(buffer, *cursor) {
                 *cursor = prev;
             }
             InputAction::Continue
         }
         KeyCode::Right => {
-            if let Some(next) = next_char_boundary(buffer, *cursor) {
+            if let Some(block) = crate::file_input::blocks(buffer)
+                .into_iter()
+                .find(|block| block.range.start <= *cursor && *cursor < block.range.end)
+            {
+                *cursor = block.range.end;
+            } else if let Some(next) = next_char_boundary(buffer, *cursor) {
                 *cursor = next;
             }
             InputAction::Continue
         }
         KeyCode::Char(c) => {
+            if let Some(block) = crate::file_input::blocks(buffer)
+                .into_iter()
+                .find(|block| block.range.start < *cursor && *cursor < block.range.end)
+            {
+                *cursor = block.range.end;
+            }
             buffer.insert(*cursor, c);
             *cursor += c.len_utf8();
+            InputAction::Continue
+        }
+        KeyCode::Delete => {
+            if let Some(block) = crate::file_input::blocks(buffer)
+                .into_iter()
+                .find(|block| block.range.start <= *cursor && *cursor < block.range.end)
+            {
+                buffer.replace_range(block.range, "");
+            }
             InputAction::Continue
         }
         _ => InputAction::Continue,

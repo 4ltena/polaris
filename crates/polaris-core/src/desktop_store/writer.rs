@@ -893,7 +893,7 @@ impl StoreRoot {
                 if let Some(memory) = &mut record.memory {
                     memory.phase = polaris_desktop_protocol::snapshot::MemoryPhase::OutcomeUnknown;
                     memory.detail =
-                        "前回の実行が中断されました。未確定の要約は自動再送しません".into();
+                        "The previous run was interrupted. Unresolved summaries will not be resent automatically".into();
                 }
                 changed = true;
             }
@@ -1050,7 +1050,9 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
                 .checked_add(p.state.runs.len() as u64)
                 .ok_or(StoreError::Overflow)?
     {
-        return Err(StoreError::Corrupt("原文turnと実行台帳の対応"));
+        return Err(StoreError::Corrupt(
+            "Original turn and run ledger association",
+        ));
     }
     super::memory::validate(p)?;
     prompt::validate(p)?;
@@ -1066,7 +1068,7 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
     let mut active = 0;
     for record in &p.state.runs {
         if !runs.insert(&record.run.run_id) || !attempts.insert(&record.run.attempt_id) {
-            return Err(StoreError::Corrupt("run/attemptの重複"));
+            return Err(StoreError::Corrupt("Duplicate run or attempt"));
         }
         if let Some(binding) = &record.admission
             && (binding.admission_id.is_empty()
@@ -1085,12 +1087,12 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
             usize::from(!record.run.state.is_terminal() && record.run.state != RunState::Queued);
         for op in &record.operations {
             if !operations.insert(&op.operation_id) {
-                return Err(StoreError::Corrupt("operationの重複"));
+                return Err(StoreError::Corrupt("Duplicate operation"));
             }
         }
     }
     if active > 1 {
-        return Err(StoreError::Corrupt("複数の非終端親run"));
+        return Err(StoreError::Corrupt("Multiple nonterminal parent runs"));
     }
     for request in &p.state.requests {
         if let RequestResult::SourceApplyResolved { approval_id } = &request.result
@@ -1107,7 +1109,9 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
             || request.request_hash.len() != 64
             || !request.request_hash.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            return Err(StoreError::Corrupt("要求台帳のキー・世代・hash"));
+            return Err(StoreError::Corrupt(
+                "Request ledger key, generation, or hash",
+            ));
         }
         if let RequestResult::RunAccepted { run_id, attempt_id }
         | RequestResult::CancelRequested { run_id, attempt_id } = &request.result
@@ -1117,7 +1121,7 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
                 .iter()
                 .any(|r| &r.run.run_id == run_id && &r.run.attempt_id == attempt_id)
         {
-            return Err(StoreError::Corrupt("要求台帳のrun参照"));
+            return Err(StoreError::Corrupt("Request ledger run reference"));
         }
     }
     let mut approval_ids = BTreeSet::new();
@@ -1144,7 +1148,9 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
                             .any(|op| op.operation_id == a.operation_id)
                 }))
         {
-            return Err(StoreError::Corrupt("承認台帳のID・対象・hash・消費"));
+            return Err(StoreError::Corrupt(
+                "Approval ledger ID, target, hash, or consumption",
+            ));
         }
         let pending = p
             .state
@@ -1154,10 +1160,10 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
             .collect::<Vec<_>>();
         if !r.invalidated && r.decision.is_none() {
             if pending.len() != 1 || pending[0] != a {
-                return Err(StoreError::Corrupt("承認pendingの不一致"));
+                return Err(StoreError::Corrupt("Pending approval mismatch"));
             }
         } else if !pending.is_empty() {
-            return Err(StoreError::Corrupt("回答済み承認のpending"));
+            return Err(StoreError::Corrupt("Answered approval still pending"));
         }
     }
     for request in &p.state.requests {
@@ -1168,7 +1174,7 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
                 .iter()
                 .any(|r| &r.pending.approval_id == approval_id && r.decision.is_some())
         {
-            return Err(StoreError::Corrupt("回答の承認参照"));
+            return Err(StoreError::Corrupt("Response approval reference"));
         }
     }
     Ok(())
@@ -2004,7 +2010,7 @@ impl Writer {
     pub(super) fn memory_raw_prefix(&self, offset: DecimalU64, hash: &str) -> StoreResult<Vec<u8>> {
         self.ready()?;
         if offset > self.published.marker.raw_offset {
-            return Err(StoreError::Corrupt("記憶の原文範囲"));
+            return Err(StoreError::Corrupt("Memory source range"));
         }
         disk::prefix(&self.directory, disk::RAW, offset, hash)
     }

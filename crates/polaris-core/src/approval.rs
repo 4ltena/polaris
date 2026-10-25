@@ -95,9 +95,9 @@ impl Severity {
     /// not been measured against anything yet, so changing them silently
     /// changes what `auto = "medium"` agrees to.
     const LEVELS: [&'static str; 3] = [
-        "取り消せる。読み取りか、このrunが作った一時的なものへの変更にとどまり、失敗しても元へ戻せる",
-        "このプロジェクトの追跡対象を変える。戻せるが手作業が要る",
-        "プロジェクトの外、ネットワーク、資格情報、履歴の破壊のいずれかに及ぶ。取り消せない可能性がある",
+        "Reversible: limited to reading or changing temporary resources created by this run; failures can be rolled back",
+        "Changes tracked project content. Reversible, but requires manual work",
+        "Affects resources outside the project, the network, credentials, or destructive history changes. May be irreversible",
     ];
 
     fn from_index(index: f64) -> Option<Self> {
@@ -178,7 +178,7 @@ impl Classifier {
                 &std::collections::BTreeMap::from([(
                     "severity".to_string(),
                     Question::Score {
-                        instructions: "この操作が取り返しのつかない結果を招く度合いはどれか。"
+                        instructions: "How likely is this operation to cause irreversible effects?"
                             .to_string(),
                         criteria: Severity::LEVELS.map(str::to_string).to_vec(),
                     },
@@ -213,6 +213,24 @@ pub struct Gate {
 }
 
 impl Gate {
+    pub(crate) fn environment_confirmation_available(&self) -> Result<(), String> {
+        self.approval_request(
+            "Environment setup requires plan-bound approval".into(),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) async fn confirm_environment(
+        &self,
+        reason: String,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let request = self
+            .approval_request(reason, false)?
+            .ok_or("Environment approval is unavailable")?;
+        Self::finish(&request.reason, approver.ask_async(&request.reason).await)
+    }
     pub fn new(policy: ApprovalPolicy) -> Self {
         Self {
             policy,
@@ -413,7 +431,7 @@ impl Gate {
             advisor.decider.as_ref(),
             &serde_json::json!({ "task": advisor.task }),
             &advisor.task,
-            "操作",
+            "Operation",
             &[(display.metadata.item.as_str(), display.description.as_str())],
             std::future::pending(),
         )
@@ -423,7 +441,7 @@ impl Gate {
         // the exclusion band is acted on; the other two keep the question.
         (bands.excluded == 1).then(|| {
             format!(
-                "判定器が依頼に対して役に立たないと判断したため実行しなかった: {}",
+                "Not executed because the decider judged it unhelpful for the request: {}",
                 display.description
             )
         })
@@ -443,7 +461,7 @@ impl Gate {
         // Registration reaches outside the machine, so it is asked about
         // whatever the policy says and is never classified away.
         let Some(request) =
-            self.approval_request(format!("MCPサーバの登録\n{description}"), false)?
+            self.approval_request(format!("Register MCP server\n{description}"), false)?
         else {
             return Ok(());
         };
@@ -525,7 +543,7 @@ impl Gate {
         // because it leaves the machine, whatever the policy says.
         self.approval_request(
             format!(
-                "{}; ペイロード {}",
+                "{}; payload {}",
                 display.description, display.metadata.payload_hash
             ),
             false,
@@ -941,7 +959,7 @@ mod tests {
             assert_eq!(approver.asked.is_empty(), !asks, "{yes}");
             assert_eq!(held.is_ok(), asks, "{yes}");
             if !asks {
-                assert!(held.unwrap_err().contains("役に立たない"), "{yes}");
+                assert!(held.unwrap_err().contains("unhelpful"), "{yes}");
             }
         }
     }
@@ -1322,7 +1340,7 @@ mod tests {
                     &mut approver,
                 );
                 assert_eq!(approver.asked.len(), 1, "{policy:?} must ask once");
-                assert!(approver.asked[0].contains("影響: 未判定"));
+                assert!(approver.asked[0].contains("Effect: unclassified"));
                 assert_eq!(result.is_ok(), decision == Decision::Allow);
             }
         }
@@ -1374,7 +1392,7 @@ mod tests {
             .owned_mcp_approval(ExternalCeiling::Allowed, &mcp_operation())
             .unwrap()
             .expect("owner must approve unknown tool");
-        assert_eq!(display.title, "MCP ツール実行");
+        assert_eq!(display.title, "MCP tool execution");
         assert_eq!(
             display.metadata.impact,
             crate::mcp::operation::McpImpact::Unknown

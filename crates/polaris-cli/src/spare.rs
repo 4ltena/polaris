@@ -12,13 +12,13 @@ use std::process::ExitCode;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// 頼まれていない整理を許す。付けない限り判定は通らない。
+    /// Allow unrequested cleanup assessment. Required to pass admission.
     #[arg(long)]
     allow: bool,
-    /// 自分の作業のために残しておく割合（0〜100）。
+    /// Percentage of capacity reserved for your work (0–100).
     #[arg(long, default_value_t = 50)]
     reserve: u32,
-    /// 整理の候補数。0なら行うことが無い。
+    /// Number of cleanup candidates. Zero means no work is available.
     #[arg(long, default_value_t = 0)]
     candidates: usize,
 }
@@ -26,14 +26,14 @@ pub struct Args {
 fn refusal_text(reason: Refusal) -> &'static str {
     match reason {
         Refusal::NotAllowed => {
-            "頼まれていない作業は許可されていません。`--allow` を付けると判定を続けます。"
+            "Unrequested work is not authorized. Specify --allow to continue assessment."
         }
         Refusal::QuotaUnknown => {
-            "利用枠の読み取りがありません。実アカウントでの取得は未実施のため、ここで止まります。"
+            "No usage limit observation. Real account retrieval has not been performed; stopping here."
         }
-        Refusal::NoSpare => "残りは自分の作業に要る分です。",
-        Refusal::Busy => "実行中のrunがあります。その枠は余剰ではありません。",
-        Refusal::NothingToDo => "行うだけの候補がありません。",
+        Refusal::NoSpare => "Remaining capacity is reserved for your work.",
+        Refusal::Busy => "A run is active. Its capacity is not spare.",
+        Refusal::NothingToDo => "No actionable candidates.",
     }
 }
 
@@ -58,25 +58,25 @@ pub fn run(args: Args) -> ExitCode {
             let cwd = match std::env::current_dir() {
                 Ok(cwd) => cwd,
                 Err(error) => {
-                    eprintln!("作業フォルダを読めません: {error}");
+                    eprintln!("Cannot read the working folder: {error}");
                     return ExitCode::FAILURE;
                 }
             };
             let state = match polaris_core::project::state_dir(&cwd) {
                 Ok(state) => state,
                 Err(error) => {
-                    eprintln!("保存先を決められません: {error}");
+                    eprintln!("Cannot determine the destination: {error}");
                     return ExitCode::FAILURE;
                 }
             };
             let graph = polaris_core::similarity::graph(&[]);
             match polaris_core::spare::proposal::save(&state, &held, graph.proposals) {
                 Ok(path) => println!(
-                    "余剰枠での整理を始められます。案は {} へ書きました。統合は利用者の承認を経ます。",
+                    "Spare capacity permits cleanup planning. A proposal was written to {}. Integration requires user approval.",
                     path.display()
                 ),
                 Err(_) => println!(
-                    "余剰枠での整理は始められますが、書くだけの案がありません。何も保存していません。"
+                    "Spare capacity permits cleanup, but no proposal is available. Nothing was saved."
                 ),
             }
             ExitCode::SUCCESS

@@ -84,7 +84,7 @@ impl PersistedSession {
     ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformではセッション保存の保護を確認できません",
+            "Cannot verify session storage protections on this platform",
         ))
     }
 
@@ -141,7 +141,7 @@ impl PersistedSession {
     ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformではセッション保存の保護を確認できません",
+            "Cannot verify session storage protections on this platform",
         ))
     }
 
@@ -186,7 +186,7 @@ impl PersistedSession {
     fn cursor(&self) -> io::Result<std::sync::MutexGuard<'_, u64>> {
         self.generation
             .lock()
-            .map_err(|_| io::Error::other("保存カーソルを取得できません"))
+            .map_err(|_| io::Error::other("Cannot retrieve the saved cursor"))
     }
 
     pub fn snapshot(&self) -> io::Result<ConversationSnapshot> {
@@ -195,7 +195,7 @@ impl PersistedSession {
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
             return Err(io::Error::other(
-                "別の書き込みでセッションが更新されました。再開し直してください",
+                "Another writer updated the session. Resume it again",
             ));
         }
         let mut memory = open_session_memory(&self.database, false)?;
@@ -224,12 +224,14 @@ impl PersistedSession {
         let owned = if published {
             cursor
                 .checked_add(1)
-                .ok_or_else(|| io::Error::other("保存世代が上限です"))?
+                .ok_or_else(|| io::Error::other("Storage generation limit reached"))?
         } else {
             *cursor
         };
         if expected.state.generation != owned {
-            return Err(io::Error::other("要求準備中に別の書き込みが発生しました"));
+            return Err(io::Error::other(
+                "Another write occurred during request preparation",
+            ));
         }
         let lock = self.store.lock()?;
         lock.check_snapshot(expected)?;
@@ -343,7 +345,7 @@ impl PersistedSession {
         if before.state.generation != *cursor || before.state.generation != expected_generation {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "workflow変更の保存世代が変わりました",
+                "Workflow change storage generation changed",
             ));
         }
         if crate::conversation_state::content_hash(
@@ -352,17 +354,19 @@ impl PersistedSession {
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "workflow変更の保存前stateが変わりました",
+                "Workflow change pre-save state changed",
             ));
         }
         if before.state.raw_commit_offset != before.raw_offset
             || before.state.raw_commit_hash != before.raw_hash
         {
-            return Err(io::Error::other("workflow変更前に未公開の原文があります"));
+            return Err(io::Error::other(
+                "Unpublished source text exists before the workflow change",
+            ));
         }
         let expected_next = expected_generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+            .ok_or_else(|| io::Error::other("Storage generation limit reached"))?;
         if candidate.generation != expected_generation
             || candidate.raw_commit_offset != before.raw_offset
             || candidate.raw_commit_hash != before.raw_hash
@@ -370,7 +374,7 @@ impl PersistedSession {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "workflow変更候補が専用保存契約に一致しません",
+                "Workflow change candidate does not match the dedicated storage contract",
             ));
         }
         candidate.validate()?;
@@ -387,7 +391,9 @@ impl PersistedSession {
             || published.raw_offset != before.raw_offset
             || published.raw_hash != before.raw_hash
         {
-            return Err(io::Error::other("workflow変更の公開結果が一致しません"));
+            return Err(io::Error::other(
+                "Workflow change publication result mismatch",
+            ));
         }
         memory
             .with_conversation_marker(&published_view(&published.state)?, || Ok(()))
@@ -417,13 +423,15 @@ impl PersistedSession {
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "セッション設定の保存前stateが変わりました",
+                "Session settings pre-save state changed",
             ));
         }
         if before.state.raw_commit_offset != before.raw_offset
             || before.state.raw_commit_hash != before.raw_hash
         {
-            return Err(io::Error::other("セッション設定前に未公開の原文があります"));
+            return Err(io::Error::other(
+                "Unpublished source text exists before session configuration",
+            ));
         }
         let changes_mode = candidate.history_mode != before.state.history_mode;
         let mut same_mode = candidate.clone();
@@ -431,7 +439,7 @@ impl PersistedSession {
         if !crate::session_settings::session_only_change(&before.state, &same_mode) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "セッション設定候補が専用保存契約に一致しません",
+                "Session settings candidate does not match the dedicated storage contract",
             ));
         }
         candidate.validate()?;
@@ -440,7 +448,7 @@ impl PersistedSession {
         }
         let expected_next = expected_generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+            .ok_or_else(|| io::Error::other("Storage generation limit reached"))?;
         let mut memory = open_session_memory(&self.database, false)?;
         if changes_mode && candidate.history_mode == HistoryMode::Structured10 {
             memory
@@ -472,7 +480,9 @@ impl PersistedSession {
             || published.raw_offset != before.raw_offset
             || published.raw_hash != before.raw_hash
         {
-            return Err(io::Error::other("セッション設定の公開結果が一致しません"));
+            return Err(io::Error::other(
+                "Session settings publication result mismatch",
+            ));
         }
         memory
             .with_conversation_marker(&published_view(&published.state)?, || Ok(()))
@@ -493,14 +503,14 @@ impl PersistedSession {
             if checkpoint.workflow_revision != before.workflow.revision {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "verification checkpoint workflow revisionが変わりました",
+                    "Verification checkpoint workflow revision changed",
                 ));
             }
             if let Some(previous) = &before.verification_checkpoint {
                 if !previous.same_preparation_basis(&checkpoint) {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "verification checkpointのCAS basisが変わりました",
+                        "Verification checkpoint CAS basis changed",
                     ));
                 }
                 if previous.stage != checkpoint.stage
@@ -508,7 +518,7 @@ impl PersistedSession {
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "verification checkpointのCAS stageが一致しません",
+                        "Verification checkpoint CAS stage mismatch",
                     ));
                 }
             } else if checkpoint.stage
@@ -516,7 +526,7 @@ impl PersistedSession {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "verification checkpointはpreparedから保存します",
+                    "Verification checkpoints must be saved from prepared state",
                 ));
             }
             let mut next = before.clone();
@@ -539,7 +549,7 @@ impl PersistedSession {
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "change contractの承認はtrusted ownerだけが行えます",
+                "Only a trusted owner can approve change contracts",
             ));
         }
         let reference = contract.reference();
@@ -573,7 +583,7 @@ impl PersistedSession {
             ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "承認できるchange contract revisionではありません",
+                    "This change contract revision cannot be approved",
                 ));
             }
             let approved = draft
@@ -623,7 +633,7 @@ impl PersistedSession {
         if contract.header.status != ArtifactStatusV1::Draft || !contract.eligibility.is_routine() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "routine条件を満たすdraftだけを自動承認できます",
+                "Only drafts meeting routine conditions can be approved automatically",
             ));
         }
         let generation = *self.cursor()?;
@@ -631,7 +641,7 @@ impl PersistedSession {
             if before.workflow.revision != expected_workflow_revision {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "workflow revisionが変わりました",
+                    "Workflow revision changed",
                 ));
             }
             let mut graph = before.workflow_artifacts.clone();
@@ -739,7 +749,7 @@ impl PersistedSession {
             if before.workflow.revision != expected_workflow_revision {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "workflow revisionが変わりました",
+                    "Workflow revision changed",
                 ));
             }
             let convergence = build_owner_convergence_for_state(before, store, &bundle)?;
@@ -783,7 +793,7 @@ impl PersistedSession {
             let Some(previous) = &before.verification_checkpoint else {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "verification checkpointがありません",
+                    "No verification checkpoint",
                 ));
             };
             if previous != &checkpoint
@@ -792,7 +802,7 @@ impl PersistedSession {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "verification checkpointのCASが一致しません",
+                    "Verification checkpoint CAS mismatch",
                 ));
             }
             let convergence = build_owner_convergence_for_state(before, store, &bundle)?;
@@ -844,20 +854,17 @@ impl PersistedSession {
             if before.workflow.revision != expected_workflow_revision {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "review workflow revisionが変わりました",
+                    "Review workflow revision changed",
                 ));
             }
             if !matches!(before.workflow.phase, Phase::Implement | Phase::Review) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "review publicationはImplementまたはReview phaseだけで実行できます",
+                    "Review publication is allowed only in Implement or Review phase",
                 ));
             }
             let previous = before.verification_checkpoint.as_ref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "verification checkpointがありません",
-                )
+                io::Error::new(io::ErrorKind::WouldBlock, "No verification checkpoint")
             })?;
             previous.validate().map_err(io::Error::other)?;
             if previous.checkpoint_id != checkpoint_id
@@ -866,7 +873,7 @@ impl PersistedSession {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "published verification checkpointのCASが一致しません",
+                    "Published verification checkpoint CAS mismatch",
                 ));
             }
 
@@ -921,7 +928,7 @@ impl PersistedSession {
         if before.state.generation != *cursor || before.state.generation != expected_generation {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "workflow artifactの保存世代が変わりました。再開し直してください",
+                "Workflow artifact storage generation changed. Resume again",
             ));
         }
         let store = WorkflowArtifactStore::open(&self.data_root, &before.state.project_id)?;
@@ -940,7 +947,7 @@ impl PersistedSession {
             .state
             .generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+            .ok_or_else(|| io::Error::other("Storage generation limit reached"))?;
         Ok(output)
     }
 
@@ -959,7 +966,7 @@ impl PersistedSession {
         let before = lock.snapshot()?;
         if before.state.generation != *cursor {
             return Err(io::Error::other(
-                "保存世代が変わりました。原文を保持して停止しました",
+                "Storage generation changed. Stopped with the original text retained",
             ));
         }
         if let Some((admission_id, payload_hash)) = admission {
@@ -968,7 +975,7 @@ impl PersistedSession {
             if payload_hash.len() != 64
                 || !payload_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
-                return Err(io::Error::other("admission payload hashが不正です"));
+                return Err(io::Error::other("Invalid admission payload hash"));
             }
             if !matches!(events.len(), 1 | 2)
                 || !events[0].1
@@ -984,20 +991,20 @@ impl PersistedSession {
                 })
             {
                 return Err(io::Error::other(
-                    "admission inputは単一のuser turnが必要です",
+                    "Admission input requires a single user turn",
                 ));
             }
             if let Some(receipt) = before.state.admission_receipts.get(admission_id) {
                 if receipt.payload_hash != payload_hash {
                     return Err(io::Error::other(
-                        "admission receiptが既存入力と衝突しました",
+                        "Admission receipt conflicts with existing input",
                     ));
                 }
                 let index = before
                     .events
                     .iter()
                     .position(|event| event.sequence == receipt.sequence)
-                    .ok_or_else(|| io::Error::other("admission receiptの原文がありません"))?;
+                    .ok_or_else(|| io::Error::other("Missing admission receipt source text"))?;
                 let event = &before.events[index];
                 if !event.starts_turn
                     || event.turn_id != receipt.turn_id
@@ -1005,12 +1012,12 @@ impl PersistedSession {
                         != serde_json::to_vec(&events[0].0).map_err(io::Error::other)?
                 {
                     return Err(io::Error::other(
-                        "admission inputの原文が既存入力と不一致です",
+                        "Admission input source text differs from existing input",
                     ));
                 }
                 if let Some((supplement, _)) = events.get(1) {
                     let saved = before.events.get(index + 1).ok_or_else(|| {
-                        io::Error::other("admission prompt結果の原文がありません")
+                        io::Error::other("Missing admission prompt result source text")
                     })?;
                     if saved.starts_turn
                         || saved.turn_id != event.turn_id
@@ -1018,7 +1025,7 @@ impl PersistedSession {
                             != serde_json::to_vec(supplement).map_err(io::Error::other)?
                     {
                         return Err(io::Error::other(
-                            "admission prompt結果が既存入力と不一致です",
+                            "Admission prompt result differs from existing input",
                         ));
                     }
                 }
@@ -1031,7 +1038,7 @@ impl PersistedSession {
                 >= crate::session_manager::MAX_ADMISSION_RECEIPTS
             {
                 return Err(io::Error::other(
-                    "admission receipt容量不足です。原文は保存していません",
+                    "Insufficient admission receipt capacity. Source text was not saved",
                 ));
             }
         }
@@ -1044,7 +1051,7 @@ impl PersistedSession {
                     != candidate.state().active_change_contract
             {
                 return Err(io::Error::other(
-                    "workflow artifactまたはphase gateを通常checkpointでは変更できません",
+                    "A normal checkpoint cannot change workflow artifacts or phase gates",
                 ));
             }
             if before.state.workflow.phase != candidate.state().phase {
@@ -1128,7 +1135,7 @@ impl PersistedSession {
                     let event = snapshot
                         .events
                         .get(before.events.len())
-                        .ok_or_else(|| io::Error::other("admission inputを保存できません"))?;
+                        .ok_or_else(|| io::Error::other("Cannot save admission input"))?;
                     next.admission_receipts.insert(
                         admission_id.to_owned(),
                         AdmissionReceiptV1 {
@@ -1161,7 +1168,7 @@ impl PersistedSession {
         let mut lock = self.store.lock()?;
         let before = lock.snapshot()?;
         if before.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         let mut memory = open_session_memory(&self.database, false)?;
         memory
@@ -1185,7 +1192,7 @@ impl PersistedSession {
         let lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         let mut memory = open_session_memory(&self.database, false)?;
         let mut child = None;
@@ -1195,7 +1202,7 @@ impl PersistedSession {
                 Ok(())
             })
             .map_err(io::Error::other)?;
-        let store = child.ok_or_else(|| io::Error::other("分岐を保存できません"))?;
+        let store = child.ok_or_else(|| io::Error::other("Cannot save the fork"))?;
         let generation = store.lock()?.snapshot()?.state.generation;
         Ok(Self {
             store: Arc::new(store),
@@ -1217,7 +1224,7 @@ impl PersistedSession {
         let mut lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         lock.begin_rewind_boundary(workspace_pre_manifest_id, visible_memory_raw_object_ids)
     }
@@ -1236,7 +1243,7 @@ impl PersistedSession {
         let mut lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         lock.finish_rewind_boundary(boundary_id, workspace_post_manifest_id, eligibility, effect)
     }
@@ -1252,7 +1259,7 @@ impl PersistedSession {
         let mut lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         lock.abandon_rewind_boundary(boundary_id, reason)
     }
@@ -1273,7 +1280,7 @@ impl PersistedSession {
         let lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         lock.list_rewind_boundaries()
     }
@@ -1292,7 +1299,7 @@ impl PersistedSession {
         let lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
         if snapshot.state.generation != *cursor {
-            return Err(io::Error::other("保存世代が変わりました"));
+            return Err(io::Error::other("Storage generation changed"));
         }
         let plan = lock.plan_rewind_branch(boundary_id, &new_session_id()?)?;
         let (_, pre) = plan.workspace_manifests();
@@ -1300,7 +1307,7 @@ impl PersistedSession {
         let post = boundaries
             .last()
             .and_then(|boundary| boundary.completion.as_ref())
-            .ok_or_else(|| io::Error::other("現在の巻き戻し境界が未完了です"))?
+            .ok_or_else(|| io::Error::other("The current rewind boundary is incomplete"))?
             .workspace_post_manifest_id
             .parse()
             .map_err(io::Error::other)?;
@@ -1310,7 +1317,7 @@ impl PersistedSession {
             .map_err(io::Error::other)?;
         if !preview.restorable {
             return Err(io::Error::other(
-                "管理操作または保存状態が巻き戻しを許可しません",
+                "Management operations or saved state do not permit rewind",
             ));
         }
         crate::rewind_candidate_capacity::preflight_rewind_candidate_capacity(
@@ -1328,7 +1335,7 @@ impl PersistedSession {
                 Ok(())
             })
             .map_err(io::Error::other)?;
-        let store = child.ok_or_else(|| io::Error::other("rewind分岐を保存できません"))?;
+        let store = child.ok_or_else(|| io::Error::other("Cannot save the rewind fork"))?;
         let generation = store.lock()?.snapshot()?.state.generation;
         Ok(Self {
             store: Arc::new(store),
@@ -1468,7 +1475,7 @@ fn build_owner_convergence_for_state(
         (Some(feature), Some(task)) => (feature, task),
         _ => {
             return Err(io::Error::other(
-                "convergenceにはcurrent active contractまたはtaskが必要です",
+                "Convergence requires a current active contract or task",
             ));
         }
     };
@@ -1543,7 +1550,7 @@ fn validate_owner_convergence_for_state(
         state.workflow.active_task.as_ref(),
     ) {
         (Some(feature), Some(task)) => (feature, task),
-        _ => return Err(io::Error::other("convergenceにactive artifactがありません")),
+        _ => return Err(io::Error::other("No active artifact for convergence")),
     };
     let feature = store.load_feature_spec(graph, feature_reference)?;
     let task_graph = store.load_task_graph(graph, &active_task.task_graph)?;
@@ -1574,7 +1581,7 @@ fn open_session_memory(database: &Path, _create: bool) -> io::Result<MemoryStore
 fn windows_refuse_owner() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "このWindows試験ではprivate artifact/workflow保存を利用できません",
+        "Private artifact/workflow storage is unavailable in this Windows test",
     ))
 }
 
@@ -1591,7 +1598,7 @@ fn windows_creation_guard(
     let unavailable = || {
         io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformではセッション保存の保護を確認できません",
+            "Cannot verify session storage protections on this platform",
         )
     };
     state.validate()?;
@@ -1899,7 +1906,7 @@ mod tests {
         let raw = saved.snapshot().unwrap();
         assert_eq!(raw.events.len(), 5);
         assert_eq!(raw.events[3].message.tool_call_id.as_deref(), Some("b"));
-        assert!(raw.events[3].message.content.contains("結果は不明"));
+        assert!(raw.events[3].message.content.contains("outcome is unknown"));
         assert_eq!(raw.events[4].message.content, "continue");
         assert_eq!(raw.events[2].message.content, "completed");
     }

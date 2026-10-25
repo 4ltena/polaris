@@ -1544,7 +1544,9 @@ async fn explicit_related_search_uses_frozen_query_and_preserves_owner_status() 
         .await
         .unwrap();
         let output = task.await.unwrap().unwrap();
-        assert!(output.contains(&format!("構造化取得分類：\"{classification}\"")));
+        assert!(output.contains(&format!(
+            "Structured retrieval classification: \"{classification}\""
+        )));
         assert!(output.contains(lane));
         assert!(output.contains(&pending.summary));
         assert!(output.contains(&pending.source.raw_hash));
@@ -1682,7 +1684,7 @@ async fn explicit_related_search_queued_cancellation_is_read_only_and_not_retrie
     owner.poll(Some(&mut writer), true);
     assert_eq!(
         task.await.unwrap().unwrap_err().to_string(),
-        "会話記憶の実行は停止しています"
+        "Conversation memory execution is stopped"
     );
     assert_eq!(search_owner_bytes(&writer), before);
     assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);

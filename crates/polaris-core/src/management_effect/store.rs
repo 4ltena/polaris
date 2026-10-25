@@ -48,6 +48,7 @@ use std::{
 enum JournalLeaseV1<'a> {
     Mutation(&'a ProjectMutationLeaseV1),
     Runtime(&'a ProjectActivityLeaseV1),
+    Environment(&'a ProjectActivityLeaseV1),
 }
 
 #[cfg(any(unix, all(test, windows)))]
@@ -131,7 +132,7 @@ pub enum ManagementEffectStoreError {
     ForeignPrefix,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManagementEffectStoreV1 {
     state_dir: PathBuf,
     root: PathBuf,
@@ -1716,6 +1717,59 @@ impl ManagementEffectStoreV1 {
         self.prepare_with_lease(JournalLeaseV1::Mutation(lease), expected, request)
     }
 
+    /// Plan-bound environment effects borrow the parent turn's activity lease.
+    /// This does not broaden prepare_runtime or acquire a nested EX lease.
+    #[cfg(unix)]
+    pub(crate) fn prepare_environment_runtime(
+        &self,
+        lease: &ProjectActivityLeaseV1,
+        expected: ManagementEffectCursorV1,
+        request: PrepareManagementEffectV1,
+    ) -> Result<PrepareManagementEffectOutcomeV1, ManagementEffectStoreError> {
+        self.prepare_with_lease(JournalLeaseV1::Environment(lease), expected, request)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn start_environment_runtime(
+        &self,
+        lease: &ProjectActivityLeaseV1,
+        effect: &PreparedManagementEffectV1,
+    ) -> Result<StartedManagementEffectV1, ManagementEffectStoreError> {
+        self.start_with_lease(JournalLeaseV1::Environment(lease), effect)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn deny_environment_runtime(
+        &self,
+        lease: &ProjectActivityLeaseV1,
+        effect: &PreparedManagementEffectV1,
+        reason: ManagementDenialReasonV1,
+    ) -> Result<DeniedManagementEffectV1, ManagementEffectStoreError> {
+        self.deny_with_lease(JournalLeaseV1::Environment(lease), effect, reason)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn complete_environment_runtime(
+        &self,
+        lease: &ProjectActivityLeaseV1,
+        effect: &StartedManagementEffectV1,
+        evidence: ManagementEffectHashV1,
+    ) -> Result<CompletedManagementEffectV1, ManagementEffectStoreError> {
+        let _owner = self.lock_owner()?;
+        validate_evidence_hash(evidence)?;
+        self.complete_from_started_or_replay(JournalLeaseV1::Environment(lease), effect, evidence)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unknown_environment_runtime(
+        &self,
+        lease: &ProjectActivityLeaseV1,
+        effect: &StartedManagementEffectV1,
+        reason: ManagementUnknownReasonV1,
+    ) -> Result<UnknownManagementEffectV1, ManagementEffectStoreError> {
+        self.mark_outcome_unknown_with_lease(JournalLeaseV1::Environment(lease), effect, reason)
+    }
+
     /// Restricts shared-activity journal writes to runtime-local session controls.
     #[cfg(unix)]
     pub fn prepare_runtime(
@@ -1783,7 +1837,9 @@ impl ManagementEffectStoreV1 {
         if !self.has_prepare_reserve(&state)? {
             match lease {
                 JournalLeaseV1::Mutation(lease) => self.seal_generation(lease, &state, false)?,
-                JournalLeaseV1::Runtime(_) => return Err(ManagementEffectStoreError::StoreFull),
+                JournalLeaseV1::Runtime(_) | JournalLeaseV1::Environment(_) => {
+                    return Err(ManagementEffectStoreError::StoreFull);
+                }
             }
             state = self.load()?;
             if !self.has_prepare_reserve(&state)? {
@@ -2351,7 +2407,10 @@ impl ManagementEffectStoreV1 {
         event: JournalEventV1,
     ) -> Result<VerifiedManagementEffectEventV1, ManagementEffectStoreError> {
         self.check_journal_lease(lease)?;
-        if let JournalLeaseV1::Runtime(_) = lease {
+        if matches!(
+            lease,
+            JournalLeaseV1::Runtime(_) | JournalLeaseV1::Environment(_)
+        ) {
             let request = match &event {
                 JournalEventV1::Prepared { request } => request,
                 JournalEventV1::ReconciledAbandon { .. } => {
@@ -2541,6 +2600,18 @@ impl ManagementEffectStoreV1 {
         lease: JournalLeaseV1<'_>,
         request: &PrepareManagementEffectV1,
     ) -> Result<(), ManagementEffectStoreError> {
+        if let JournalLeaseV1::Environment(_) = lease {
+            validate_request_shape(self.project_scope, request)?;
+            validate_new_inventory_contract(request)?;
+            if request.inventory.encoded() != "C43"
+                || request.scope.permission != ManagementPermissionScopeV1::Project
+                || request.rewind != ManagementRewindDispositionV1::IrreversibleRemote
+                || request.scope.session.is_none()
+                || request.scope.account_binding.is_some()
+            {
+                return Err(ManagementEffectStoreError::InvalidInventoryContract);
+            }
+        }
         if let JournalLeaseV1::Runtime(_) = lease {
             validate_request_shape(self.project_scope, request)?;
             validate_new_inventory_contract(request)?;
@@ -2565,7 +2636,7 @@ impl ManagementEffectStoreV1 {
     ) -> Result<(), ManagementEffectStoreError> {
         match lease {
             JournalLeaseV1::Mutation(lease) => self.check_lease(lease),
-            JournalLeaseV1::Runtime(lease) => {
+            JournalLeaseV1::Runtime(lease) | JournalLeaseV1::Environment(lease) => {
                 if lease.store_root() != self.expected_lease_root {
                     return Err(ManagementEffectStoreError::WrongProjectLease);
                 }
@@ -3246,6 +3317,7 @@ pub(super) fn validate_new_inventory_contract(
         "C03" | "C04" | "C05" | "C07" | "T20" => (&[System], IrreversibleLocal, Optional, Required),
         "T19" => (&[Clipboard], IrreversibleLocal, Required, Forbidden),
         "C10" => (&[Remote], IrreversibleRemote, Optional, Required),
+        "C43" => (&[Project], IrreversibleRemote, Optional, Forbidden),
         "T17" => (&[Project, System], IrreversibleLocal, Required, Forbidden),
         "C37" | "D08" | "D22" | "T14" => (
             &[LocalSession, Project, System, Remote],

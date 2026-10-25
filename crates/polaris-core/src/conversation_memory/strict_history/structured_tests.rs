@@ -192,7 +192,7 @@ async fn r31_unknown_provider_result_stops_reopen_before_another_call() {
     assert!(history.recover_pending(&store, &db).await.is_err());
     let reopened = ConversationStore::open(root.path(), "p", ID).unwrap();
     let error = history.recover_pending(&reopened, &db).await.unwrap_err();
-    assert!(error.to_string().contains("再送しません"), "{error}");
+    assert!(error.to_string().contains("will not be resent"), "{error}");
     assert_eq!(summary.calls.load(Ordering::SeqCst), 1);
     assert_eq!(embedding.passages.load(Ordering::SeqCst), 0);
 }
@@ -309,7 +309,7 @@ async fn marker_failure_reuses_saved_response_and_pending_embedding() {
     });
     let other = StrictHistory::new(summary.clone(), other_embedding.clone());
     let error = other.recover_pending(&store, &db).await.unwrap_err();
-    assert!(error.to_string().contains("現在の資源"));
+    assert!(error.to_string().contains("current resources"));
     assert_eq!(other_embedding.passages.load(Ordering::SeqCst), 0);
     assert_eq!(summary.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -433,7 +433,7 @@ async fn session_recovers_saved_response_before_new_input_and_keeps_cursor_in_st
     session.check_persistence().unwrap();
     let evidence = session.prepare_history().await.unwrap().unwrap();
     assert!(evidence.content.contains("production"));
-    assert!(evidence.content.contains("記憶の取得分類"));
+    assert!(evidence.content.contains("Memory retrieval classification"));
     assert!(crate::budget::count_tokens(&evidence.content) <= 768);
     assert_eq!(
         session
@@ -517,7 +517,12 @@ async fn stale_saved_attempt_is_checked_before_interrupted_tool_append() {
         .unwrap();
     let raw = std::fs::read(saved.store.directory().join("raw.jsonl")).unwrap();
     let error = session.recover_history().await.unwrap_err();
-    assert!(error.to_string().contains("所属・世代・原文"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("ownership, generation, or source"),
+        "{error}"
+    );
     assert_eq!(
         std::fs::read(saved.store.directory().join("raw.jsonl")).unwrap(),
         raw
@@ -659,7 +664,10 @@ async fn r32_historical_source_metadata_must_match_the_saved_response() {
         "conversation://source-replaced?start=1&end=1",
     )
     .unwrap_err();
-    assert!(error.to_string().contains("構造化保存記録"), "{error}");
+    assert!(
+        error.to_string().contains("structured storage records"),
+        "{error}"
+    );
     // The structured rows themselves remain valid; only the forged v2 source fails.
     let uri = crate::conversation_memory::structured::sources::source_uri(
         &response.delta.publication.publication_id,
@@ -715,7 +723,10 @@ async fn r32_historical_source_rejects_a_different_visible_summary_id() {
     let uri = format!("conversation://{}?start=1&end=1", evidence.source.id);
     let error = crate::conversation_memory::resolve_conversation_uri(&store, &other_path, &uri)
         .unwrap_err();
-    assert!(error.to_string().contains("構造化保存記録"), "{error}");
+    assert!(
+        error.to_string().contains("structured storage records"),
+        "{error}"
+    );
 }
 
 #[path = "structured_tests/related.rs"]
@@ -777,7 +788,7 @@ fn a_killed_extraction_neither_resends_an_unknown_summary_nor_repeats_a_saved_on
             let Err(error) = result else {
                 panic!("unknown summary stops");
             };
-            assert!(error.to_string().contains("再送しません"), "{error}");
+            assert!(error.to_string().contains("will not be resent"), "{error}");
             assert_eq!(embedding.passages.load(Ordering::SeqCst), 0);
         } else {
             let recovered = result.unwrap();

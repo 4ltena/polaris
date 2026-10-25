@@ -62,14 +62,7 @@ pub fn prompt(implementation: &Implementation) -> Result<String, Refusal> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "実機で確認してほしい。\n\n\
-         対象: {root}\n\
-         実装世代: run {run} / attempt {attempt}\n\n\
-         変更したファイル:\n{paths}\n\n\
-         実装の概要:\n{summary}\n\n\
-         確認してほしいこと:\n{checks}\n\n\
-         結果は合否と、失敗した場合の再現手順を返してほしい。\
-         この文面は実装が終わったことだけを示し、実機での合格は含まない。",
+        "Please verify on a real device.\n\nTarget: {root}\nImplementation generation: run {run} / attempt {attempt}\n\nChanged files:\n{paths}\n\nImplementation summary:\n{summary}\n\nChecks requested:\n{checks}\n\nReport pass or fail, with reproduction steps for failures. This request indicates only that implementation is complete; it does not establish acceptance on a real device.",
         root = implementation.project_root,
         run = implementation.run_id,
         attempt = implementation.attempt_id,

@@ -74,8 +74,8 @@ fn setup_data_description_preserves_fields_and_debug_hides_binding_details() {
         "auth.bearer_token",
         "credential_reference",
         "discover_2026",
-        "カタログの取得",
-        "対象プロジェクト: project",
+        "catalog retrieval",
+        "Target project: project",
     ] {
         assert!(description.contains(visible), "missing {visible}");
     }
@@ -87,7 +87,7 @@ fn setup_data_description_preserves_fields_and_debug_hides_binding_details() {
     );
     let mut replacement = proposal;
     replacement.replaces = true;
-    assert!(replacement.description("fixture").contains("置き換え:"));
+    assert!(replacement.description("fixture").contains("Replacement:"));
 }
 
 #[test]

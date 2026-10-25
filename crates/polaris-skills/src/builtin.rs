@@ -39,7 +39,11 @@ pub const ROOT: &str = "<polaris-builtin>";
 /// terms — the only bundled skills were the mandatory profile — so anything
 /// optional had to be copied into `~/.polaris/skills` by hand on every
 /// machine.
-const SKILLS: [(&str, &str); 2] = [
+const SKILLS: [(&str, &str); 3] = [
+    (
+        "envkit",
+        include_str!("../resources/skills/envkit/SKILL.md"),
+    ),
     (
         "document-writing",
         include_str!("../resources/skills/document-writing/SKILL.md"),
@@ -61,11 +65,20 @@ pub fn skills() -> Vec<Skill> {
         .iter()
         .filter_map(|(name, manifest)| {
             let (name, description, body) = crate::frontmatter::parse(manifest, name).ok()?;
+            let envkit = name == "envkit";
             Some(Skill {
-                name,
+                name: if envkit {
+                    "builtin:envkit".into()
+                } else {
+                    name
+                },
                 description,
                 body,
-                path: PathBuf::from(ROOT).join("skills").join("SKILL.md"),
+                path: if envkit {
+                    PathBuf::from(ROOT).join("skills/envkit/SKILL.md")
+                } else {
+                    PathBuf::from(ROOT).join("skills/SKILL.md")
+                },
             })
         })
         .collect()

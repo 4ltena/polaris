@@ -52,7 +52,9 @@ impl StructuredAttemptReceipt {
             || !source.expired_turns().contains(&turn)
             || structured_summary_intent(source)?.as_ref() != Some(&self.intent)
         {
-            return Err(invalid("構造化抽出記録の所属・世代・原文が一致しません"));
+            return Err(invalid(
+                "Structured extraction record ownership, generation, or source mismatch",
+            ));
         }
         source.validate_complete_turn(turn)?;
         if let Some(response) = &self.response {
@@ -81,7 +83,9 @@ impl ConversationStore {
         receipt.validate(expected, turn)?;
         let source = self.load_snapshot(receipt.generation, &receipt.raw_hash)?;
         if serde_json::to_vec(&source)? != serde_json::to_vec(expected)? {
-            return Err(invalid("構造化抽出の保存source snapshotが一致しません"));
+            return Err(invalid(
+                "Saved structured extraction source snapshot mismatch",
+            ));
         }
         Ok(Some(receipt))
     }
@@ -92,7 +96,7 @@ impl ConversationStore {
             let directory = parent.join(name);
             match fs::symlink_metadata(&directory) {
                 Ok(metadata) if metadata.file_type().is_dir() => {}
-                Ok(_) => return Err(invalid("構造化抽出の保存先がdirectoryではありません")),
+                Ok(_) => return Err(invalid("Structured extraction storage is not a directory")),
                 Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                     private_directory(&directory)?;
                     File::open(&parent)?.sync_all()?;
@@ -120,14 +124,16 @@ impl ConversationStore {
             Err(error) => return Err(error),
         };
         if !metadata.is_file() || metadata.len() > MAX_RECEIPT_BYTES {
-            return Err(invalid("構造化抽出記録の形式・大きさが上限外です"));
+            return Err(invalid(
+                "Structured extraction record format or size is outside bounds",
+            ));
         }
         let mut bytes = Vec::new();
         File::open(path)?
             .take(MAX_RECEIPT_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-            return Err(invalid("構造化抽出記録が1MiBを超えました"));
+            return Err(invalid("Structured extraction record exceeds 1 MiB"));
         }
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
@@ -142,25 +148,27 @@ impl ConversationStore {
         let (turn, _) = id
             .strip_prefix("structured10-")
             .and_then(|s| s.split_once('-'))
-            .ok_or_else(|| invalid("構造化公開IDが不正です"))?;
+            .ok_or_else(|| invalid("Invalid structured publication ID"))?;
         let turn = turn
             .parse::<u64>()
-            .map_err(|_| invalid("構造化公開turnが不正です"))?;
+            .map_err(|_| invalid("Invalid structured publication turn"))?;
         let receipt = self
             .read_structured_attempt(epoch, turn)?
-            .ok_or_else(|| invalid("構造化公開の保存記録がありません"))?;
+            .ok_or_else(|| invalid("Missing structured publication storage record"))?;
         let source = self.load_snapshot(receipt.generation, &receipt.raw_hash)?;
         receipt.validate(&source, turn)?;
         let response = receipt
             .response
-            .ok_or_else(|| invalid("構造化公開の応答がありません"))?;
+            .ok_or_else(|| invalid("Missing structured publication response"))?;
         if receipt.epoch != epoch
             || response.delta.publication.publication_id != id
             || u64::try_from(response.delta.publication.scope.generation)
                 .ok()
                 .is_none_or(|generation| generation > maximum_generation)
         {
-            return Err(invalid("構造化公開が許可された世代・IDと一致しません"));
+            return Err(invalid(
+                "Structured publication does not match the authorized generation or ID",
+            ));
         }
         Ok(response.delta)
     }
@@ -183,7 +191,9 @@ impl LockedConversation<'_> {
                     .any(|summary| summary.starts_with(&format!("strict10-{id}-")))
             }) != Some(turn)
         {
-            return Err(invalid("構造化抽出の対象が次の期限切れturnと一致しません"));
+            return Err(invalid(
+                "Structured extraction target does not match the next expiring turn",
+            ));
         }
         crate::conversation_memory::structured::sources::publication_view(state)?
             .check_receipt_capacity(Some(&format!(
@@ -197,7 +207,7 @@ impl LockedConversation<'_> {
     fn write_structured_attempt(&self, receipt: &StructuredAttemptReceipt) -> io::Result<()> {
         let bytes = serde_json::to_vec(receipt)?;
         if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-            return Err(invalid("構造化抽出記録が1MiBを超えました"));
+            return Err(invalid("Structured extraction record exceeds 1 MiB"));
         }
         let directory = self.store.attempt_directory(receipt.epoch, true)?.unwrap();
         let path = directory.join(format!("{}.json", receipt.turn));
@@ -222,7 +232,9 @@ impl LockedConversation<'_> {
         // Only the first unpublished turn can start, so all earlier attempts
         // are marker-visible. No directory scan or separate mutable counter is needed.
         if expected.state.visible_structured_publication_ids.len() >= MAX_ATTEMPTS {
-            return Err(invalid("構造化抽出記録がepoch内の上限に達しました"));
+            return Err(invalid(
+                "Structured extraction records reached the per-epoch limit",
+            ));
         }
         let receipt = StructuredAttemptReceipt {
             schema_version: RECEIPT_VERSION,
@@ -235,7 +247,7 @@ impl LockedConversation<'_> {
             turn,
             prompt_version: STRUCTURED_PROMPT_VERSION.into(),
             intent: structured_summary_intent(expected)?
-                .ok_or_else(|| invalid("構造化抽出sourceがありません"))?,
+                .ok_or_else(|| invalid("Missing structured extraction source"))?,
             response: None,
         };
         receipt.validate(expected, turn)?;
@@ -254,7 +266,7 @@ impl LockedConversation<'_> {
         let mut receipt = self
             .store
             .bound_structured_attempt(expected, turn)?
-            .ok_or_else(|| invalid("構造化抽出の開始記録がありません"))?;
+            .ok_or_else(|| invalid("Missing structured extraction start record"))?;
         receipt.validate(expected, turn)?;
         let saved = SavedResponse {
             summary: response.summary.clone(),
@@ -265,7 +277,7 @@ impl LockedConversation<'_> {
             return if prior == &saved {
                 Ok(())
             } else {
-                Err(invalid("保存済み構造化応答を置換できません"))
+                Err(invalid("Cannot replace a saved structured response"))
             };
         }
         receipt.response = Some(saved);

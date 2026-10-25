@@ -152,12 +152,12 @@ fn only_committed_settings_changes_request_binding_refresh() {
         assert!(!result.lines.is_empty(), "{request}");
     }
     let cancelled = fixture
-        .call_result("remember on", KeyCode::Esc, false, None)
+        .call_result("memory configure on", KeyCode::Esc, false, None)
         .unwrap();
     assert!(!cancelled.settings_changed);
     assert_eq!(fixture.snapshot().state, before);
     let committed = fixture
-        .call_result("remember on", KeyCode::Char('y'), false, None)
+        .call_result("memory configure on", KeyCode::Char('y'), false, None)
         .unwrap();
     assert!(committed.settings_changed);
     assert!(fixture.snapshot().state.session_settings.unwrap().remember);
@@ -243,7 +243,7 @@ fn m3c_helper_cancel_records_denial_and_persistence_error_refuses_changes() {
     assert!(
         lines
             .iter()
-            .any(|line| line.to_string().contains("取り消しました"))
+            .any(|line| line.to_string().contains("cancelled"))
     );
     assert_eq!(fixture.snapshot().state, before);
     assert!(matches!(
@@ -378,7 +378,7 @@ fn m3c_helper_read_views_bound_history_and_report_range_or_size_errors() {
             .call("goal current", KeyCode::Esc, true, None)
             .unwrap()[0]
             .to_string()
-            .contains("ありません")
+            .contains("No saved goal")
     );
     saved
         .append(Message::user("x".repeat(MAX_VIEW_BYTES + 1)), true, None)

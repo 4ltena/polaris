@@ -180,7 +180,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            script: vec!["こんにちは。".into(), "これはfakeの応答です。".into()],
+            script: vec!["こんにちは。".into(), "This is a fake response.".into()],
             step_interval: Duration::from_millis(50),
             output_deadline: Duration::from_secs(5),
         }
@@ -3145,9 +3145,9 @@ impl Engine {
             history_start_cursor: cursor(&id, 0),
             session_id: self.session.clone(),
             summary: if self.production {
-                "保存済みの会話".into()
+                "Saved conversation".into()
             } else {
-                "一時領域のfake会話".into()
+                "Temporary fake conversation".into()
             },
             session_revision: published.marker.session_revision,
             content_revision: published.marker.content_revision,
@@ -3589,15 +3589,15 @@ fn error(code: ErrorCode) -> ProtocolError {
     ProtocolError {
         code,
         message: match code {
-            ErrorCode::PermissionDenied => "対象の会話にアクセスできません",
-            ErrorCode::RevisionConflict => "期待版または要求内容が一致しません",
-            ErrorCode::SessionBusy => "実行中または終了処理中です",
-            ErrorCode::CapabilityUnavailable => "このserviceでは利用できません",
-            ErrorCode::ReferenceUnavailable => "参照入力はこのserviceでは利用できません",
-            ErrorCode::StorageFailed | ErrorCode::RecoveryRequired => "保存状態を確認できません",
-            ErrorCode::Capacity => "保存容量が不足しています。新しい入力は受け付けていません",
-            ErrorCode::NotFound => "対象がありません",
-            _ => "要求を受け付けられません",
+            ErrorCode::PermissionDenied => "Cannot access the target conversation",
+            ErrorCode::RevisionConflict => "Expected revision or request content mismatch",
+            ErrorCode::SessionBusy => "Running or shutting down",
+            ErrorCode::CapabilityUnavailable => "Unavailable in this service",
+            ErrorCode::ReferenceUnavailable => "Reference input is unavailable in this service",
+            ErrorCode::StorageFailed | ErrorCode::RecoveryRequired => "Cannot verify saved state",
+            ErrorCode::Capacity => "Insufficient storage capacity. New input is not being accepted",
+            ErrorCode::NotFound => "No target",
+            _ => "Cannot accept the request",
         }
         .into(),
     }

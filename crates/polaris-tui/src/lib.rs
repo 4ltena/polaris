@@ -12,6 +12,11 @@ mod continuation_tests;
 mod conversation_view;
 #[cfg(unix)]
 mod draft;
+#[cfg(target_os = "macos")]
+mod environment_commands;
+mod file_input;
+#[cfg(target_os = "macos")]
+mod file_reveal;
 pub mod input;
 #[cfg(test)]
 mod input_preparation_tests;
@@ -108,7 +113,7 @@ const UNDECIDED_EFFORT: &str = "undecided";
 #[cfg(target_os = "linux")]
 const LINUX_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
-const LINUX_SHUTDOWN_DURING_RESTORE: &str = "停止要求を受信しました";
+const LINUX_SHUTDOWN_DURING_RESTORE: &str = "Stop request received";
 
 #[cfg(target_os = "linux")]
 fn linux_signal_exit_code(reason: signal::LinuxProcessShutdown) -> ExitCode {
@@ -184,30 +189,30 @@ async fn linux_finish_pre_turn_shutdown(
     if let Some(mut runtime) = runtime
         && let Err(error) = runtime.shutdown().await
     {
-        first_error = Some(format!("MCP runtimeを終了できません: {error}"));
+        first_error = Some(format!("Cannot stop the MCP runtime: {error}"));
     }
     if let Some(admission) = admission
         && let Err(error) =
             admission.finish(polaris_core::session_manager::TerminalStatus::OutcomeUnknown)
         && first_error.is_none()
     {
-        first_error = Some(format!("sidechat runを終了できません: {error}"));
+        first_error = Some(format!("Cannot stop the sidechat run: {error}"));
     }
     if let Some(boundary) = boundary {
         let result = persistence
-            .ok_or_else(|| "巻き戻し境界の保存元が失われました".to_string())
+            .ok_or_else(|| "Rewind boundary storage source was lost".to_string())
             .and_then(|saved| {
                 saved
                     .abandon_rewind_boundary(
                         &boundary.boundary_id,
-                        "停止要求を受信したためターンを開始しませんでした".into(),
+                        "The turn was not started because a stop request was received".into(),
                     )
                     .map_err(|error| error.to_string())
             });
         if let Err(error) = result
             && first_error.is_none()
         {
-            first_error = Some(format!("巻き戻し境界を確定できません: {error}"));
+            first_error = Some(format!("Cannot finalize the rewind boundary: {error}"));
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -287,14 +292,13 @@ impl LinuxTerminalGuard {
     }
 
     fn enable_mouse_and_cursor(&mut self) {
-        if ratatui::crossterm::execute!(
+        // Restore both modes even if enabling them only partially succeeds.
+        self.mouse = true;
+        let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
-            ratatui::crossterm::event::EnableMouseCapture
-        )
-        .is_ok()
-        {
-            self.mouse = true;
-        }
+            ratatui::crossterm::event::EnableMouseCapture,
+            ratatui::crossterm::event::EnableBracketedPaste
+        );
         if ratatui::crossterm::execute!(
             std::io::stdout(),
             ratatui::crossterm::cursor::SetCursorStyle::BlinkingBar
@@ -340,6 +344,7 @@ fn linux_restore_terminal_step(step: LinuxTerminalStep) -> std::io::Result<()> {
         ),
         LinuxTerminalStep::Mouse => ratatui::crossterm::execute!(
             std::io::stdout(),
+            ratatui::crossterm::event::DisableBracketedPaste,
             ratatui::crossterm::event::DisableMouseCapture
         ),
         LinuxTerminalStep::Raw => ratatui::crossterm::terminal::disable_raw_mode(),
@@ -497,21 +502,23 @@ async fn handle_runtime_command(
         "input" => {
             let words = extra.split_whitespace().collect::<Vec<_>>();
             let ["status", id] = words.as_slice() else {
-                return Err("/input status <受理ID>。実行中の取消はEscで行います。".into());
+                return Err(
+                    "/input status <admission-id>. Press Esc to cancel a running task.".into(),
+                );
             };
-            let saved = saved.ok_or("受理記録にはv2会話が必要です")?;
+            let saved = saved.ok_or("Admission records require a v2 conversation")?;
             let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
             let current = polaris_core::session_manager::SessionId::new(snapshot.state.session_id)
                 .map_err(|e| e.to_string())?;
             if !state_dir.join("tui-admissions-v1").exists() {
-                return Err("この会話に保存された受理記録はありません".into());
+                return Err("No admission records saved in this conversation".into());
             }
             let manager = polaris_core::desktop_store::SessionManagerStore::inspect_family_owned(
                 &state_dir.join("tui-admissions-v1"),
                 &current,
             )
             .map_err(|e| e.to_string())?
-            .ok_or("この会話に保存された受理記録はありません")?;
+            .ok_or("No admission records saved in this conversation")?;
             let id =
                 polaris_core::session_manager::AdmissionId::new(*id).map_err(|e| e.to_string())?;
             let admitted = manager.status(&id).map_err(|e| e.to_string())?;
@@ -528,21 +535,20 @@ async fn handle_runtime_command(
                 _ => None,
             };
             if admitted.parent_session != current && destination != Some(&current) {
-                return Err("この会話の受理記録ではありません".into());
+                return Err("This admission record does not belong to this conversation".into());
             }
             Ok(vec![render::sanitize(&format!(
-                "入力 {} / revision {} / 状態 {:?}",
+                "Input {} / revision {} / state {:?}",
                 admitted.id.as_str(),
                 admitted.revision,
                 admitted.state
             ))])
         }
-        "instruction" => {
-            Err("実行中instructionの永続ownerは接続中です。通常入力を使ってください".into())
-        }
+        "instruction" => Err(
+            "The persistent owner of the running instruction is connected. Use normal input".into(),
+        ),
         _ => Err(
-            "/subagents、/roles、/run settings|details、/sandbox、/input status を指定してください"
-                .into(),
+            "Specify /subagents, /roles, /run settings|details, /sandbox, or /input status".into(),
         ),
     }
 }
@@ -566,7 +572,10 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
         return None;
     }
     Some((|| {
-        let saved = session.persistence.as_ref().ok_or("v2保存会話が必要です")?;
+        let saved = session
+            .persistence
+            .as_ref()
+            .ok_or("A saved v2 conversation is required")?;
         let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
         let current =
             polaris_core::session_manager::SessionId::new(snapshot.state.session_id.clone())
@@ -588,7 +597,9 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
             )?;
             let id = handle.admission_id().as_str().to_owned();
             queue.push_back(handle);
-            return Ok(vec![format!("指示受理ID: {id}。次のrun境界で適用します")]);
+            return Ok(vec![format!(
+                "Instruction admission ID: {id}. Applied at the next run boundary"
+            )]);
         }
         let id = polaris_core::session_manager::AdmissionId::new(cancel.expect("cancel"))
             .map_err(|e| e.to_string())?;
@@ -597,14 +608,14 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
             .as_ref()
             .is_some_and(|item| item.admission_id() == &id);
         if position.is_none() && !is_active {
-            return Err("この会話の送信待ちIDではありません".into());
+            return Err("This is not a queued input ID for this conversation".into());
         }
         if !account::confirm(
             terminal,
             reader,
-            "送信待ち入力の取消",
+            "Cancel queued input",
             id.as_str(),
-            "このIDの未実行の指示だけを取り消します。",
+            "Cancel only the unexecuted instruction with this ID.",
         ) {
             let context = runtime_commands::RuntimeMutationContext {
                 effects,
@@ -614,7 +625,7 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 accepted: false,
             };
             runtime_effects::begin(&context, "D10", id.as_str().as_bytes())?;
-            return Ok(vec!["取消要求を取り消しました".into()]);
+            return Ok(vec!["Cancellation request cancelled".into()]);
         }
         let handle = if is_active {
             active.take().expect("active")
@@ -629,7 +640,7 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
             &activity,
             handle,
         )?;
-        Ok(vec![format!("入力 {} を取り消しました", id.as_str())])
+        Ok(vec![format!("Input {} cancelled", id.as_str())])
     })())
 }
 
@@ -766,7 +777,7 @@ fn ensure_history_backend(
     if matches!(mode, HistoryMode::Strict10 | HistoryMode::Structured10)
         && session.strict_history.is_none()
     {
-        let (history, usage) = factory.ok_or("履歴の埋め込み・要約backendがありません")?()?;
+        let (history, usage) = factory.ok_or("No history embedding or summarization backend")?()?;
         session.strict_history = Some(history);
         session.summary_usage = Some(usage);
     }
@@ -844,11 +855,11 @@ async fn restore_prepared_continuation_inner(
     ensure_history_backend(&mut candidate_session, mode, history_backend_factory)?;
     candidate_session
         .attach(continuation.persistence.clone())
-        .map_err(|error| format!("v2セッションを接続できません: {error}"))?;
+        .map_err(|error| format!("Cannot attach the v2 session: {error}"))?;
     candidate_session
         .recover_saved_history()
         .await
-        .map_err(|error| format!("保存済みの履歴を復元できません: {error}"))?;
+        .map_err(|error| format!("Cannot restore saved history: {error}"))?;
     #[cfg(target_os = "linux")]
     if signal::pending_linux_process_shutdown().is_some() {
         return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
@@ -860,7 +871,7 @@ async fn restore_prepared_continuation_inner(
     let (restored, needs_checkpoint) = continuation
         .persistence
         .prepare_workflow(config.clone())
-        .map_err(|error| format!("ワークフロー状態を復元できません: {error}"))?;
+        .map_err(|error| format!("Cannot restore workflow state: {error}"))?;
     let workflow = if workflow_mode_overridden {
         let mut candidate_config = restored.config.clone();
         candidate_config.enabled = config.enabled;
@@ -870,12 +881,12 @@ async fn restore_prepared_continuation_inner(
             restored.gates.clone(),
             restored.state(),
         )
-        .map_err(|error| format!("workflow設定を検証できません: {error}"))?;
+        .map_err(|error| format!("Cannot verify workflow settings: {error}"))?;
         if candidate.config.enabled {
             drop(
                 candidate
                     .begin_turn_from_disk(skills)
-                    .map_err(|error| format!("workflow設定を検証できません: {error}"))?,
+                    .map_err(|error| format!("Cannot verify workflow settings: {error}"))?,
             );
         }
         candidate
@@ -883,7 +894,9 @@ async fn restore_prepared_continuation_inner(
         restored
     };
     if workflow_mode_overridden {
-        return Err("workflow変更には管理操作の確認と記録が必要です".into());
+        return Err(
+            "Workflow changes require management operation confirmation and recording".into(),
+        );
     }
     let publication = if needs_checkpoint {
         #[cfg(target_os = "linux")]
@@ -891,7 +904,10 @@ async fn restore_prepared_continuation_inner(
             return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
         }
         if !allow_compat_checkpoint {
-            return Err("workflow互換状態の移行は管理操作の復旧後に行ってください".into());
+            return Err(
+                "Migrate workflow compatibility state after recovering management operations"
+                    .into(),
+            );
         }
         let mut candidate = before_workflow.state.clone();
         candidate.workflow_config = Some(
@@ -906,7 +922,7 @@ async fn restore_prepared_continuation_inner(
         let published = continuation
             .persistence
             .publish_workflow_change(before_workflow.state.generation, &before_hash, candidate)
-            .map_err(|error| format!("workflow設定を保存できません: {error}"))?;
+            .map_err(|error| format!("Cannot save workflow settings: {error}"))?;
         #[cfg(not(target_os = "linux"))]
         drop(published);
         Some(ContinuationWorkflowPublication {
@@ -983,7 +999,7 @@ async fn new_workflow_session(
         }
         session.workflow = Some(workflow);
     } else if initial_phase.is_some() {
-        return Err("--phase には設定で [workflow].enabled = true が必要です".into());
+        return Err("--phase requires [workflow].enabled = true in configuration".into());
     }
     // Production Unix input always needs the v2 admission owner, including
     // workflow opt-out with legacy history. Isolated caller tests can still
@@ -1113,8 +1129,8 @@ async fn select_tui_prompt(
     let (mut runtime, _) = request
         .host
         .runtime(session_id, run_id, request.ceiling)
-        .map_err(|error| (format!("MCPを準備できません: {error}"), false))?
-        .ok_or_else(|| ("MCPサーバーを利用できません".to_owned(), false))?;
+        .map_err(|error| (format!("Cannot prepare MCP: {error}"), false))?
+        .ok_or_else(|| ("MCP servers are unavailable".to_owned(), false))?;
     request
         .host
         .configure_preselection(&mut runtime, request.selector, None);
@@ -1129,15 +1145,15 @@ async fn select_tui_prompt(
             let unknown =
                 result.disposition == polaris_core::desktop_store::McpDisposition::OutcomeUnknown;
             let _ = runtime.shutdown().await;
-            Err(("MCP promptを確認できません".into(), unknown))
+            Err(("Cannot verify the MCP prompt".into(), unknown))
         }
         Ok(Err(error)) => {
             let _ = runtime.shutdown().await;
-            Err((format!("MCP promptを取得できません: {error}"), true))
+            Err((format!("Cannot retrieve the MCP prompt: {error}"), true))
         }
         Err(_) => {
             let _ = runtime.shutdown().await;
-            Err(("MCP prompt取得が時間切れです".into(), true))
+            Err(("MCP prompt retrieval timed out".into(), true))
         }
     }
 }
@@ -1184,7 +1200,7 @@ impl TuiAdmissionTurn {
             polaris_core::session_manager::AdmissionState::Running { run_id, .. } => {
                 Ok(run_id.as_str())
             }
-            _ => Err("sidechat runが実行中ではありません".into()),
+            _ => Err("The sidechat run is not active".into()),
         }
     }
 
@@ -1315,7 +1331,7 @@ fn open_tui_admission_owner(
     ),
     String,
 > {
-    Err("TUI sidechat admissionはこのplatformでは利用できません".into())
+    Err("TUI sidechat admission is unavailable on this platform".into())
 }
 
 fn persist_manager_transition(
@@ -1369,7 +1385,7 @@ pub fn recover_admission_owner(
                     match snapshot.state.admission_receipts.get(id.as_str()) {
                         Some(receipt) if receipt.payload_hash == admission.payload_hash => true,
                         Some(_) => {
-                            return Err("保存済みadmission receiptがpayloadと不一致です".into());
+                            return Err("Saved admission receipt does not match the payload".into());
                         }
                         None => false,
                     }
@@ -1430,7 +1446,7 @@ fn empty_sidechat_session(
     let previous = parent
         .persistence
         .as_ref()
-        .ok_or("sidechatにはv2セッションが必要です")?;
+        .ok_or("Sidechat requires a v2 session")?;
     let snapshot = previous.snapshot().map_err(|error| error.to_string())?;
     let mut next = polaris_core::session::Session::new();
     next.disable_files_md_auto_regenerate = parent.disable_files_md_auto_regenerate;
@@ -1493,7 +1509,7 @@ async fn admit_tui_input(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("sidechat自動振り分けにはv2セッションが必要です")?;
+        .ok_or("Automatic sidechat routing requires a v2 session")?;
     let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
     let current =
         SessionId::new(snapshot.state.session_id.clone()).map_err(|error| error.to_string())?;
@@ -1513,7 +1529,7 @@ async fn admit_tui_input(
     )?;
     if let Some(blocked) = manager.outcome_unknown_blocker(&current) {
         return Err(format!(
-            "入力 {} の実行状態が不明です。この会話では新しい入力を開始できません。/new で別会話を作成するか、保存状態を確認してください",
+            "The execution state of input {} is unknown. New input cannot start in this conversation. Create another with /new or inspect saved state",
             blocked.id.as_str()
         )
         .into());
@@ -1544,7 +1560,7 @@ async fn admit_tui_input(
         .submit(request, manager.revision)
         .map_err(|error| match error {
             polaris_core::session_manager::AdmissionError::Capacity(_) => {
-                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                "This conversation has insufficient storage capacity. Continue with /fork once processing is idle"
                     .to_owned()
             }
             _ => error.to_string(),
@@ -1577,7 +1593,7 @@ async fn admit_tui_input(
         .check_receipt_capacity(&receipts)
         .map_err(|error| match error {
             polaris_core::session_manager::AdmissionError::Capacity(_) => {
-                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                "This conversation has insufficient storage capacity. Continue with /fork once processing is idle"
                     .to_owned()
             }
             _ => error.to_string(),
@@ -1593,7 +1609,7 @@ async fn admit_tui_input(
         )
         .map_err(|error| match error {
             polaris_core::desktop_store::StoreError::Capacity(_) => {
-                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                "This conversation has insufficient storage capacity. Continue with /fork once processing is idle"
                     .to_owned()
             }
             _ => error.to_string(),
@@ -1636,13 +1652,13 @@ async fn admit_tui_input(
                 .map_err(|cancel_error| TuiAdmissionFailure::consumed(cancel_error.to_string()))?;
             persist_manager_transition(&store, before, &manager)
                 .map_err(TuiAdmissionFailure::consumed)?;
-            return Err(format!("sidechat destinationを準備できません: {error}").into());
+            return Err(format!("Cannot prepare the sidechat destination: {error}").into());
         }
     };
     persist_manager_transition(&store, before, &manager)?;
     let (destination, reason) = match &prepared.state {
         AdmissionState::DestinationReady { session_id, reason } => (session_id.clone(), *reason),
-        _ => return Err("sidechat destinationが確定しませんでした".into()),
+        _ => return Err("The sidechat destination was not finalized".into()),
     };
     let switched = destination != current;
     let mut sidechat = if switched {
@@ -1663,7 +1679,7 @@ async fn admit_tui_input(
             .cancel(&admission.id, before, saved.revision)
             .map_err(|cancel_error| cancel_error.to_string())?;
         persist_manager_transition(&store, before, &manager)?;
-        return Err(format!("routine authorityを接続できません: {error}").into());
+        return Err(format!("Cannot attach routine authority: {error}").into());
     }
     let mut selected_mcp_runtime = None;
     let selected_message = if let Some(request) = prompt_request {
@@ -1704,7 +1720,7 @@ async fn admit_tui_input(
         tool_memory_enabled,
     ) {
         Ok(boundary) => (boundary, None),
-        Err(error) => (None, Some(format!("巻き戻し保存を開始できません: {error}"))),
+        Err(error) => (None, Some(format!("Cannot start rewind storage: {error}"))),
     };
     let appended_now = match selected_message {
         Some(message) => destination_session.push_admitted_user_with_supplement(
@@ -1746,7 +1762,7 @@ async fn admit_tui_input(
         } if admission_id == &admission.id && session_id == &destination
     ) {
         return Err(TuiAdmissionFailure::consumed(format!(
-            "sidechat runを開始できません: {:?}",
+            "Cannot start the sidechat run: {:?}",
             queued.state
         )));
     }
@@ -1765,11 +1781,11 @@ async fn admit_tui_input(
         },
         match (switched, rewind_warning) {
             (true, Some(warning)) => Some(format!(
-                "sidechat {} に切り替えました ({reason:?}, running) · {warning}",
+                "Switched to sidechat {} ({reason:?}, running) · {warning}",
                 destination.as_str()
             )),
             (true, None) => Some(format!(
-                "sidechat {} に切り替えました ({reason:?}, running)",
+                "Switched to sidechat {} ({reason:?}, running)",
                 destination.as_str()
             )),
             (false, warning) => warning,
@@ -1961,7 +1977,7 @@ fn visible_rewind_memory_ids(
     origins.sort();
     origins.dedup();
     if origins.len() > MAX_TOOL_MEMORY_ORIGINS {
-        return Err(std::io::Error::other("記憶の系譜が上限を超えています"));
+        return Err(std::io::Error::other("Memory lineage exceeds the limit"));
     }
     let branch = persistence.store.rewind_branch_metadata()?;
     tool_memory::visible_tool_memory_raw_object_ids(
@@ -2053,13 +2069,13 @@ fn finish_rewind_for_session(
             if !capture_can_complete() {
                 return persistence.abandon_rewind_boundary(
                     &boundary.boundary_id,
-                    "停止要求を受けたため巻き戻し境界は未完了です".into(),
+                    "The rewind boundary is incomplete because a stop request was received".into(),
                 );
             }
             let reason = match crossing {
                 ManagementRewindCrossingV1::Clear => external_unknown,
                 ManagementRewindCrossingV1::Blocked { .. } => {
-                    Some("巻き戻せない管理操作が含まれています".into())
+                    Some("Includes management operations that cannot be rewound".into())
                 }
             };
             let (eligibility, effect) = match reason {
@@ -2083,7 +2099,7 @@ fn finish_rewind_for_session(
         }
         Err(error) => persistence.abandon_rewind_boundary(
             &boundary.boundary_id,
-            format!("ターン後の保存証拠を確認できません: {error}"),
+            format!("Cannot verify post-turn storage evidence: {error}"),
         ),
     }
 }
@@ -2207,7 +2223,7 @@ fn slash_completion_action(
 }
 
 const WINDOWS_OWNER_UNAVAILABLE: &str =
-    "Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。";
+    "Windows lacks the required execution and mutation protections. No changes were made.";
 
 fn require_turn_owner() -> Result<(), &'static str> {
     if cfg!(windows) {
@@ -2259,6 +2275,112 @@ fn apply_admitted_key(
     #[cfg(not(windows))]
     {
         Ok(apply_key(buffer, cursor, key))
+    }
+}
+
+fn apply_composer_paste(
+    buffer: &mut String,
+    cursor: &mut usize,
+    history: &mut input::History,
+    text: &str,
+) -> Result<bool, &'static str> {
+    if !composer_paste_is_allowed(buffer, *cursor, text) {
+        return Err("Secrets cannot be pasted into the normal input field");
+    }
+    let before = file_input::blocks(buffer).len();
+    file_input::insert_paste(buffer, cursor, text)?;
+    if redact_inline_secret_value(buffer, cursor, history) {
+        return Err("Secrets cannot be pasted into the normal input field");
+    }
+    Ok(file_input::blocks(buffer).len() > before)
+}
+
+// Classify borrowed characters before copying a paste into ordinary input.
+// The same safe MCP secret command forms as submission admission are allowed.
+fn composer_paste_is_allowed(buffer: &str, cursor: usize, text: &str) -> bool {
+    fn word_is<I: Iterator<Item = char>>(
+        chars: &mut std::iter::Peekable<I>,
+        expected: &str,
+    ) -> bool {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        for expected in expected.chars() {
+            if !chars
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
+            {
+                return false;
+            }
+        }
+        chars.peek().is_none_or(|c| c.is_whitespace())
+    }
+    let mut chars = buffer[..cursor]
+        .chars()
+        .chain(text.chars())
+        .chain(buffer[cursor..].chars())
+        .peekable();
+    if !word_is(&mut chars, "/mcp") || !word_is(&mut chars, "secret") {
+        return true;
+    }
+    let mut set = chars.clone();
+    if word_is(&mut set, "set") && set.all(char::is_whitespace) {
+        return true;
+    }
+    if word_is(&mut chars, "delete") {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut has_reference = false;
+        while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+            chars.next();
+            has_reference = true;
+        }
+        return has_reference && chars.all(char::is_whitespace);
+    }
+    false
+}
+
+#[cfg(test)]
+mod composer_paste_tests {
+    use super::*;
+
+    #[test]
+    fn paste_inserts_without_submitting_and_preserves_secret_redaction() {
+        let mut buffer = "before ".to_owned();
+        let mut cursor = buffer.len();
+        let mut history = input::History::new();
+        assert!(
+            !apply_composer_paste(&mut buffer, &mut cursor, &mut history, "日本語\ntext").unwrap()
+        );
+        assert_eq!(buffer, "before 日本語\ntext");
+        assert_eq!(cursor, buffer.len());
+        buffer = "/mcp secret set dummy ".into();
+        cursor = buffer.len();
+        let before = buffer.clone();
+        assert!(
+            apply_composer_paste(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                "dummy-only-not-a-credential"
+            )
+            .is_err()
+        );
+        assert!(!buffer.contains("dummy-only-not-a-credential"));
+        assert_eq!(buffer, before);
+        assert_eq!(cursor, buffer.len());
+        for (prefix, paste, expected) in [
+            ("/mcp sec", "ret set", true),
+            ("/mcp sec", "ret set dummy-value", false),
+            ("", "/mcp secret set", true),
+            ("", "/mcp secret delete reference", true),
+        ] {
+            assert_eq!(
+                composer_paste_is_allowed(prefix, prefix.len(), paste),
+                expected
+            );
+        }
     }
 }
 
@@ -2438,7 +2560,7 @@ fn refuse_quit_with_pending_work(
             *input_cursor = input_buffer.len();
         }
     }
-    *status = Status::Notice("送信待ち・下書きを処理してから /quit を実行してください".into());
+    *status = Status::Notice("Handle queued input and drafts before running /quit".into());
     true
 }
 
@@ -2543,8 +2665,10 @@ fn draw_submission_preview<E>(
     text: &str,
     draw: impl FnOnce(&[render::HistoryLine], &mut render::HistoryWrapCache, &Status) -> Result<(), E>,
 ) -> Result<(), E> {
-    let previous_status =
-        std::mem::replace(status, Status::Notice("送信準備中（未受理）".to_owned()));
+    let previous_status = std::mem::replace(
+        status,
+        Status::Notice("Preparing send (not admitted)".to_owned()),
+    );
     let result = conversation_view
         .with_temporary_user_input(text, |preview, cache| draw(preview, cache, status));
     *status = previous_status;
@@ -2649,14 +2773,16 @@ fn open_rewind_workspace(
         &state_dir.join("rewind-workspace"),
         RewindLimits::default(),
     )
-    .map_err(|error| format!("巻き戻し保存先を検証できません: {error}"))?;
+    .map_err(|error| format!("Cannot verify rewind storage: {error}"))?;
     match owner.resolve_pending() {
         Ok(ResolveOutcome::Clean) => Ok(owner),
         Ok(ResolveOutcome::RolledBack(_)) => Err(
-            "巻き戻し途中のファイルを復旧しました。設定を読み直すためPolarisを再起動してください。"
+            "Recovered files from an interrupted rewind. Restart Polaris to reload settings."
                 .into(),
         ),
-        Err(error) => Err(format!("巻き戻し途中の復旧を確認できません: {error}")),
+        Err(error) => Err(format!(
+            "Cannot verify recovery from an interrupted rewind: {error}"
+        )),
     }
 }
 
@@ -2673,7 +2799,7 @@ fn show_persisted_read_only_resume<B: ratatui::backend::Backend, R: approver::Ke
         .into_iter()
         .map(|event| event.message)
         .collect::<Vec<_>>();
-    let source = format!("保存会話（閲覧のみ）: {reason}");
+    let source = format!("Saved conversation (view only): {reason}");
     show_read_only_transcript(terminal, reader, &messages, &source);
     Ok(())
 }
@@ -2932,7 +3058,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
 
     #[cfg(target_os = "linux")]
     if let Err(error) = source_apply::prepare_state(&args.cwd, &args.state_dir) {
-        eprintln!("保存先を準備できません: {error}");
+        eprintln!("Cannot prepare storage: {error}");
         return ExitCode::FAILURE;
     }
 
@@ -2950,7 +3076,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     && let Err(viewer_error) =
                         show_startup_read_only_resume(&continuation.persistence, &error)
                 {
-                    eprintln!("保存会話を閲覧できません: {viewer_error}");
+                    eprintln!("Cannot view the saved conversation: {viewer_error}");
                 }
                 eprintln!("{error}");
                 return ExitCode::FAILURE;
@@ -2969,7 +3095,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         let lease = match owner.try_mutation() {
             Ok(lease) => lease,
             Err(error) => {
-                eprintln!("管理操作の復旧を開始できません: {error}");
+                eprintln!("Cannot start management operation recovery: {error}");
                 return ExitCode::FAILURE;
             }
         };
@@ -2982,18 +3108,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             ) {
                 Ok(store) => store,
                 Err(error) => {
-                    eprintln!("管理操作の記録を復旧できません: {error}");
+                    eprintln!("Cannot recover management operation records: {error}");
                     return ExitCode::FAILURE;
                 }
             };
         let Some(data_root) = args.sessions_dir.parent() else {
-            eprintln!("v2セッションの保存先を特定できません");
+            eprintln!("Cannot locate v2 session storage");
             return ExitCode::FAILURE;
         };
         let project_id = match persist::project_identity(&project_root) {
             Ok(project_id) => project_id,
             Err(error) => {
-                eprintln!("プロジェクト識別子を取得できません: {error}");
+                eprintln!("Cannot retrieve the project identifier: {error}");
                 return ExitCode::FAILURE;
             }
         };
@@ -3007,7 +3133,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             &args.state_dir.join("memory.sqlite3"),
             &project_id,
         ) {
-            eprintln!("会話切替の証拠を復旧できません: {error}");
+            eprintln!("Cannot recover conversation switch evidence: {error}");
             return ExitCode::FAILURE;
         }
         let workflow_owner =
@@ -3032,16 +3158,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             ) {
                 Ok(value) => value.map(|effect| {
                     format!(
-                        "未解決の管理操作 {} ({}) があります。新しい入力は開始できません{}",
+                        "Unresolved management operation {} ({}). New input cannot start{}",
                         effect.request.operation_id,
                         effect.request.inventory,
                         recovery_issue
                             .as_ref()
-                            .map(|reason| format!("。復旧理由: {reason}"))
+                            .map(|reason| format!(". Recovery reason: {reason}"))
                             .unwrap_or_default()
                     )
                 }),
-                Err(error) => Some(format!("管理・同期の状態を確認できません: {error}")),
+                Err(error) => Some(format!("Cannot verify management and sync state: {error}")),
             };
         (store, recovery_issue, blocker)
     };
@@ -3051,9 +3177,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if management_startup_blocker.is_none()
             && let Err(error) = continuation
                 .persistence
-                .abandon_unfinished_rewind_boundaries("前回の実行が完了する前に終了しました".into())
+                .abandon_unfinished_rewind_boundaries(
+                    "The previous execution exited before completion".into(),
+                )
         {
-            eprintln!("未完了の巻き戻し境界を確認できません: {error}");
+            eprintln!("Cannot verify the incomplete rewind boundary: {error}");
             return ExitCode::FAILURE;
         }
         if let Some(owner) = &rewind_workspace
@@ -3062,9 +3190,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             if let Err(viewer_error) =
                 show_startup_read_only_resume(&continuation.persistence, &error)
             {
-                eprintln!("保存会話を閲覧できません: {viewer_error}");
+                eprintln!("Cannot view the saved conversation: {viewer_error}");
             }
-            eprintln!("保存済み会話の作業ファイルを確認できません: {error}");
+            eprintln!("Cannot verify workspace files for the saved conversation: {error}");
             return ExitCode::FAILURE;
         }
     }
@@ -3140,7 +3268,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         .is_some_and(|continuation| continuation.kind == ContinuationKind::Resume)
         && let Err(error) = session.recover_history().await
     {
-        eprintln!("strict10履歴を復元できません: {error}");
+        eprintln!("Cannot restore strict10 history: {error}");
         return ExitCode::FAILURE;
     }
     #[cfg(target_os = "linux")]
@@ -3156,7 +3284,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             match workflow_override_candidate(&session, &args.workflow_config, &effective_skills) {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    eprintln!("workflow変更を検証できません: {error}");
+                    eprintln!("Cannot verify the workflow change: {error}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -3188,7 +3316,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         );
         #[cfg(target_os = "linux")]
         if let Some(error) = startup_terminal_error.into_inner() {
-            eprintln!("workflow確認画面を復旧できません: {error}");
+            eprintln!("Cannot recover the workflow confirmation screen: {error}");
             return ExitCode::FAILURE;
         }
         match workflow_change {
@@ -3198,11 +3326,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 if let Some(code) = linux_pending_exit_code() {
                     return code;
                 }
-                eprintln!("workflow変更を取り消しました");
+                eprintln!("Workflow change cancelled");
                 return ExitCode::FAILURE;
             }
             Err(error) => {
-                eprintln!("workflow変更を保存できません: {error}");
+                eprintln!("Cannot save the workflow change: {error}");
                 return ExitCode::FAILURE;
             }
         }
@@ -3304,7 +3432,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
-        ratatui::crossterm::event::EnableMouseCapture
+        ratatui::crossterm::event::EnableMouseCapture,
+        ratatui::crossterm::event::EnableBracketedPaste
     );
     // A thin bar cursor, not the terminal's default (usually a full
     // blinking block) — a block cursor fully inverts whatever glyph sits
@@ -3388,7 +3517,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
     };
     #[cfg(unix)]
-    let mut rewind_unavailable_reason = "まだ保存済みの巻き戻し境界がありません".to_owned();
+    let mut rewind_unavailable_reason = "No saved rewind boundaries yet".to_owned();
     let mut exit_confirmation = ExitConfirmation::default();
     let mut rewind_gesture = rewind_ui::DoubleEscape::default();
     #[cfg(not(target_os = "linux"))]
@@ -3444,7 +3573,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         ) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("初期設定を確認できません: {error}");
+                eprintln!("Cannot verify initial settings: {error}");
                 return ExitCode::FAILURE;
             }
         };
@@ -3468,7 +3597,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         {
             Ok(pair) => pair,
             Err(error) => {
-                eprintln!("初期埋め込み設定を確認できません: {error}");
+                eprintln!("Cannot verify initial embedding settings: {error}");
                 return ExitCode::FAILURE;
             }
         };
@@ -3567,7 +3696,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             continue;
         }
         if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
-            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+            status = Status::Error("Secrets cannot be entered in the normal input field".into());
         }
         // `/new`, `/fork`, and `/resume` replace the conversation owner.
         // Reattach process-owned services and selectors before accepting the
@@ -3680,7 +3809,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
         };
         if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
-            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+            status = Status::Error("Secrets cannot be entered in the normal input field".into());
         }
         #[cfg(unix)]
         let memory_activation =
@@ -3794,6 +3923,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             ))
         } else {
             loop {
+                if !is_secret_command(&input_buffer)
+                    && file_input::may_have_tail(&input_buffer, input_cursor)
+                    && !ratatui::crossterm::event::poll(Duration::from_millis(40)).unwrap_or(true)
+                    && file_input::normalize_tail(&mut input_buffer, &mut input_cursor)
+                {
+                    status = Status::Notice("File link inserted".into());
+                    continue 'outer;
+                }
                 #[cfg(target_os = "linux")]
                 let candidate = match linux_read_idle_event_with(
                     |duration| {
@@ -3815,8 +3952,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     &management_effects,
                                     &draft_candidate,
                                 ) {
-                                    fatal_message =
-                                        Some(format!("下書きを保存できません: {error}"));
+                                    fatal_message = Some(format!("Cannot save the draft: {error}"));
                                     return Err(std::io::Error::other(error));
                                 }
                                 draft_saved_text = draft_candidate.clone();
@@ -3838,8 +3974,29 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     Ok(e) => e,
                     Err(_) => break 'outer ExitCode::FAILURE,
                 };
+                #[cfg(target_os = "macos")]
+                if !matches!(&candidate, ratatui::crossterm::event::Event::Mouse(_)) {
+                    conversation_view.file_click.cancel();
+                }
                 if let ratatui::crossterm::event::Event::Mouse(mouse) = &candidate {
                     exit_confirmation.cancel();
+                    #[cfg(target_os = "macos")]
+                    if let Some(notice) = reveal_history_file(
+                        &mut conversation_view,
+                        *mouse,
+                        &args.cwd,
+                        ratatui::layout::Rect::new(
+                            0,
+                            0,
+                            terminal_width(&terminal),
+                            area_height_for_history(
+                                render::footer_height(suggestions.len()),
+                                terminal_height(&terminal),
+                            ),
+                        ),
+                    ) {
+                        status = notice;
+                    }
                     use ratatui::crossterm::event::MouseEventKind;
                     match mouse.kind {
                         MouseEventKind::Moved => continue,
@@ -3971,11 +4128,42 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
             conversation_view.selection = None;
         }
-        let ratatui::crossterm::event::Event::Key(key) = event else {
-            continue;
+        let key = match event {
+            ratatui::crossterm::event::Event::Key(key) => key,
+            ratatui::crossterm::event::Event::Paste(mut text) => {
+                let result = apply_composer_paste(
+                    &mut input_buffer,
+                    &mut input_cursor,
+                    &mut input_history,
+                    &text,
+                );
+                zeroize::Zeroize::zeroize(&mut text);
+                match result {
+                    Ok(true) => status = Status::Notice("File link inserted".into()),
+                    Err(error) => status = Status::Error(error.into()),
+                    _ => {}
+                }
+                continue;
+            }
+            _ => continue,
         };
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press
+            && !is_secret_command(&input_buffer)
+            && matches!(
+                key.code,
+                ratatui::crossterm::event::KeyCode::Backspace
+                    | ratatui::crossterm::event::KeyCode::Delete
+                    | ratatui::crossterm::event::KeyCode::Left
+                    | ratatui::crossterm::event::KeyCode::Right
+                    | ratatui::crossterm::event::KeyCode::Enter
+                    | ratatui::crossterm::event::KeyCode::Up
+                    | ratatui::crossterm::event::KeyCode::Down
+            )
+        {
+            file_input::normalize_tail(&mut input_buffer, &mut input_cursor);
+        }
         if secret_value_key_is_blocked(&input_buffer, &key) {
-            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+            status = Status::Error("Secrets cannot be entered in the normal input field".into());
             continue;
         }
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press
@@ -3992,12 +4180,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             if key.code == KeyCode::Esc {
                 if !input_buffer.is_empty() || has_pending_inputs || dispatching_queued_input {
                     rewind_gesture.cancel();
-                    status =
-                        Status::Notice("入力欄と送信待ちを空にしてから巻き戻してください".into());
+                    status = Status::Notice(
+                        "Clear the input field and queued input before rewinding".into(),
+                    );
                     continue;
                 }
                 if !rewind_gesture.press(Instant::now()) {
-                    status = Status::Notice("もう一度Escを押すと巻き戻し候補を開きます".into());
+                    status = Status::Notice("Press Esc again to open rewind candidates".into());
                     continue;
                 }
                 #[cfg(unix)]
@@ -4023,7 +4212,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Ok(selection) => selection,
                         Err(error) => {
                             status =
-                                Status::Error(format!("巻き戻し候補を確認できません: {error}"));
+                                Status::Error(format!("Cannot verify rewind candidates: {error}"));
                             continue;
                         }
                     };
@@ -4076,8 +4265,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 width,
                             );
                             status = Status::Notice(format!(
-                                "入力「{}」の直前へ巻き戻しました。元の会話は保存されています。",
-                                boundary.user_message_preview.as_deref().unwrap_or("不明")
+                                "Rewound to before input \"{}\". The original conversation is saved.",
+                                boundary
+                                    .user_message_preview
+                                    .as_deref()
+                                    .unwrap_or("unknown")
                             ));
                         }
                         Err(error) if error.fatal => {
@@ -4094,7 +4286,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 }
                 #[cfg(not(unix))]
                 {
-                    status = Status::Notice("この環境ではファイル巻き戻しを利用できません".into());
+                    status =
+                        Status::Notice("File rewind is unavailable in this environment".into());
                     continue;
                 }
             }
@@ -4181,32 +4374,24 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         #[cfg(target_os = "linux")]
                         slash::Action::WorkspaceControl(request) => {
                             let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));
-                            let result = if verb == "models" {
-                                model_inventory_read_lines(extra).await
-                            } else {
-                                match workspace_commands.as_ref() {
-                                    Ok(owner) => match verb {
-                                        "browse" => owner.browse(extra),
-                                        "attachment" => owner.attachment(extra),
-                                        "recipe" => workspace_commands::recipes(extra),
-                                        "setting" => owner.setting(
-                                            extra,
-                                            &terminal,
-                                            &mut key_reader,
-                                            rewind_workspace.as_ref().expect("startup owner"),
-                                            &management_effects,
-                                            has_pending_inputs,
-                                        ),
-                                        "handoff" => owner.handoff(extra),
-                                        _ => Err("対象の操作はありません".into()),
-                                    },
-                                    Err(error) => Err(error.clone()),
-                                }
+                            let result = match workspace_commands.as_ref() {
+                                Ok(owner) => match verb {
+                                    "setting" => owner.setting(
+                                        extra,
+                                        &terminal,
+                                        &mut key_reader,
+                                        rewind_workspace.as_ref().expect("startup owner"),
+                                        &management_effects,
+                                        has_pending_inputs,
+                                    ),
+                                    _ => Err("No target operation".into()),
+                                },
+                                Err(error) => Err(error.clone()),
                             };
                             match result {
                                 Ok(lines) => {
                                     local_lines.extend(lines);
-                                    status = Status::Notice("読み取り結果を表示しました".into());
+                                    status = Status::Notice("Read result displayed".into());
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4231,7 +4416,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             match result {
                                 Ok(lines) => {
                                     local_lines.extend(lines);
-                                    status = Status::Notice("決定記録の結果を表示しました".into());
+                                    status =
+                                        Status::Notice("Decision record result displayed".into());
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4257,9 +4443,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             match result {
                                 Ok(lines) => {
                                     if matches!(operation, slash::Action::Clear)
-                                        && lines
-                                            .iter()
-                                            .any(|line| line.to_string().starts_with("T08 完了"))
+                                        && lines.iter().any(|line| {
+                                            line.to_string().starts_with("T08 complete")
+                                        })
                                     {
                                         local_lines.clear();
                                         let width =
@@ -4277,7 +4463,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         );
                                     }
                                     local_lines.extend(lines);
-                                    status = Status::Notice("管理操作の結果を表示しました".into());
+                                    status = Status::Notice(
+                                        "Management operation result displayed".into(),
+                                    );
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4301,8 +4489,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         local_lines.extend(
                                             lines.into_iter().map(ratatui::text::Line::from),
                                         );
-                                        status =
-                                            Status::Notice("受理入力の結果を表示しました".into());
+                                        status = Status::Notice(
+                                            "Admitted input result displayed".into(),
+                                        );
                                     }
                                     Err(error) => {
                                         queued_inputs_paused = true;
@@ -4328,9 +4517,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     Ok(lines) => {
                                         local_lines.extend(lines);
                                         refresh_saved_settings = true;
-                                        status = Status::Notice(
-                                            "role bindingの結果を表示しました".into(),
-                                        );
+                                        status =
+                                            Status::Notice("Role binding result displayed".into());
                                     }
                                     Err(error) => status = Status::Error(error),
                                 }
@@ -4350,7 +4538,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     Ok(lines) => {
                                         local_lines.extend(lines);
                                         status = Status::Notice(
-                                            "sandboxの実行結果を表示しました".into(),
+                                            "Sandbox execution result displayed".into(),
                                         );
                                     }
                                     Err(error) => status = Status::Error(error),
@@ -4374,7 +4562,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 Ok(lines) => {
                                     local_lines
                                         .extend(lines.into_iter().map(ratatui::text::Line::from));
-                                    status = Status::Notice("実行状態を表示しました".into());
+                                    status = Status::Notice("Execution state displayed".into());
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4409,7 +4597,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             match result {
                                 Ok(lines) => {
                                     local_lines.extend(lines);
-                                    status = Status::Notice("認証操作の結果を表示しました".into());
+                                    status = Status::Notice(
+                                        "Authentication operation result displayed".into(),
+                                    );
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4418,6 +4608,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         slash::Action::Status => {
                             local_lines.extend(status_lines(StatusSnapshot {
                                 session: &session,
+                                session_path: Some(&session_path),
+                                accounts: account_list_lines(),
+                                #[cfg(unix)]
+                                binding: args.account_binding.as_deref(),
                                 provider_name: &provider_name,
                                 model_name: &model_name,
                                 usage_report: usage_meter.snapshot(),
@@ -4444,7 +4638,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 .into_iter()
                                 .map(ratatui::text::Line::from),
                             );
-                            status = Status::Notice("状態を表示しました".into());
+                            status = Status::Notice("Status displayed".into());
                             continue;
                         }
                         slash::Action::Doctor => {
@@ -4470,7 +4664,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &args.sessions_dir,
                                 &args.cwd,
                             ));
-                            status = Status::Notice("診断結果を表示しました".into());
+                            status = Status::Notice("Diagnostic results displayed".into());
                             continue;
                         }
                         slash::Action::Review(extra) => {
@@ -4714,7 +4908,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     }) {
                                     Ok(job) => {
                                         pending_c10_job = Some(job);
-                                        status = Status::Notice("C10操作を開始しました".into());
+                                        status = Status::Notice("C10 operation started".into());
                                     }
                                     Err(error) => {
                                         record_c10_result(Err(error), &mut status, &mut local_lines)
@@ -4898,7 +5092,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         || active_instruction.is_some()
                                     {
                                         status = Status::Notice(
-                                            "受理済みの指示を処理・取消してから終了してください"
+                                            "Process or cancel admitted instructions before exiting"
                                                 .into(),
                                         );
                                         continue;
@@ -5048,7 +5242,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut input_cursor,
                         &mut input_history,
                     ) {
-                        status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+                        status = Status::Error(
+                            "Secrets cannot be entered in the normal input field".into(),
+                        );
                     }
                     continue;
                 }
@@ -5080,7 +5276,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                     };
                     if refuse_secret_submission(&mut text, local_secret_owner_available) {
-                        status = Status::Error("秘密情報を通常の入力や送信待ちに渡せません".into());
+                        status = Status::Error(
+                            "Secrets cannot be passed to normal or queued input".into(),
+                        );
                         continue;
                     }
                     if !dispatching_queued_input && submission_resumes_queued_inputs(&text) {
@@ -5173,32 +5371,24 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 #[cfg(target_os = "linux")]
                 Some(slash::Action::WorkspaceControl(request)) => {
                     let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));
-                    let result = if verb == "models" {
-                        model_inventory_read_lines(extra).await
-                    } else {
-                        match workspace_commands.as_ref() {
-                            Ok(owner) => match verb {
-                                "browse" => owner.browse(extra),
-                                "attachment" => owner.attachment(extra),
-                                "recipe" => workspace_commands::recipes(extra),
-                                "setting" => owner.setting(
-                                    extra,
-                                    &terminal,
-                                    &mut key_reader,
-                                    rewind_workspace.as_ref().expect("startup owner"),
-                                    &management_effects,
-                                    has_pending_inputs,
-                                ),
-                                "handoff" => owner.handoff(extra),
-                                _ => Err("対象の操作はありません".into()),
-                            },
-                            Err(error) => Err(error.clone()),
-                        }
+                    let result = match workspace_commands.as_ref() {
+                        Ok(owner) => match verb {
+                            "setting" => owner.setting(
+                                extra,
+                                &terminal,
+                                &mut key_reader,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                has_pending_inputs,
+                            ),
+                            _ => Err("No target operation".into()),
+                        },
+                        Err(error) => Err(error.clone()),
                     };
                     match result {
                         Ok(lines) => {
                             local_lines.extend(lines);
-                            status = Status::Notice("読み取り結果を表示しました".into());
+                            status = Status::Notice("Read result displayed".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5224,7 +5414,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     match result {
                         Ok(lines) => {
                             local_lines.extend(lines);
-                            status = Status::Notice("決定記録の結果を表示しました".into());
+                            status = Status::Notice("Decision record result displayed".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5254,7 +5444,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             if matches!(operation, slash::Action::Clear)
                                 && lines
                                     .iter()
-                                    .any(|line| line.to_string().starts_with("T08 完了"))
+                                    .any(|line| line.to_string().starts_with("T08 complete"))
                             {
                                 local_lines.clear();
                                 let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
@@ -5271,7 +5461,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 );
                             }
                             local_lines.extend(lines);
-                            status = Status::Notice("管理操作の結果を表示しました".into());
+                            status = Status::Notice("Management operation result displayed".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5294,7 +5484,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             Ok(lines) => {
                                 local_lines
                                     .extend(lines.into_iter().map(ratatui::text::Line::from));
-                                status = Status::Notice("受理入力の結果を表示しました".into());
+                                status = Status::Notice("Admitted input result displayed".into());
                             }
                             Err(error) => {
                                 queued_inputs_paused = true;
@@ -5320,7 +5510,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             Ok(lines) => {
                                 local_lines.extend(lines);
                                 refresh_saved_settings = true;
-                                status = Status::Notice("role bindingの結果を表示しました".into());
+                                status = Status::Notice("Role binding result displayed".into());
                             }
                             Err(error) => status = Status::Error(error),
                         }
@@ -5339,7 +5529,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         ) {
                             Ok(lines) => {
                                 local_lines.extend(lines);
-                                status = Status::Notice("sandboxの実行結果を表示しました".into());
+                                status =
+                                    Status::Notice("Sandbox execution result displayed".into());
                             }
                             Err(error) => status = Status::Error(error),
                         }
@@ -5361,7 +5552,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     match result {
                         Ok(lines) => {
                             local_lines.extend(lines.into_iter().map(ratatui::text::Line::from));
-                            status = Status::Notice("実行状態を表示しました".into());
+                            status = Status::Notice("Execution state displayed".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5396,7 +5587,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     match result {
                         Ok(lines) => {
                             local_lines.extend(lines);
-                            status = Status::Notice("認証操作の結果を表示しました".into());
+                            status =
+                                Status::Notice("Authentication operation result displayed".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5405,6 +5597,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 Some(slash::Action::Status) => {
                     local_lines.extend(status_lines(StatusSnapshot {
                         session: &session,
+                        session_path: Some(&session_path),
+                        accounts: account_list_lines(),
+                        #[cfg(unix)]
+                        binding: args.account_binding.as_deref(),
                         provider_name: &provider_name,
                         model_name: &model_name,
                         usage_report: usage_meter.snapshot(),
@@ -5431,7 +5627,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         .into_iter()
                         .map(ratatui::text::Line::from),
                     );
-                    status = Status::Notice("状態を表示しました".into());
+                    status = Status::Notice("Status displayed".into());
                     continue;
                 }
                 Some(slash::Action::Doctor) => {
@@ -5456,7 +5652,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &args.sessions_dir,
                         &args.cwd,
                     ));
-                    status = Status::Notice("診断結果を表示しました".into());
+                    status = Status::Notice("Diagnostic results displayed".into());
                     continue;
                 }
                 Some(slash::Action::Mcp(requested))
@@ -5465,13 +5661,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     if requested == "prompt cancel" {
                         pending_mcp_prompt = None;
                         mcp_prompt_requires_reselect = false;
-                        status = Status::Notice("MCP prompt選択を取り消しました".into());
+                        status = Status::Notice("MCP prompt selection cancelled".into());
                         continue;
                     }
                     match mcp_prompt_choice(&requested) {
                         Ok(choice) => {
                             status = Status::Notice(format!(
-                                "次の入力でMCP prompt {}/{} を選択します",
+                                "MCP prompt {}/{} will be selected for the next input",
                                 render::sanitize(&choice.server),
                                 render::sanitize(&choice.prompt)
                             ));
@@ -5718,7 +5914,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             }) {
                             Ok(job) => {
                                 pending_c10_job = Some(job);
-                                status = Status::Notice("C10操作を開始しました".into());
+                                status = Status::Notice("C10 operation started".into());
                             }
                             Err(error) => {
                                 record_c10_result(Err(error), &mut status, &mut local_lines)
@@ -5891,7 +6087,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             #[cfg(unix)]
                             if !queued_instructions.is_empty() || active_instruction.is_some() {
                                 status = Status::Notice(
-                                    "受理済みの指示を処理・取消してから終了してください".into(),
+                                    "Process or cancel admitted instructions before exiting".into(),
                                 );
                                 continue;
                             }
@@ -5994,7 +6190,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             ) {
                 input_buffer = text;
                 input_cursor = input_buffer.len();
-                status = Status::Error(format!("下書きの送信準備を保存できません: {error}"));
+                status = Status::Error(format!("Cannot save draft send preparation: {error}"));
                 continue;
             }
             draft_saved_text.clear();
@@ -6008,19 +6204,19 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Ok(id) => Some(id.to_string()),
                         Err(error) => {
                             rewind_unavailable_reason =
-                                format!("この入力のファイル保存を作成できません: {error}");
+                                format!("Cannot create a file snapshot for this input: {error}");
                             None
                         }
                     }
                 }
                 None => {
                     rewind_unavailable_reason =
-                        "この作業場所はファイル巻き戻しの対象外です".to_owned();
+                        "This workspace is not eligible for file rewind".to_owned();
                     None
                 }
             }
         } else {
-            rewind_unavailable_reason = "この会話は保存済みv2セッションではありません".to_owned();
+            rewind_unavailable_reason = "This conversation is not a saved v2 session".to_owned();
             None
         };
         #[cfg(not(unix))]
@@ -6039,7 +6235,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 }
             };
             match acquired {
-                Ok(lease) => lease,
+                Ok(lease) => std::sync::Arc::new(lease),
                 Err(error) => {
                     if dispatching_queued_input {
                         queued_inputs.push_front(text);
@@ -6049,7 +6245,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         input_cursor = input_buffer.len();
                     }
                     status = Status::Error(format!(
-                        "作業場所が他の処理に使われているため、この入力を開始できません: {error}"
+                        "Cannot start this input because the workspace is in use: {error}"
                     ));
                     continue;
                 }
@@ -6071,7 +6267,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     input_cursor = input_buffer.len();
                 }
                 status = Status::Error(format!(
-                    "未解決の管理操作 {} ({}) があります。復旧前に新しい入力は開始できません",
+                    "Unresolved management operation {} ({}). New input cannot start before recovery",
                     effect.request.operation_id, effect.request.inventory
                 ));
                 continue;
@@ -6085,7 +6281,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     input_buffer = text;
                     input_cursor = input_buffer.len();
                 }
-                status = Status::Error(format!("管理操作の状態を確認できません: {error}"));
+                status =
+                    Status::Error(format!("Cannot verify management operation state: {error}"));
                 continue;
             }
         }
@@ -6094,7 +6291,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if let Some(persistence) = session.persistence.as_ref() {
             let admission = rewind_workspace
                 .as_ref()
-                .ok_or_else(|| "作業ファイルの検証ownerがありません".to_string())
+                .ok_or_else(|| "No workspace file verification owner".to_string())
                 .and_then(|owner| {
                     let branch =
                         polaris_core::rewind_admission::published_branch(owner, &persistence.store)
@@ -6112,7 +6309,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     input_buffer = text;
                     input_cursor = input_buffer.len();
                 }
-                status = Status::Error(format!("会話の実行許可を確認できません: {error}"));
+                status = Status::Error(format!(
+                    "Cannot verify conversation execution permission: {error}"
+                ));
                 continue;
             }
         }
@@ -6121,11 +6320,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if let (Some(owner), Some(id)) = (rewind_workspace.as_ref(), &rewind_pre_manifest_id) {
             let matches = id
                 .parse()
-                .map_err(|error| format!("保存した作業木IDが不正です: {error}"))
+                .map_err(|error| format!("Invalid saved worktree ID: {error}"))
                 .and_then(|manifest| {
                     owner
                         .matches_manifest(&manifest)
-                        .map_err(|error| format!("作業木を照合できません: {error}"))
+                        .map_err(|error| format!("Cannot reconcile the worktree: {error}"))
                 });
             if !matches.is_ok_and(|matches| matches) {
                 if dispatching_queued_input {
@@ -6136,7 +6335,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     input_cursor = input_buffer.len();
                 }
                 status = Status::Error(
-                    "入力準備中に作業ファイルが変更されました。再送前に状態を確認してください"
+                    "Workspace files changed during input preparation. Inspect state before resending"
                         .into(),
                 );
                 continue;
@@ -6152,7 +6351,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 input_cursor = input_buffer.len();
             }
             status = Status::Error(
-                "MCP promptの選択結果が不明です。/mcp prompt で再選択するか /mcp prompt cancel で取り消してください"
+                "MCP prompt selection outcome is unknown. Reselect with /mcp prompt or cancel with /mcp prompt cancel"
                     .into(),
             );
             continue;
@@ -6166,9 +6365,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 input_cursor = input_buffer.len();
             }
             status = Status::Error(if session.persistence.is_none() {
-                "MCP promptにはv2会話が必要です。会話を移行してから選択してください".into()
+                "MCP prompts require a v2 conversation. Migrate the conversation before selecting"
+                    .into()
             } else {
-                "MCPサーバーを利用できません。入力は開始していません".into()
+                "MCP servers are unavailable. Input was not started".into()
             });
             continue;
         }
@@ -6192,7 +6392,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 session
                     .persistence
                     .as_ref()
-                    .ok_or("保存済み指示の会話がありません")?;
+                    .ok_or("No conversation for the saved instruction")?;
                 let (store, mut manager) =
                     open_tui_admission_owner(&args.state_dir, instruction.parent_session())?;
                 instruction_commands::preflight(&manager, &session, &instruction)?;
@@ -6212,7 +6412,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 let current = session
                     .persistence
                     .as_ref()
-                    .ok_or("保存済み指示の会話がありません")?
+                    .ok_or("No conversation for the saved instruction")?
                     .snapshot()
                     .map_err(|e| e.to_string())?
                     .state
@@ -6221,7 +6421,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     || applied.run_id
                         != polaris_core::session_manager::RunId::derive(&applied.admission_id)
                 {
-                    return Err("保存済み指示の実行先と受理記録が一致しません".into());
+                    return Err(
+                        "Saved instruction destination and admission record mismatch".into(),
+                    );
                 }
                 Ok(TuiAdmissionTurn {
                     store,
@@ -6233,7 +6435,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 Ok(admission) => tui_admission = Some(admission),
                 Err(error) => {
                     fatal_message = Some(format!(
-                        "指示の適用を確認できません。再送せず復旧してください: {error}"
+                        "Cannot verify instruction application. Do not resend; recover first: {error}"
                     ));
                     break 'outer ExitCode::FAILURE;
                 }
@@ -6277,7 +6479,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         && let Some(choice) = pending_mcp_prompt.take()
                     {
                         local_lines.push(ratatui::text::Line::from(format!(
-                            "MCP prompt {}/{} を選択しました",
+                            "Selected MCP prompt {}/{}",
                             render::sanitize(&choice.server),
                             render::sanitize(&choice.prompt)
                         )));
@@ -6293,7 +6495,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 Err(TuiAdmissionFailure::Retryable(error)) => {
                     input_buffer = text;
                     input_cursor = input_buffer.len();
-                    status = Status::Error(format!("入力を振り分けできません: {error}"));
+                    status = Status::Error(format!("Cannot route input: {error}"));
                     continue;
                 }
                 Err(TuiAdmissionFailure::PromptFailed { message, unknown }) => {
@@ -6307,18 +6509,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         input_cursor = input_buffer.len();
                     }
                     status = Status::Error(format!(
-                        "{message}。会話履歴には追加していません。{}。/mcp prompt で再選択してください",
+                        "{message}. Not added to conversation history. {}. Reselect with /mcp prompt",
                         if unknown {
-                            "取得結果は不明です"
+                            "Retrieval outcome is unknown"
                         } else {
-                            "モデル実行は開始していません"
+                            "Model execution was not started"
                         }
                     ));
                     continue;
                 }
                 Err(error @ TuiAdmissionFailure::Consumed(_)) => {
                     fatal_message = Some(format!(
-                        "入力保存または実行開始を確認できません: {}。再起動後に回復状態を確認してください。",
+                        "Cannot verify input storage or execution start: {}. Check recovery state after restarting.",
                         error.message()
                     ));
                     break 'outer ExitCode::FAILURE;
@@ -6330,7 +6532,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             {
                 input_buffer = text;
                 input_cursor = input_buffer.len();
-                status = Status::Error(format!("routine authorityを接続できません: {error}"));
+                status = Status::Error(format!("Cannot attach routine authority: {error}"));
                 continue;
             }
             #[cfg(unix)]
@@ -6344,7 +6546,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 Ok(boundary) => rewind_boundary = boundary,
                 Err(error) => {
                     rewind_unavailable_reason =
-                        format!("この入力の会話境界を保存できません: {error}");
+                        format!("Cannot save the conversation boundary for this input: {error}");
                 }
             }
             session.push_user(&text);
@@ -6472,7 +6674,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             Some(admission) => match admission.run_id() {
                 Ok(run_id) => run_id.to_owned(),
                 Err(error) => {
-                    let message = format!("sidechat runのIDを確認できません: {error}");
+                    let message = format!("Cannot verify the sidechat run ID: {error}");
                     #[cfg(target_os = "linux")]
                     let message = match linux_finish_pre_turn_shutdown(
                         tui_admission.take(),
@@ -6578,7 +6780,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             )
             .await
             {
-                fatal_message = Some(format!("TUI表示を更新できません; {cleanup}"));
+                fatal_message = Some(format!("Cannot update the TUI display; {cleanup}"));
             }
             break ExitCode::FAILURE;
         }
@@ -6636,7 +6838,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 .await
                 {
                     fatal_message = Some(format!(
-                        "subagent controlを準備できません: {error}; {cleanup}"
+                        "Cannot prepare subagent control: {error}; {cleanup}"
                     ));
                     break 'outer ExitCode::FAILURE;
                 }
@@ -6646,10 +6848,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 {
                     let _ = persistence.abandon_rewind_boundary(
                         &boundary.boundary_id,
-                        "subagent controlを開始できません".into(),
+                        "Cannot start subagent control".into(),
                     );
                 }
-                status = Status::Error(format!("subagent controlを準備できません: {error}"));
+                status = Status::Error(format!("Cannot prepare subagent control: {error}"));
                 #[cfg(target_os = "linux")]
                 if let Some(code) = linux_pending_exit_code() {
                     break 'outer code;
@@ -6667,7 +6869,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             Ok(Some(snapshot)) => snapshot.state.generation,
             Ok(None) => 0,
             Err(error) => {
-                status = Status::Error(format!("実行管理の保存状態を読めません: {error}"));
+                status = Status::Error(format!(
+                    "Cannot read saved execution management state: {error}"
+                ));
                 continue 'outer;
             }
         };
@@ -6678,7 +6882,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if let Some(active) = tui_admission.as_ref() {
             conversation_view.push_history_line(render::HistoryLine {
                 line: ratatui::text::Line::from(format!(
-                    "受理ID: {}（/input status|cancel）",
+                    "Admission ID: {} (/input status|cancel)",
                     active.admission_id.as_str()
                 )),
                 shaded: true,
@@ -6694,12 +6898,32 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         ) {
             Ok(provider) => provider,
             Err(error) => {
-                fatal_message = Some(format!("role bindingを実行へ接続できません: {error}"));
+                fatal_message = Some(format!("Cannot attach role bindings to the run: {error}"));
                 break 'outer ExitCode::FAILURE;
             }
         };
         #[cfg(not(unix))]
         let child_provider = args.provider.clone();
+        #[cfg(target_os = "macos")]
+        let _environment_turn = {
+            let tool = std::sync::Arc::new(polaris_core::environment::tool::EnvironmentTool::new(
+                polaris_core::project::resolve_root(&args.cwd),
+                args.cwd.clone(),
+            ));
+            let binding = match tool.bind(
+                management_effects.clone(),
+                std::sync::Arc::clone(&_project_activity),
+                &durable_session_id,
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    fatal_message = Some(error);
+                    break 'outer ExitCode::FAILURE;
+                }
+            };
+            session.environment = Some(tool);
+            binding
+        };
         let outcome = {
             let mut stop = StopTracker::new(next_max_turns);
             let mut gate = Gate::new(approval_policy);
@@ -6777,6 +7001,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 mcp_runtime.as_mut(),
             );
             tokio::pin!(agent_future);
+            let mut file_input_changed_at = Instant::now();
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first tick fires immediately; skip it since the
@@ -6872,6 +7097,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     _ = ticker.tick() => {
+                        if file_input_changed_at.elapsed() >= Duration::from_millis(40)
+                            && !is_secret_command(&input_buffer)
+                        {
+                            file_input::normalize_tail(&mut input_buffer, &mut input_cursor);
+                        }
                         #[cfg(unix)]
                         if runtime_error.borrow().is_some(){break TurnOutcome::Fatal;}
                         if mid_turn_notice_until.is_some_and(|until| Instant::now() < until) {
@@ -6927,8 +7157,43 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
                             MouseEventKind,
                         };
+                        #[cfg(target_os = "macos")]
+                        if let Some(Ok(Event::Mouse(mouse))) = &maybe_event {
+                            if let Some(notice) = reveal_history_file(
+                                &mut conversation_view,
+                                *mouse,
+                                &args.cwd,
+                                ratatui::layout::Rect::new(
+                                    0, 0, terminal_width(&terminal),
+                                    area_height_for_history(render::footer_height(rendered_suggestion_count), terminal_height(&terminal)),
+                                ),
+                            ) {
+                                status = notice;
+                                mid_turn_notice_until = Some(Instant::now() + MID_TURN_NOTICE_DURATION);
+                            }
+                        } else {
+                            conversation_view.file_click.cancel();
+                        }
                         match maybe_event {
+                            Some(Ok(Event::Paste(mut text))) => {
+                                let result = apply_composer_paste(&mut input_buffer, &mut input_cursor, &mut input_history, &text);
+                                zeroize::Zeroize::zeroize(&mut text);
+                                file_input_changed_at = Instant::now();
+                                match result {
+                                    Ok(true) => status = Status::Notice("File link inserted".into()),
+                                    Err(error) => status = Status::Error(error.into()),
+                                    _ => {},
+                                }
+                                mid_turn_notice_until = Some(Instant::now() + MID_TURN_NOTICE_DURATION);
+                            }
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                                file_input_changed_at = Instant::now();
+                                if !is_secret_command(&input_buffer)
+                                    && matches!(key.code, KeyCode::Backspace | KeyCode::Delete | KeyCode::Left
+                                        | KeyCode::Right | KeyCode::Enter | KeyCode::Up | KeyCode::Down)
+                                {
+                                    file_input::normalize_tail(&mut input_buffer, &mut input_cursor);
+                                }
                                 match slash_completion_action(&suggestions, &mut selected_suggestion, key) {
                                     SlashCompletionAction::Navigate => continue,
                                     SlashCompletionAction::Submit(command) => {
@@ -6968,7 +7233,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     }
                                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                         #[cfg(unix)]
-                                        { status = Status::Notice("コピーは実行終了後に /copy で確認してください".into()); }
+                                        { status = Status::Notice("After execution finishes, confirm copying with /copy".into()); }
                                         #[cfg(not(unix))]
                                         {
                                             status = match require_action_owner(&slash::Action::Copy) {
@@ -7024,13 +7289,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     KeyCode::Enter if input_buffer.starts_with("/instruction ") => {
                                         let request=std::mem::take(&mut input_buffer);input_cursor=0;
                                         let result=(||->Result<String,String>{
-                                            let text=request.strip_prefix("/instruction send ").ok_or("使い方: /instruction send <次のrunへの指示>")?;
-                                            let active=tui_admission.as_mut().ok_or("保存済み受理ownerがありません")?;
-                                            let saved=runtime_persistence.as_ref().ok_or("v2保存会話が必要です")?;
+                                            let text=request.strip_prefix("/instruction send ").ok_or("Usage: /instruction send <instruction-for-next-run>")?;
+                                            let active=tui_admission.as_mut().ok_or("No saved admission owner")?;
+                                            let saved=runtime_persistence.as_ref().ok_or("A saved v2 conversation is required")?;
                                             let handle=instruction_commands::receive(&active.store,&mut active.manager,saved,&management_effects,&_project_activity,polaris_core::management_effect::ManagementOperationIdV1::random().map_err(|e|e.to_string())?,text)?;
                                             let id=handle.admission_id().as_str().to_owned();queued_instructions.push_back(handle);Ok(id)
                                         })();
-                                        match result {Ok(id)=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(format!("指示受理ID: {id}。この会話の次のrun境界で適用します")),shaded:true});status=Status::Notice("次のrunへの指示を保存しました".into());},Err(error)=>status=Status::Error(error)}
+                                        match result {Ok(id)=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(format!("Instruction admission ID: {id}. Applied at this conversation's next run boundary")),shaded:true});status=Status::Notice("Instruction saved for the next run".into());},Err(error)=>status=Status::Error(error)}
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
                                     }
                                     #[cfg(unix)]
@@ -7038,38 +7303,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         let request=std::mem::take(&mut input_buffer);input_cursor=0;
                                         let result=(|| -> Result<(bool,String),String> {
                                             let words=request.split_whitespace().collect::<Vec<_>>();
-                                            let ["/input",verb,id]=words.as_slice() else {return Err("使い方: /input status|cancel <受理ID>".into());};
-                                            let active=tui_admission.as_ref().ok_or("このrunには保存済み受理IDがありません")?;
+                                            let ["/input",verb,id]=words.as_slice() else {return Err("Usage: /input status|cancel <admission-id>".into());};
+                                            let active=tui_admission.as_ref().ok_or("This run has no saved admission ID")?;
                                             let id=polaris_core::session_manager::AdmissionId::new(*id).map_err(|e|e.to_string())?;
                                             let receipt=active.manager.status(&id).map_err(|e|e.to_string())?;
-                                            if *verb=="status" {return Ok((false,render::sanitize(&format!("入力 {} / revision {} / 状態 {:?}",receipt.id.as_str(),receipt.revision,receipt.state))));}
-                                            if *verb!="cancel" {return Err("使い方: /input status|cancel <受理ID>".into());}
+                                            if *verb=="status" {return Ok((false,render::sanitize(&format!("Input {} / revision {} / state {:?}",receipt.id.as_str(),receipt.revision,receipt.state))));}
+                                            if *verb!="cancel" {return Err("Usage: /input status|cancel <admission-id>".into());}
                                             if id!=active.admission_id {
-                                                let position=queued_instructions.iter().position(|item|item.admission_id()==&id).ok_or("この会話の実行中・送信待ちIDではありません")?;
+                                                let position=queued_instructions.iter().position(|item|item.admission_id()==&id).ok_or("This is not an active or queued input ID for this conversation")?;
                                                 #[cfg(target_os="linux")] let mut reader=LinuxSignalAwareKeyReader;
                                                 #[cfg(not(target_os="linux"))] let mut reader=approver::CrosstermKeyReader;
-                                                if !account::confirm(&terminal,&mut reader,"送信待ち入力の取消",id.as_str(),"このIDの未実行の指示だけを取り消します。") {
+                                                if !account::confirm(&terminal,&mut reader,"Cancel queued input",id.as_str(),"Cancel only the unexecuted instruction with this ID.") {
                                                     let context=runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted:false};
                                                     runtime_effects::begin(&context,"D10",id.as_str().as_bytes())?;
-                                                    return Ok((false,"取消要求を取り消しました".into()));
+                                                    return Ok((false,"Cancellation request cancelled".into()));
                                                 }
                                                 let instruction=queued_instructions.remove(position).expect("queued");
-                                                let active=tui_admission.as_mut().ok_or("保存された受理ownerがありません")?;
-                                                instruction_commands::cancel_queue(&active.store,&mut active.manager,runtime_persistence.as_ref().ok_or("v2会話が必要です")?,&management_effects,&_project_activity,instruction)?;
-                                                return Ok((false,format!("入力 {} を取り消しました",id.as_str())));
+                                                let active=tui_admission.as_mut().ok_or("No stored admission owner")?;
+                                                instruction_commands::cancel_queue(&active.store,&mut active.manager,runtime_persistence.as_ref().ok_or("A v2 conversation is required")?,&management_effects,&_project_activity,instruction)?;
+                                                return Ok((false,format!("Input {} cancelled",id.as_str())));
                                             }
                                             #[cfg(target_os="linux")]
                                             let mut reader=LinuxSignalAwareKeyReader;
                                             #[cfg(not(target_os="linux"))]
                                             let mut reader=approver::CrosstermKeyReader;
-                                            let accepted=account::confirm(&terminal,&mut reader,"入力の停止要求",id.as_str(),"この入力のrunを停止し、所有するchild/MCPの終了を確認します。");
+                                            let accepted=account::confirm(&terminal,&mut reader,"Request input stop",id.as_str(),"Stop this input's run and verify termination of its owned children and MCP runtime.");
                                             let context=runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted};
                                             interruption_effect=runtime_effects::begin(&context,"D10",id.as_str().as_bytes())?;
-                                            Ok((accepted,if accepted {"入力の停止を要求しました".into()}else{"停止要求を取り消しました".into()}))
+                                            Ok((accepted,if accepted {"Input stop requested".into()}else{"Stop request cancelled".into()}))
                                         })();
                                         match result {
                                             Ok((true,_))=>break TurnOutcome::Interrupted,
-                                            Ok((false,line))=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false});status=Status::Notice("入力状態を表示しました".into());},
+                                            Ok((false,line))=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false});status=Status::Notice("Input state displayed".into());},
                                             Err(error)=>status=Status::Error(error),
                                         }
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
@@ -7083,13 +7348,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             let mut cancellation_reader=LinuxSignalAwareKeyReader;
                                             #[cfg(not(target_os="linux"))]
                                             let mut cancellation_reader=approver::CrosstermKeyReader;
-                                            let accepted = !extra.trim().starts_with("cancel ") || account::confirm(&terminal,&mut cancellation_reader,"subagent停止要求",extra.trim(),"現在のchild/attemptだけへ停止要求を送ります。終了はwaitで確認してください。");
+                                            let accepted = !extra.trim().starts_with("cancel ") || account::confirm(&terminal,&mut cancellation_reader,"Request subagent stop",extra.trim(),"Send a stop request only to the current child/attempt. Verify termination with wait.");
                                             runtime_commands::subagents(Some(&turn_control),extra.trim(),Some(runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted})).await
                                         } else {
                                             runtime_commands::run_details(Some(&turn_control)).await.map(|mut lines| { lines.extend(conversation_view.tool_detail_lines()); lines })
                                         };
                                         match result {
-                                            Ok(lines)=>{conversation_view.extend_text_lines(lines);status=Status::Notice("実行状態を表示しました".into());},
+                                            Ok(lines)=>{conversation_view.extend_text_lines(lines);status=Status::Notice("Execution state displayed".into());},
                                             Err(error)=>status=Status::Error(error),
                                         }
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
@@ -7107,11 +7372,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             if queued_inputs.back().is_some_and(|text|!text.starts_with('/')) && runtime_persistence.is_some() {
                                                 let text=queued_inputs.pop_back().expect("queued input");
                                                 let result=(||->Result<String,String>{
-                                                    let active=tui_admission.as_mut().ok_or("保存済み受理ownerがありません")?;
+                                                    let active=tui_admission.as_mut().ok_or("No saved admission owner")?;
                                                     let handle=instruction_commands::receive(&active.store,&mut active.manager,runtime_persistence.as_ref().expect("saved"),&management_effects,&_project_activity,polaris_core::management_effect::ManagementOperationIdV1::random().map_err(|e|e.to_string())?,&text)?;
                                                     let id=handle.admission_id().as_str().to_owned();queued_instructions.push_back(handle);Ok(id)
                                                 })();
-                                                match result {Ok(id)=>status=Status::Notice(format!("入力 {id} を保存しました。次のrunで適用します")),Err(error)=>{input_buffer=text;input_cursor=input_buffer.len();status=Status::Error(error);}}
+                                                match result {Ok(id)=>status=Status::Notice(format!("Input {id} saved. Applied in the next run")),Err(error)=>{input_buffer=text;input_cursor=input_buffer.len();status=Status::Error(error);}}
                                             } else {
                                                 status=Status::Notice(format!("queued local command ({})",queued_inputs.len()));
                                             }
@@ -7123,7 +7388,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         }
                                         InflightInputAction::RejectedSecret => {
                                             status = Status::Error(
-                                                "このTUIでは秘密情報の設定をまだ受け付けていません".into(),
+                                                "This TUI does not yet accept secret configuration".into(),
                                             );
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
@@ -7242,7 +7507,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         let text = selection::extract_text(&wrapped, sel);
                                         if !text.is_empty() {
                                             #[cfg(unix)]
-                                            { status = Status::Notice("選択した範囲のコピーは実行終了後に確認してください".into()); }
+                                            { status = Status::Notice("Confirm copying the selected range after execution finishes".into()); }
                                             #[cfg(not(unix))]
                                             { status = Status::Notice(apply_selection_copy(&text, clipboard::copy_to_clipboard)); }
                                             mid_turn_notice_until = Some(
@@ -7336,7 +7601,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 .shutdown()
                 .await
                 .err()
-                .map(|error| format!("MCP runtimeを終了できません: {error}"))
+                .map(|error| format!("Cannot stop the MCP runtime: {error}"))
         } else {
             None
         };
@@ -7366,7 +7631,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         let shutdown_reason = shutdown_reason.or_else(signal::pending_linux_process_shutdown);
         #[cfg(unix)]
         if let Some(error) = runtime_error.borrow_mut().take() {
-            control_cleanup_error = Some(format!("実行管理の保存に失敗しました: {error}"));
+            control_cleanup_error = Some(format!(
+                "Failed to save execution management state: {error}"
+            ));
         }
         #[cfg(target_os = "linux")]
         if control_cleanup_error.is_none() {
@@ -7398,7 +7665,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 terminal
             };
             if let Err(error) = admission.finish(terminal) {
-                control_cleanup_error = Some(format!("sidechat runを終了できません: {error}"));
+                control_cleanup_error = Some(format!("Cannot stop the sidechat run: {error}"));
             }
         }
         #[cfg(target_os = "linux")]
@@ -7408,7 +7675,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         {
             if let Some(error) = runtime_error.into_inner() {
-                control_cleanup_error = Some(format!("実行管理の保存に失敗しました: {error}"));
+                control_cleanup_error = Some(format!(
+                    "Failed to save execution management state: {error}"
+                ));
             }
             if let Some(started) = interruption_effect {
                 let context = runtime_commands::RuntimeMutationContext {
@@ -7424,7 +7693,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     control_cleanup_error.is_none(),
                     b"root-interrupted-after-owned-cleanup",
                 ) {
-                    control_cleanup_error = Some(format!("停止結果を保存できません: {error}"));
+                    control_cleanup_error = Some(format!("Cannot save the stop outcome: {error}"));
                 }
             }
         }
@@ -7442,7 +7711,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             let scheduled = schedule_tui_shadow(finalizer, &session, &text, &turn_control);
             if let Err(error) = scheduled {
                 local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                    format!("回答達成判定を記録できません: {error}"),
+                    format!("Cannot record answer completion assessment: {error}"),
                     ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
                 )));
             }
@@ -7491,7 +7760,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             #[cfg(target_os = "linux")]
             TurnOutcome::Shutdown(_) => {
                 if let Err(error) = keep_or_roll_back(&mut session, checkpoint) {
-                    cleanup_failure = Some(format!("停止中の会話を復旧できません: {error}"));
+                    cleanup_failure =
+                        Some(format!("Cannot recover the stopping conversation: {error}"));
                 }
             }
             TurnOutcome::Fatal => {
@@ -7500,7 +7770,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 {
                     let _ = persistence.abandon_rewind_boundary(
                         &boundary.boundary_id,
-                        "TUI実行が完了前に終了しました".into(),
+                        "TUI execution exited before completion".into(),
                     );
                 }
                 break ExitCode::FAILURE;
@@ -7509,7 +7779,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         let rewind_writers_stopped = control_cleanup_error.is_none();
         if let Some(error) = control_cleanup_error {
-            status = Status::Error(format!("subagent controlを終了できません: {error}"));
+            status = Status::Error(format!("Cannot stop subagent control: {error}"));
         }
         #[cfg(target_os = "linux")]
         let rewind_turn_completed = linux_turn_completed_without_shutdown(
@@ -7523,7 +7793,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         if let Some(boundary) = rewind_boundary {
             let Some(persistence) = session.persistence.as_ref() else {
-                fatal_message = Some("巻き戻し境界の保存元が失われました".into());
+                fatal_message = Some("Rewind boundary storage source was lost".into());
                 break 'outer ExitCode::FAILURE;
             };
             let completion = if rewind_turn_completed && rewind_writers_stopped {
@@ -7551,14 +7821,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     ),
                     None => persistence.abandon_rewind_boundary(
                         &boundary.boundary_id,
-                        "ファイル保存先が利用できません".into(),
+                        "File storage is unavailable".into(),
                     ),
                 }
             } else {
                 let reason = if turn_interrupted && rewind_writers_stopped {
-                    "中断したターンは巻き戻し対象外です（保存境界が未完了）"
+                    "Interrupted turns cannot be rewound (save boundary incomplete)"
                 } else {
-                    "ターンまたはsubagentが正常終了していません"
+                    "The turn or a subagent did not finish successfully"
                 };
                 persistence.abandon_rewind_boundary(&boundary.boundary_id, reason.into())
             };
@@ -7568,7 +7838,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Some(completion) if matches!(
                             completion.eligibility,
                             polaris_core::conversation_state::RewindEligibilityV1::Eligible
-                        ) => "まだ保存済みの巻き戻し境界がありません".into(),
+                        ) => "No saved rewind boundaries yet".into(),
                         Some(completion) => match completion.effect {
                             polaris_core::conversation_state::RewindEffectStatusV1::Unknown {
                                 description,
@@ -7576,15 +7846,15 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             | polaris_core::conversation_state::RewindEffectStatusV1::ExternalMutation {
                                 description,
                             } => description,
-                            _ => "このターンは巻き戻し対象外です".into(),
+                            _ => "This turn cannot be rewound".into(),
                         },
                         None => saved
                             .abandoned_reason
-                            .unwrap_or_else(|| "このターンの保存境界は未完了です".into()),
+                            .unwrap_or_else(|| "This turn's save boundary is incomplete".into()),
                     };
                 }
                 Err(error) => {
-                    fatal_message = Some(format!("巻き戻し境界を確定できません: {error}"));
+                    fatal_message = Some(format!("Cannot finalize the rewind boundary: {error}"));
                     break 'outer ExitCode::FAILURE;
                 }
             }
@@ -7611,8 +7881,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             Ok(()) => exit_code,
             Err(error) => {
                 fatal_message = Some(match fatal_message.take() {
-                    Some(previous) => format!("{previous}; 下書き保存: {error}"),
-                    None => format!("下書きを保存できません: {error}"),
+                    Some(previous) => format!("{previous}; draft storage: {error}"),
+                    None => format!("Cannot save the draft: {error}"),
                 });
                 ExitCode::FAILURE
             }
@@ -7662,6 +7932,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste,
         ratatui::crossterm::event::DisableMouseCapture
     );
     if let Some(msg) = fatal_message {
@@ -7836,14 +8107,14 @@ fn c10_tui_invocation(requested: &str) -> Result<C10TuiInvocation, String> {
         ["push"] => Ok(C10TuiInvocation::Push),
         [action @ ("recover" | "abandon"), operation] => {
             let operation = ManagementOperationIdV1::from_str(operation)
-                .map_err(|_| "C10 operation IDが不正です".to_string())?;
+                .map_err(|_| "Invalid C10 operation ID".to_string())?;
             if *action == "recover" {
                 Ok(C10TuiInvocation::Recover(operation))
             } else {
                 Ok(C10TuiInvocation::Abandon(operation))
             }
         }
-        _ => Err("使い方: /sync push · /sync recover <C10 operation ID> · /sync abandon <C10 operation ID>".into()),
+        _ => Err("Usage: /sync push · /sync recover <C10-operation-id> · /sync abandon <C10-operation-id>".into()),
     }
 }
 
@@ -7863,7 +8134,7 @@ fn is_c10_sync_request(requested: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn c10_unavailable_action(requested: &str, has_queued_input: bool) -> Result<String, String> {
     if has_queued_input {
-        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+        return Err("Clear queued input before changing shared content".into());
     }
     match c10_tui_invocation(requested)? {
         C10TuiInvocation::Push => {}
@@ -7871,10 +8142,7 @@ fn c10_unavailable_action(requested: &str, has_queued_input: bool) -> Result<Str
             let _ = operation;
         }
     }
-    Err(
-        "c10_unavailable_platform: 共有送信はmacOSのData Protection Keychainでのみ利用できます。"
-            .into(),
-    )
+    Err("c10_unavailable_platform: shared sends require the macOS Data Protection Keychain.".into())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7889,7 +8157,7 @@ fn record_c10_result(
                 text.lines()
                     .map(|line| ratatui::text::Line::from(render::sanitize(line))),
             );
-            *status = Status::Notice("C10操作の結果を表示しました".into());
+            *status = Status::Notice("C10 operation result displayed".into());
         }
         Err(error) => *status = Status::Error(render::sanitize(&error)),
     }
@@ -7945,7 +8213,7 @@ impl C10TuiHost {
     ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
         use polaris_core::sync::push::SyncPushErrorV1;
         self.live()?;
-        view.title = "C10 preview（確定はprepare後）".into();
+        view.title = "C10 preview (confirmation follows preparation)".into();
         let (reply, response) = std::sync::mpsc::sync_channel(0);
         self.events
             .send(C10TuiEvent::Preview(view, reply))
@@ -7986,11 +8254,11 @@ impl polaris_core::sync::push::SyncPushHostV1 for C10TuiHost {
             return Err(SyncPushErrorV1::Permission);
         }
         if !self.ask(render::C10ConfirmView {
-            title: "C10操作を照合して中止".into(),
+            title: "Reconcile and abandon C10 operation".into(),
             details: vec![
                 format!("operation={operation}"),
                 format!("request={request}"),
-                "送信されなかったことの証明にはなりません。".into(),
+                "This does not prove that nothing was sent.".into(),
             ],
         })? {
             return Err(SyncPushErrorV1::Permission);
@@ -8077,7 +8345,7 @@ impl C10TuiJob {
                 Ok(C10TuiEvent::Finished(result)) => self.result = Some(result),
                 Err(TryRecvError::Disconnected) => {
                     self.result = Some(Err(
-                        "C10 workerが終了しました。再送せず状態を確認してください".into(),
+                        "The C10 worker ended. Do not resend; inspect state".into()
                     ))
                 }
                 Err(TryRecvError::Empty) => {}
@@ -8092,13 +8360,13 @@ impl C10TuiJob {
         self.inbox.take();
         if self.worker.take().unwrap().join().is_err() {
             return Some(Err(
-                "C10 workerが失敗しました。再送せず状態を確認してください".into(),
+                "The C10 worker failed. Do not resend; inspect state".into()
             ));
         }
         Some(
             self.result
                 .take()
-                .unwrap_or_else(|| Err("C10 workerの結果を確認できません".into())),
+                .unwrap_or_else(|| Err("Cannot verify the C10 worker result".into())),
         )
     }
 }
@@ -8140,24 +8408,24 @@ fn c10_tui_view(
     summary: &polaris_core::sync::push::SyncPushConfirmationSummaryV1,
 ) -> render::C10ConfirmView {
     render::C10ConfirmView {
-        title: "C10共有送信の確認".into(),
+        title: "Confirm C10 shared send".into(),
         details: vec![
             format!("operation={}", summary.operation_id),
             format!("request={}", summary.request_hash),
             format!("project={}", summary.project),
-            format!("共有={}", summary.share_id),
+            format!("share={}", summary.share_id),
             format!("remote={}", summary.remote_label),
             format!("ref={}", summary.remote_ref),
             format!("manifest={}", summary.manifest_digest),
             format!("payload={}", summary.payload_digest),
             format!("expected remote={:?}", summary.expected_remote),
             format!(
-                "対象={}件・除外={}件",
+                "included={} excluded={}",
                 summary.file_count, summary.excluded_count
             ),
             format!("account registration={}", summary.account_registration_id),
-            format!("操作={:?}", summary.action),
-            "会話の巻き戻しでは共有送信を取り消せません。".into(),
+            format!("operation={:?}", summary.action),
+            "Conversation rewind cannot undo shared sends.".into(),
         ],
     }
 }
@@ -8166,24 +8434,24 @@ fn c10_tui_view(
 fn c10_tui_outcome(outcome: polaris_core::sync::push::SyncPushOutcomeV1) -> Result<String, String> {
     use polaris_core::sync::push::SyncPushOutcomeV1;
     match outcome {
-        SyncPushOutcomeV1::NoChanges => Ok("C10: 共有内容は一致しています".into()),
+        SyncPushOutcomeV1::NoChanges => Ok("C10: shared content matches".into()),
         SyncPushOutcomeV1::Completed {
             operation_id,
             commit,
         } => Ok(format!(
-            "C10送信完了: operation={operation_id} commit={commit}"
+            "C10 send complete: operation={operation_id} commit={commit}"
         )),
         SyncPushOutcomeV1::Denied { operation_id } => {
-            Ok(format!("C10操作を取り消しました: operation={operation_id}"))
+            Ok(format!("C10 operation cancelled: operation={operation_id}"))
         }
         SyncPushOutcomeV1::ReconciledAbandon { operation_id } => Ok(format!(
-            "C10操作を照合して中止しました: operation={operation_id}（未送信の証明ではありません）"
+            "C10 operation reconciled and abandoned: operation={operation_id} (does not prove that nothing was sent)"
         )),
         SyncPushOutcomeV1::OutcomeUnknown { operation_id } => Err(format!(
-            "C10結果未確定: operation={operation_id}。再送せず /sync recover {operation_id} で照合してください"
+            "C10 outcome unknown: operation={operation_id}. Do not resend; reconcile with /sync recover {operation_id}"
         )),
         SyncPushOutcomeV1::PartialComplete { operation_id } => Err(format!(
-            "C10保存未完了: operation={operation_id}。再送せず /sync recover {operation_id} で照合してください"
+            "C10 persistence incomplete: operation={operation_id}. Do not resend; reconcile with /sync recover {operation_id}"
         )),
     }
 }
@@ -8196,19 +8464,19 @@ fn start_c10_sync_action(
     has_queued_input: bool,
 ) -> Result<C10TuiJob, String> {
     if has_queued_input {
-        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+        return Err("Clear queued input before changing shared content".into());
     }
     let invocation = c10_tui_invocation(requested)?;
     #[cfg(target_os = "macos")]
     {
         let project = std::fs::canonicalize(polaris_core::project::resolve_root(project))
-            .map_err(|_| "C10 projectを確認できません")?;
+            .map_err(|_| "Cannot verify the C10 project")?;
         let expected =
-            polaris_core::project::state_dir(&project).map_err(|_| "C10 stateを確認できません")?;
-        if std::fs::canonicalize(state).map_err(|_| "C10 stateを確認できません")?
-            != std::fs::canonicalize(expected).map_err(|_| "C10 stateを確認できません")?
+            polaris_core::project::state_dir(&project).map_err(|_| "Cannot verify C10 state")?;
+        if std::fs::canonicalize(state).map_err(|_| "Cannot verify C10 state")?
+            != std::fs::canonicalize(expected).map_err(|_| "Cannot verify C10 state")?
         {
-            return Err("C10 projectと保存場所が一致しません".into());
+            return Err("C10 project and storage location mismatch".into());
         }
         Ok(C10TuiJob::start(invocation, move |host| {
             use polaris_core::sync::push::SyncPushOwnerV1;
@@ -8412,7 +8680,7 @@ mod c10_tui_adapter_tests {
                 |_| { panic!("owned synthetic worker failure") }
             )
             .unwrap_err()
-            .contains("workerが失敗")
+            .contains("worker failed")
         );
     }
 
@@ -8456,7 +8724,7 @@ mod c10_tui_adapter_tests {
                 start_c10_sync_action(root.path(), root.path(), "recover invalid", false)
                     .err()
                     .unwrap(),
-                "C10 operation IDが不正です"
+                "Invalid C10 operation ID"
             );
         }
         #[cfg(target_os = "linux")]
@@ -8464,7 +8732,7 @@ mod c10_tui_adapter_tests {
             assert!(c10_unavailable_action("push", true).is_err());
             assert_eq!(
                 c10_unavailable_action("recover invalid", false).unwrap_err(),
-                "C10 operation IDが不正です"
+                "Invalid C10 operation ID"
             );
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
@@ -8619,29 +8887,29 @@ fn sync_action(
         && !recovering
         && !matches!(words.first(), Some(&"join" | &"pull" | &"leave" | &"push"))
     {
-        return Err("使い方: /sync [status|join <remote> <share-id> <invite-id> <expires> [除外名... ]|pull|leave|apply|recover <表示された操作ID>]".into());
+        return Err("Usage: /sync [status|join <remote> <share-id> <invite-id> <expires> [excluded-name... ]|pull|leave|apply|recover <displayed-operation-id>]".into());
     }
     if !inspect && has_queued_input {
-        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+        return Err("Clear queued input before changing shared content".into());
     }
     let project = std::fs::canonicalize(polaris_core::project::resolve_root(project))
         .map_err(|e| e.to_string())?;
     let expected_state = polaris_core::project::state_dir(&project).map_err(|e| e.to_string())?;
     let state = std::fs::canonicalize(state).map_err(|e| e.to_string())?;
     if state != std::fs::canonicalize(expected_state).map_err(|e| e.to_string())? {
-        return Err("projectと保存場所が一致しません".into());
+        return Err("Project and storage location mismatch".into());
     }
     // Retain the same owner from inspection through confirmation and commit.
     let owner = ApplyOwnerV1::acquire(&project).map_err(|e| e.to_string())?;
     if matches!(words.first(), Some(&"join" | &"pull" | &"leave" | &"push")) {
         if words[0] == "push" {
             return Err(
-                "共有送信ownerは未実装です。credential実機検証が必要なため送信できません。".into(),
+                "The shared send owner is not implemented. Sending requires credential verification on a real device.".into(),
             );
         }
         owner
             .ensure_sync_idle()
-            .map_err(|_| "未完了の共有操作を確認してください")?;
+            .map_err(|_| "Inspect the incomplete sharing operation")?;
         let classification = participation::read(&state).map_err(|e| e.to_string())?;
         let held = classification.participation();
         let mut join = None;
@@ -8653,22 +8921,22 @@ fn sync_action(
                     invitation_id: words[3].into(),
                     expires_unix_seconds: words[4]
                         .parse()
-                        .map_err(|_| "招待期限はUNIX秒で指定してください")?,
+                        .map_err(|_| "Specify the invitation expiry in UNIX seconds")?,
                 };
                 let now =
-                    u64::try_from(now_millis() / 1000).map_err(|_| "招待期限を照合できません")?;
+                    u64::try_from(now_millis() / 1000).map_err(|_| "Cannot verify the invitation expiry")?;
                 share
                     .accept(now)
-                    .map_err(|_| "招待URL・ID・期限を確認してください。変更していません。")?;
+                    .map_err(|_| "Check the invitation URL, ID, and expiry. No changes were made.")?;
                 if held.is_some() {
-                    return Err("参加済みです。安全なcredential rebind ownerは未実装です。".into());
+                    return Err("Already participating. The safe credential rebind owner is not implemented.".into());
                 }
                 let manifest = polaris_core::sync::share::ShareManifest {
                     version: 1,
                     excluded: words[5..].iter().map(|w| (*w).to_owned()).collect(),
                 };
                 let detail = format!(
-                    "共有: {}\n招待: {}\nremote: {}\n期限: {}\n除外: {:?}\n参加はこの端末の保存のみ。peer・sourceを変更しません。",
+                    "Share: {}\nInvitation: {}\nremote: {}\nExpiry: {}\nExcluded: {:?}\nJoining changes only this device's storage. Peers and source files are unchanged.",
                     share.share_id,
                     share.invitation_id,
                     share.remote_display(),
@@ -8679,29 +8947,29 @@ fn sync_action(
                 ("C08 join", detail)
             }
             "pull" if words.len() == 1 => {
-                let held = held.as_ref().ok_or("このprojectは未参加です")?;
+                let held = held.as_ref().ok_or("This project has not joined")?;
                 (
                     "C11 pull",
                     format!(
-                        "共有: {}\nremote: {}\n合意revision: {}\n受信・local stagingだけを更新します。source適用は別の確認です。",
+                        "Share: {}\nremote: {}\nAgreed revision: {}\nUpdates only received data and local staging. Source apply requires separate confirmation.",
                         held.share.share_id,
                         held.share.remote_display(),
-                        held.agreed_commit.as_deref().unwrap_or("なし")
+                        held.agreed_commit.as_deref().unwrap_or("none")
                     ),
                 )
             }
             "leave" if words.len() == 1 => {
-                let held = held.as_ref().ok_or("このprojectは未参加です")?;
+                let held = held.as_ref().ok_or("This project has not joined")?;
                 (
                     "C13 leave",
                     format!(
-                        "共有: {}\nこの端末の参加状態を削除します。共有履歴・peer・sourceは残します。",
+                        "Share: {}\nRemoves this device's participation state. Shared history, peers, and source files are retained.",
                         held.share.share_id
                     ),
                 )
             }
             _ => return Err(
-                "/sync join <remote> <share-id> <invite-id> <expires> [除外名...] | pull | leave"
+                "/sync join <remote> <share-id> <invite-id> <expires> [excluded-name...] | pull | leave"
                     .into(),
             ),
         };
@@ -8710,8 +8978,8 @@ fn sync_action(
             project: project.display().to_string(),
             operation: id.into(),
             revision: detail,
-            previous_revision: "変更前の参加状態を管理記録へ結び付けます".into(),
-            recovery: "sourceとpeerは変更しません".into(),
+            previous_revision: "Bind the prior participation state to the management record".into(),
+            recovery: "Source files and peers are unchanged".into(),
             changes: Vec::new(),
         };
         let accepted = confirm(&view);
@@ -8722,41 +8990,43 @@ fn sync_action(
                     .join_confirmed(share, manifest, now, accepted)
                     .map(|p| {
                         if p.is_some() {
-                            "参加しました"
+                            "Joined"
                         } else {
-                            "参加を取り消しました"
+                            "Join cancelled"
                         }
                         .into()
                     })
             }
             "pull" => owner.pull_confirmed(accepted).map(|p| match p {
                 Some(exchange) => format!(
-                    "受け取りました: {}件、解消待ち{}件。sourceへは未反映です。",
+                    "Received: {} items, {} unresolved. Source files are unchanged.",
                     exchange.changes.len(),
                     exchange.needs_attention().len()
                 ),
-                None => "受信を取り消しました".into(),
+                None => "Receive cancelled".into(),
             }),
             "leave" => owner.leave_confirmed(accepted).map(|p| {
                 if p.is_some() {
-                    "この端末の参加を解除しました"
+                    "This device left the share"
                 } else {
-                    "離脱を取り消しました"
+                    "Leave cancelled"
                 }
                 .into()
             }),
             _ => unreachable!(),
         }
-        .map_err(|_| "共有操作の結果を確定できません。/syncで状態を確認してください。".into());
+        .map_err(|_| {
+            "Cannot finalize the sharing operation result. Inspect state with /sync.".into()
+        });
     }
     let active = owner.active().map_err(|e| e.to_string())?;
     let recovery = state.join("sync/recovery").display().to_string();
     if inspect {
         let pending = active.as_ref().map_or_else(
-            || "なし".into(),
+            || "none".into(),
             |intent| {
                 format!(
-                    "{:?} {:?} / 操作ID: {}",
+                    "{:?} {:?} / operation ID: {}",
                     intent.descriptor().inventory_id,
                     intent.latest().phase,
                     intent.descriptor().operation_key.as_hex()
@@ -8765,10 +9035,10 @@ fn sync_action(
         );
         let management_pending = match owner
             .inspect_management()
-            .map_err(|_| "共有の管理記録を確認できません")?
+            .map_err(|_| "Cannot verify sharing management records")?
         {
             polaris_core::management_effect::ManagementEffectInspectOpenV1::Absent => {
-                "なし".to_owned()
+                "none".to_owned()
             }
             polaris_core::management_effect::ManagementEffectInspectOpenV1::Present(inspected) => {
                 let records: Vec<_> = inspected
@@ -8782,7 +9052,7 @@ fn sync_action(
                     })
                     .collect();
                 if records.is_empty() {
-                    "なし".into()
+                    "none".into()
                 } else {
                     records.join("\n")
                 }
@@ -8791,18 +9061,18 @@ fn sync_action(
         let classification = participation::read(&state).map_err(|e| e.to_string())?;
         let held = classification.participation();
         return Ok(format!(
-            "共有適用: {}\n合意revision: {}\n反映済みrevision: {}\n解消待ち: {}\n未完了: {}\n管理操作: {}\n復旧用の控え: {}\n/sync apply · /sync recover <操作ID>",
+            "Shared apply: {}\nAgreed revision: {}\nApplied revision: {}\nUnresolved: {}\nIncomplete: {}\nManagement operation: {}\nRecovery backup: {}\n/sync apply · /sync recover <operation-id>",
             if held.is_some() {
-                "参加中"
+                "participating"
             } else {
-                "未参加"
+                "not participating"
             },
             held.as_ref()
                 .and_then(|p| p.agreed_commit.as_deref())
-                .unwrap_or("なし"),
+                .unwrap_or("none"),
             held.as_ref()
                 .and_then(|p| p.applied_commit.as_deref())
-                .unwrap_or("なし"),
+                .unwrap_or("none"),
             held.as_ref().map_or(0, |p| p.unresolved.len()),
             pending,
             management_pending,
@@ -8810,10 +9080,12 @@ fn sync_action(
         ));
     }
     if recovering {
-        let active = active.ok_or("未完了の共有適用はありません")?;
+        let active = active.ok_or("No incomplete shared apply")?;
         let key = active.descriptor().operation_key.as_hex();
         if active.descriptor().inventory_id != ApplyInventoryV1::C12 || words[1] != key {
-            return Err("C12の表示された未完了操作IDを指定してください。変更していません。".into());
+            return Err(
+                "Specify the displayed incomplete C12 operation ID. No changes were made.".into(),
+            );
         }
         let parent = owner
             .c12_recovery_parent(false)
@@ -8823,29 +9095,29 @@ fn sync_action(
             project: project.display().to_string(),
             operation: key.clone(),
             revision: active.descriptor().agreed_revision.value.clone(),
-            previous_revision: "変更しない".into(),
+            previous_revision: "no change".into(),
             recovery,
             changes: Vec::new(),
         };
         if !confirm(&view) {
-            return Ok("共有適用の復旧を取り消しました".into());
+            return Ok("Shared apply recovery cancelled".into());
         }
         return match owner.recover_current(&parent).map_err(|e| e.to_string())? {
             ApplyOwnerRecoveryV1::OutcomeUnknown(_) => Ok(format!(
-                "適用結果は未確定です ({key})。sourceを再適用していません。復旧用の控え: {}",
+                "Apply outcome is unknown ({key}). Source files were not reapplied. Recovery backup: {}",
                 view.recovery
             )),
             ApplyOwnerRecoveryV1::Archived(_) => Ok(format!(
-                "保存済み証拠から操作を閉じました ({key})。sourceを再適用していません。/syncで状態を確認してください。"
+                "Closed the operation using saved evidence ({key}). Source files were not reapplied. Inspect state with /sync."
             )),
             ApplyOwnerRecoveryV1::Idle => {
-                Err("未完了状態が変わりました。/syncで確認してください。".into())
+                Err("Incomplete state changed. Inspect it with /sync.".into())
             }
         };
     }
     if let Some(active) = active {
         return Err(format!(
-            "未完了の適用があります ({})。/syncで確認してください。新しい適用は行っていません。",
+            "An incomplete apply exists ({}). Inspect it with /sync. No new apply was performed.",
             active.descriptor().operation_key.as_hex()
         ));
     }
@@ -8854,26 +9126,26 @@ fn sync_action(
         .map_err(|e| e.to_string())?
         .participation()
         .cloned()
-        .ok_or("このprojectは共有に参加していません")?;
+        .ok_or("This project has not joined a share")?;
     if !held.unresolved.is_empty() {
         return Err(format!(
-            "解消待ちが{}件あります。先に解消してください。",
+            "{} unresolved items. Resolve them first.",
             held.unresolved.len()
         ));
     }
     let agreed = held
         .agreed_commit
         .clone()
-        .ok_or("合意した内容がありません。先にpolaris sync pullを実行してください。")?;
+        .ok_or("No agreed content. Run polaris sync pull first.")?;
     if held.applied_commit.as_deref() == Some(&agreed) {
-        return Ok("この内容は反映済みです。".into());
+        return Ok("This content has already been applied.".into());
     }
     if std::fs::metadata(&project)
         .map_err(|e| e.to_string())?
         .dev()
         != std::fs::metadata(&state).map_err(|e| e.to_string())?.dev()
     {
-        return Err("projectと同じファイルシステムの復旧場所が必要です".into());
+        return Err("A recovery location on the same filesystem as the project is required".into());
     }
     let parent = owner.c12_recovery_parent(true).map_err(|e| e.to_string())?;
     let paths = SyncPaths::under(&state);
@@ -8881,8 +9153,7 @@ fn sync_action(
     let repository = SyncRepository::open(paths).map_err(|e| e.to_string())?;
     if repository.head().as_deref() != Some(&agreed) {
         return Err(
-            "同期用の記録が合意内容と一致しません。先にpolaris sync pullを実行してください。"
-                .into(),
+            "Sync records do not match the agreed content. Run polaris sync pull first.".into(),
         );
     }
     repository.restore(&agreed).map_err(|e| e.to_string())?;
@@ -8909,27 +9180,27 @@ fn sync_action(
         )
         .map_err(|e| e.to_string())?;
         if !shaped.deferred.is_empty() {
-            return Err("未作成ディレクトリの共有変更が残っています".to_string());
+            return Err("Shared changes requiring new directories remain".to_string());
         }
         let changes =
             apply::planned_changes(&snapshot, &secrets, limits).map_err(|e| e.to_string())?;
         if !changes.is_applicable() {
-            return Err("保護対象を含むため共有内容を適用できません".into());
+            return Err("Cannot apply shared content containing protected resources".into());
         }
         Ok::<_, String>((snapshot, changes))
     })
-    .map_err(|_| "保護状態を確認できません".to_string())??;
+    .map_err(|_| "Cannot verify protection state".to_string())??;
     let revision = |value: &str| -> Result<RevisionV1, String> {
         let kind = match value.len() {
             40 => RevisionKindV1::GitSha1,
             64 => RevisionKindV1::GitSha256,
-            _ => return Err("合意revisionの形式を確認できません".into()),
+            _ => return Err("Cannot verify the agreed revision format".into()),
         };
         if !value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err("合意revisionの形式を確認できません".into());
+            return Err("Cannot verify the agreed revision format".into());
         }
         Ok(RevisionV1 {
             kind,
@@ -8946,7 +9217,7 @@ fn sync_action(
         project: project.display().to_string(),
         operation: management_operation_id.to_string(),
         revision: agreed.clone(),
-        previous_revision: held.applied_commit.clone().unwrap_or_else(|| "なし".into()),
+        previous_revision: held.applied_commit.clone().unwrap_or_else(|| "none".into()),
         recovery,
         changes: changes
             .changes
@@ -8955,7 +9226,7 @@ fn sync_action(
             .collect(),
     };
     if !confirm(&view) {
-        return Ok("共有内容の適用を取り消しました".into());
+        return Ok("Shared content apply cancelled".into());
     }
     held.applied_commit = Some(agreed);
     let admission = C12ApplyAdmissionV1 {
@@ -8970,14 +9241,14 @@ fn sync_action(
     // Apply precisely the inspected snapshot; do not reconstruct it after y.
     let report = owner
         .apply_c12(admission, &snapshot, &changes, limits, &parent)
-        .map_err(|e| format!("反映を確定できません。/syncで状態を確認してください: {e}"))?;
+        .map_err(|e| format!("Cannot finalize the apply. Inspect state with /sync: {e}"))?;
     if let Some(failure) = report.failure {
         return Err(format!(
-            "適用結果は未確定です: {failure:?}。/syncで状態を確認してください。"
+            "Apply outcome is unknown: {failure:?}. Inspect state with /sync."
         ));
     }
     Ok(format!(
-        "{}件を反映しました。復旧用の控え: {}",
+        "Applied {} items. Recovery backup: {}",
         report.entries.len(),
         view.recovery
     ))
@@ -9039,7 +9310,7 @@ fn handle_sync_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
     .and_then(|()| {
         if is_c10_sync_request(requested) {
             c10_tui_invocation(requested)?;
-            return Err("C10操作にはmainが所有するpending jobが必要です".into());
+            return Err("C10 operations require a pending job owned by main".into());
         }
         sync_action(project, state, requested, has_queued_input, |view| {
             confirm_sync(terminal, reader, view)
@@ -9051,7 +9322,7 @@ fn handle_sync_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 text.lines()
                     .map(|line| ratatui::text::Line::from(render::sanitize(line))),
             );
-            *status = Status::Notice("共有適用の状態を表示しました".into());
+            *status = Status::Notice("Shared apply state displayed".into());
         }
         Err(error) => *status = Status::Error(render::sanitize(&error)),
     }
@@ -9073,8 +9344,7 @@ async fn handle_source_apply_action<B: ratatui::backend::Backend, R: approver::K
 ) {
     let mutating = requested.starts_with("run ") || requested.starts_with("resolve ");
     if mutating && (queued || session.check_persistence().is_err()) {
-        *status =
-            Status::Error("送信待ちまたは保存エラーを解消してからD27を操作してください".into());
+        *status = Status::Error("Resolve queued input or storage errors before using D27".into());
         return;
     }
     if frontend.is_err() {
@@ -9090,7 +9360,7 @@ async fn handle_source_apply_action<B: ratatui::backend::Backend, R: approver::K
                 text.lines()
                     .map(|line| ratatui::text::Line::from(render::sanitize(line))),
             );
-            *status = Status::Notice("D27の状態を表示しました".into());
+            *status = Status::Notice("D27 state displayed".into());
         }
         Err(error) => *status = Status::Error(render::sanitize(&error)),
     }
@@ -9139,7 +9409,7 @@ fn workflow_override_candidate(
     let current = session
         .workflow
         .as_ref()
-        .ok_or("保存済みworkflow設定がありません")?;
+        .ok_or("No saved workflow configuration")?;
     let mut config = current.config.clone();
     config.enabled = requested.enabled;
     config.mode = requested.mode;
@@ -9183,7 +9453,7 @@ fn apply_confirmed_workflow_change(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("workflow設定を保存する会話がありません")?;
+        .ok_or("No conversation to store workflow settings")?;
     let preview = match WorkflowChangeOwner::preview(persistence, inventory, &candidate) {
         Ok(preview) => preview,
         Err(WorkflowChangeError::NoChange) => return Ok(WorkflowChangeResult::NoChange),
@@ -9191,10 +9461,10 @@ fn apply_confirmed_workflow_change(
     };
     let before_config = preview
         .before_config()
-        .ok_or("変更前のworkflow設定がありません")?;
+        .ok_or("Missing workflow configuration before the change")?;
     let candidate_config = preview
         .candidate_config()
-        .ok_or("変更後のworkflow設定がありません")?;
+        .ok_or("Missing workflow configuration after the change")?;
     let before_phase = preview.before_workflow().phase.to_string();
     let after_phase = preview.candidate_workflow().phase.to_string();
     let view = render::WorkflowChangeConfirmView {
@@ -9260,7 +9530,7 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
     use polaris_core::management_effect::workflow_change::WorkflowEffectInventoryV1;
 
     if has_queued_input {
-        *status = Status::Notice("送信待ちを空にしてからworkflowを変更してください".into());
+        *status = Status::Notice("Clear queued input before changing workflow settings".into());
         return;
     }
     let result = (|| -> Result<Option<String>, String> {
@@ -9270,14 +9540,16 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
         let current = session
             .workflow
             .as_ref()
-            .ok_or("workflowはこのセッションで無効です")?;
+            .ok_or("Workflow is disabled for this session")?;
         let (inventory, candidate, notice) = match action {
             slash::Action::Phase(requested) => {
                 if requested.is_empty() {
-                    return Ok(Some(format!("ワークフロー段階: {}", current.state().phase)));
+                    return Ok(Some(format!("Workflow phase: {}", current.state().phase)));
                 }
                 if !current.config.enabled {
-                    return Err("workflowが無効な会話ではphaseを変更できません".into());
+                    return Err(
+                        "Cannot change phase in a conversation with workflow disabled".into(),
+                    );
                 }
                 let phase = requested.parse::<polaris_core::workflow::Phase>()?;
                 let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
@@ -9290,7 +9562,7 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
                 (
                     WorkflowEffectInventoryV1::T03,
                     candidate,
-                    format!("ワークフロー段階: {phase}"),
+                    format!("Workflow phase: {phase}"),
                 )
             }
             slash::Action::Workflow(requested) => {
@@ -9314,7 +9586,7 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
                         config.enabled = false;
                         config.mode = polaris_core::workflow::WorkflowMode::Manual;
                     }
-                    _ => return Err("workflow modeは manual、adaptive、off のいずれかです".into()),
+                    _ => return Err("Workflow mode must be manual, adaptive, or off".into()),
                 }
                 let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
                     config,
@@ -9325,7 +9597,7 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
                 let notice = format!("workflow: {}", workflow_mode_name(&candidate.config));
                 (WorkflowEffectInventoryV1::T04, candidate, notice)
             }
-            _ => return Err("workflow操作の種類が不正です".into()),
+            _ => return Err("Invalid workflow operation kind".into()),
         };
         if candidate.config.enabled {
             drop(candidate.begin_turn_from_disk(skills)?);
@@ -9345,8 +9617,8 @@ fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::Key
     })();
     *status = match result {
         Ok(Some(notice)) => Status::Notice(notice),
-        Ok(None) => Status::Notice("workflow変更を取り消しました".into()),
-        Err(error) => Status::Error(format!("workflowを保存できません: {error}")),
+        Ok(None) => Status::Notice("Workflow change cancelled".into()),
+        Err(error) => Status::Error(format!("Cannot save workflow: {error}")),
     };
 }
 
@@ -9368,7 +9640,7 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
     let persistence = session
         .persistence
         .as_ref()
-        .ok_or("この会話には巻き戻し可能な保存履歴がありません")?;
+        .ok_or("This conversation has no rewindable saved history")?;
     let boundaries = persistence
         .list_rewind_boundaries()
         .map_err(|error| error.to_string())?;
@@ -9386,7 +9658,7 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
     if rows.is_empty() {
         run_rewind_picker(terminal, reader, &rows, unavailable_reason);
         return Err(format!(
-            "検証済みの巻き戻し境界がありません: {unavailable_reason}"
+            "No verified rewind boundaries: {unavailable_reason}"
         ));
     }
     let Some(selected_id) = run_rewind_picker(terminal, reader, &rows, unavailable_reason) else {
@@ -9395,13 +9667,13 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
     let selected = boundaries
         .iter()
         .find(|boundary| boundary.boundary_id == selected_id)
-        .ok_or("選択した巻き戻し境界が見つかりません")?
+        .ok_or("The selected rewind boundary was not found")?
         .clone();
-    let latest = boundaries.last().ok_or("巻き戻し境界がありません")?;
+    let latest = boundaries.last().ok_or("No rewind boundary")?;
     let expected_post: polaris_core::rewind_workspace::ManifestId = latest
         .completion
         .as_ref()
-        .ok_or("最新の巻き戻し境界が未完了です")?
+        .ok_or("The latest rewind boundary is incomplete")?
         .workspace_post_manifest_id
         .parse()
         .map_err(|error: polaris_core::rewind_workspace::IdParseError| error.to_string())?;
@@ -9417,7 +9689,7 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
     };
     if !preview.restorable {
         return Err(format!(
-            "ファイルを復元できません: {:?}",
+            "Cannot restore files: {:?}",
             preview.blocked_reason
         ));
     }
@@ -9479,7 +9751,7 @@ async fn build_rewound_session(
     candidate
         .recover_history()
         .await
-        .map_err(|error| format!("巻き戻し先の履歴を復元できません: {error}"))?;
+        .map_err(|error| format!("Cannot restore history at the rewind destination: {error}"))?;
     #[cfg(target_os = "linux")]
     if signal::pending_linux_process_shutdown().is_some() {
         return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
@@ -9492,10 +9764,10 @@ async fn build_rewound_session(
         args.tool_memory,
         args.tool_memory_embedding.clone(),
     )
-    .map_err(|error| format!("巻き戻し先のツール記憶を復元できません: {error}"))?;
+    .map_err(|error| format!("Cannot restore tool memory at the rewind destination: {error}"))?;
     if args.remember {
         memory::configure_saved_memory(&mut candidate, &args.cwd, &args.state_dir, &path)
-            .map_err(|error| format!("巻き戻し先の記憶を復元できません: {error}"))?;
+            .map_err(|error| format!("Cannot restore memory at the rewind destination: {error}"))?;
     }
     Ok((candidate, path))
 }
@@ -9515,11 +9787,11 @@ fn reload_rewound_project_context(
 ) -> Result<RewoundProjectContext, String> {
     let project = polaris_core::project::resolve_root(cwd);
     let config = polaris_core::config::load(&project)
-        .map_err(|error| format!("復元後の設定を読み直せません: {error}"))?;
+        .map_err(|error| format!("Cannot reload settings after restoration: {error}"))?;
     let skills = polaris_skills::discover(&project, &config.skills_paths).skills;
     let agents = polaris_skills::discover_agent_types(&project, &config.agents_paths).agent_types;
     let host = polaris_core::mcp::local::LocalHost::open(cwd, false)
-        .map_err(|error| format!("復元後のMCP設定を読み直せません: {error}"))?;
+        .map_err(|error| format!("Cannot reload MCP settings after restoration: {error}"))?;
     let setup = Arc::new(host.setup_tool(mcp_ceiling));
     Ok((skills, agents, host, setup))
 }
@@ -9575,10 +9847,10 @@ fn rewind_composite_result(
 ) -> Result<(), String> {
     match result {
         Ok(Some(effect)) => Err(format!(
-            "未解決の管理操作 {} ({}) があるため巻き戻せません",
+            "Cannot rewind due to unresolved management operation {} ({})",
             effect.request.operation_id, effect.request.inventory
         )),
-        Err(error) => Err(format!("管理操作の状態を確認できません: {error}")),
+        Err(error) => Err(format!("Cannot verify management operation state: {error}")),
         Ok(None) => Ok(()),
     }
 }
@@ -9594,12 +9866,12 @@ fn read_rewind_transaction(
 ) -> Result<polaris_core::rewind_workspace::RewindTransactionReadback, String> {
     let readback = owner
         .transaction_readback_with_lease(lease, transaction_id)
-        .map_err(|error| format!("巻き戻しtransactionを同期・再読込できません: {error}"))?;
+        .map_err(|error| format!("Cannot sync and reload the rewind transaction: {error}"))?;
     if readback.candidate_session_id.as_deref() != Some(branch_id)
         || readback.expected_post != *expected_post
         || readback.target_pre != *target_pre
     {
-        return Err("巻き戻しtransactionと子会話の証拠が一致しません".into());
+        return Err("Rewind transaction and child conversation evidence mismatch".into());
     }
     Ok(readback)
 }
@@ -9617,16 +9889,16 @@ fn rollback_known_rewind(
     use polaris_core::rewind_workspace::RewindTransactionPhase;
 
     if before.phase != RewindTransactionPhase::PendingActivation {
-        return Err("巻き戻しtransactionは安全にrollbackできる状態ではありません".into());
+        return Err("The rewind transaction cannot be safely rolled back".into());
     }
     let restored = before
         .restored_manifest_id
-        .ok_or("巻き戻し後のmanifestがありません")?;
+        .ok_or("Missing post-rewind manifest")?;
     if !owner
         .matches_manifest(&restored)
         .map_err(|error| error.to_string())?
     {
-        return Err("巻き戻し後の作業ファイルが既知の状態と一致しません".into());
+        return Err("Post-rewind workspace files do not match a known state".into());
     }
     let write = owner.rollback_with_lease(lease, transaction_id);
     let after = read_rewind_transaction(
@@ -9641,10 +9913,10 @@ fn rollback_known_rewind(
         Ok(())
     } else {
         Err(format!(
-            "rollback結果を確認できません: {}",
+            "Cannot verify the rollback result: {}",
             write
                 .err()
-                .map_or_else(|| "phase不一致".into(), |error| error.to_string())
+                .map_or_else(|| "phase mismatch".into(), |error| error.to_string())
         ))
     }
 }
@@ -9661,7 +9933,7 @@ fn commit_rewind_if_unblocked(
     use polaris_core::rewind_workspace::RewindTransactionPhase;
 
     let lease = owner.try_mutation().map_err(|error| RewindFailure {
-        message: format!("巻き戻し確定用のproject leaseを取得できません: {error}"),
+        message: format!("Cannot acquire the project lease for rewind finalization: {error}"),
         fatal: true,
     })?;
     if let Err(blocker) = ensure_rewind_unblocked_with_lease(owner.project_root(), effects, &lease)
@@ -9691,7 +9963,9 @@ fn commit_rewind_if_unblocked(
                 fatal: false,
             },
             Err(recovery) => RewindFailure {
-                message: format!("巻き戻しの確定前に復旧できません: {blocker}; {recovery}"),
+                message: format!(
+                    "Cannot recover before rewind finalization: {blocker}; {recovery}"
+                ),
                 fatal: true,
             },
         });
@@ -9706,15 +9980,15 @@ fn commit_rewind_if_unblocked(
         target_pre,
     )
     .map_err(|error| RewindFailure {
-        message: format!("巻き戻しの確定結果が不明です: {error}"),
+        message: format!("Rewind finalization outcome is unknown: {error}"),
         fatal: true,
     })?;
     match readback.phase {
         RewindTransactionPhase::Committed => Ok(()),
         RewindTransactionPhase::PendingActivation => {
             let reason = write.err().map_or_else(
-                || "確定後のphaseが未終端です".to_string(),
-                |error| format!("巻き戻しの確定に失敗しました: {error}"),
+                || "Post-finalization phase is nonterminal".to_string(),
+                |error| format!("Rewind finalization failed: {error}"),
             );
             match rollback_known_rewind(
                 owner,
@@ -9730,13 +10004,13 @@ fn commit_rewind_if_unblocked(
                     fatal: false,
                 }),
                 Err(recovery) => Err(RewindFailure {
-                    message: format!("{reason}; 復旧できません: {recovery}"),
+                    message: format!("{reason}; cannot recover: {recovery}"),
                     fatal: true,
                 }),
             }
         }
         _ => Err(RewindFailure {
-            message: "巻き戻しの確定phaseを確認できません。再起動して復旧してください".into(),
+            message: "Cannot verify the rewind finalization phase. Restart to recover".into(),
             fatal: true,
         }),
     }
@@ -9762,19 +10036,19 @@ async fn perform_rewind(
         },
     )?;
     let persistence = source.persistence.as_ref().ok_or_else(|| RewindFailure {
-        message: "巻き戻し元の保存済みセッションがありません".into(),
+        message: "No saved session for the rewind source".into(),
         fatal: false,
     })?;
     let branch = persistence
         .prepare_rewind_branch(owner, &boundary.boundary_id)
         .map_err(|error| RewindFailure {
-            message: format!("会話分岐を準備できません: {error}"),
+            message: format!("Cannot prepare the conversation fork: {error}"),
             fatal: false,
         })?;
     let branch_id = branch
         .snapshot()
         .map_err(|error| RewindFailure {
-            message: format!("会話分岐を検証できません: {error}"),
+            message: format!("Cannot verify the conversation fork: {error}"),
             fatal: false,
         })?
         .state
@@ -9784,12 +10058,12 @@ async fn perform_rewind(
         Err(error) => {
             return match owner.resolve_pending() {
                 Ok(_) => Err(RewindFailure {
-                    message: format!("ファイルを復元できません: {error}"),
+                    message: format!("Cannot restore files: {error}"),
                     fatal: false,
                 }),
                 Err(recovery) => Err(RewindFailure {
                     message: format!(
-                        "ファイル復元に失敗し、途中状態を解決できません: {error}; {recovery}"
+                        "File restoration failed and the intermediate state cannot be resolved: {error}; {recovery}"
                     ),
                     fatal: true,
                 }),
@@ -9799,7 +10073,7 @@ async fn perform_rewind(
     let candidate = async {
         args.always_on
             .system_for_request()
-            .map_err(|error| format!("復元後の指示を読み直せません: {error}"))?;
+            .map_err(|error| format!("Cannot reload instructions after restoration: {error}"))?;
         let (skills, agent_types, mcp_host, mcp_setup) =
             reload_rewound_project_context(&args.cwd, mcp_ceiling)?;
         let (session, session_path) = build_rewound_session(source, branch, args, &skills).await?;
@@ -9844,12 +10118,12 @@ async fn perform_rewind(
             })();
             return match recovery {
                 Ok(()) => Err(RewindFailure {
-                    message: format!("巻き戻し先を準備できません: {error}"),
+                    message: format!("Cannot prepare the rewind destination: {error}"),
                     fatal: false,
                 }),
                 Err(recovery) => Err(RewindFailure {
                     message: format!(
-                        "巻き戻し先の準備に失敗し、元のファイルへ復旧できません: {error}; {recovery}"
+                        "Rewind destination preparation failed and original files cannot be recovered: {error}; {recovery}"
                     ),
                     fatal: true,
                 }),
@@ -9869,11 +10143,11 @@ async fn perform_rewind(
         .persistence
         .as_ref()
         .ok_or_else(|| RewindFailure {
-            message: format!("確定した子会話 {branch_id} の保存先を確認できません"),
+            message: format!("Cannot verify storage for finalized child conversation {branch_id}"),
             fatal: true,
         })?;
     validate_resume_workspace(owner, committed).map_err(|error| RewindFailure {
-        message: format!("確定した子会話 {branch_id} を再読込できません: {error}"),
+        message: format!("Cannot reload finalized child conversation {branch_id}: {error}"),
         fatal: true,
     })?;
     Ok(candidate)
@@ -9909,14 +10183,14 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     let mut summaries = match sessions::try_list_sessions(sessions_dir) {
         Ok(summaries) => summaries,
         Err(error) => {
-            *status = Status::Error(format!("保存会話の一覧を読めません: {error}"));
+            *status = Status::Error(format!("Cannot read the saved conversation list: {error}"));
             return;
         }
     };
     #[cfg(not(target_os = "linux"))]
     let mut summaries = sessions::list_sessions(sessions_dir);
     let Some(data_root) = sessions_dir.parent() else {
-        *status = Status::Notice("v2セッションの保存先が不正です".into());
+        *status = Status::Notice("Invalid v2 session storage location".into());
         return;
     };
     let project_id = persist::project_identity(&polaris_core::project::resolve_root(
@@ -9936,12 +10210,14 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 Ok(v2) => {
                     summaries.extend(v2);
                     if summaries.len() > 256 {
-                        *status = Status::Error("会話一覧が256件を超えています".into());
+                        *status = Status::Error("The conversation list exceeds 256 entries".into());
                         return;
                     }
                 }
                 Err(error) => {
-                    *status = Status::Error(format!("v2保存会話の一覧を読めません: {error}"));
+                    *status = Status::Error(format!(
+                        "Cannot read the saved v2 conversation list: {error}"
+                    ));
                     return;
                 }
             }
@@ -9979,14 +10255,14 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     if selected.kind == sessions::SessionKind::V2 {
         #[cfg(unix)]
         if rewind_workspace.is_none() {
-            *status =
-                Status::Notice("作業ファイルの検証ownerがないため会話を再開できません".into());
+            *status = Status::Notice(
+                "Cannot resume the conversation without a workspace file verification owner".into(),
+            );
             return;
         }
         let Some(project_id) = project_id.as_deref() else {
-            *status = Status::Notice(
-                "プロジェクト識別子を取得できないためv2セッションを再開できません".into(),
-            );
+            *status =
+                Status::Notice("Cannot resume the v2 session without a project identifier".into());
             return;
         };
         let strict_history = session.strict_history.clone();
@@ -10005,7 +10281,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
             .map_err(|error| error.to_string())?;
             #[cfg(unix)]
             persistence
-                .abandon_unfinished_rewind_boundaries("前回の実行が完了する前に終了しました".into())
+                .abandon_unfinished_rewind_boundaries("The previous execution exited before completion".into())
                 .map_err(|error| error.to_string())?;
             #[cfg(unix)]
             if let Some(owner) = rewind_workspace
@@ -10024,7 +10300,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                     &messages,
                     &source.display().to_string(),
                 );
-                return Err(format!("{error}。会話は閲覧のみ可能です"));
+                return Err(format!("{error}. The conversation is view-only"));
             }
             #[cfg(target_os="linux")]
             let mut frozen_resume=resume_effect::ResumeSubjectV1::Persisted(&persistence).identity()?;
@@ -10034,7 +10310,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 && previous.store.directory()==persistence.store.directory()
                 && resume_effect::ResumeSubjectV1::Persisted(previous).identity()?!=frozen_resume
             {
-                return Err("変更前の会話が選択先と一致しません".into());
+                return Err("The previous conversation does not match the selection".into());
             }
             let mut restored = polaris_core::session::Session::new();
             restored.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
@@ -10058,22 +10334,22 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 .await?;
                 #[cfg(target_os = "linux")]
                 if signal::pending_linux_process_shutdown().is_some() {
-                    return Err("停止要求を受信しました".into());
+                    return Err("Stop request received".into());
                 }
                 #[cfg(not(unix))]
-                return Err("workflow変更には管理操作が必要です".into());
+                return Err("A workflow change requires a management operation".into());
                 #[cfg(unix)]
                 {
                     restored
                         .recover_history()
                         .await
-                        .map_err(|error| format!("strict10履歴を復元できません: {error}"))?;
+                        .map_err(|error| format!("Cannot restore strict10 history: {error}"))?;
                     #[cfg(target_os = "linux")]
                     if signal::pending_linux_process_shutdown().is_some() {
-                        return Err("停止要求を受信しました".into());
+                        return Err("Stop request received".into());
                     }
-                    let workspace = rewind_workspace.ok_or("project mutation ownerがありません")?;
-                    let effects = management_effects.ok_or("管理操作の記録がありません")?;
+                    let workspace = rewind_workspace.ok_or("No project mutation owner")?;
+                    let effects = management_effects.ok_or("No management operation record")?;
                     let candidate = workflow_override_candidate(&restored, workflow_config, skills)?;
                     match apply_confirmed_workflow_change(
                         &mut restored,
@@ -10085,7 +10361,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         |view| confirm_workflow_change(terminal, reader, view),
                     )? {
                         WorkflowChangeResult::Cancelled => {
-                            return Err("workflow変更を取り消しました".into());
+                            return Err("Workflow change cancelled".into());
                         }
                         WorkflowChangeResult::Changed | WorkflowChangeResult::NoChange => {}
                     }
@@ -10104,7 +10380,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 #[cfg(target_os="linux")]
                 if let Some(publication) = publication {
                     if resume_effect::ResumeIdentityV1::published_snapshot(&publication.before)? != frozen_resume {
-                        return Err("互換復旧前に選択した会話が変更されました".into());
+                        return Err("The selected conversation changed before compatibility recovery".into());
                     }
                     frozen_resume = resume_effect::ResumeIdentityV1::published_snapshot(&publication.published)?;
                     compatibility_published = true;
@@ -10113,21 +10389,21 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 let _ = publication;
                 #[cfg(target_os = "linux")]
                 if signal::pending_linux_process_shutdown().is_some() {
-                    return Err("停止要求を受信しました".into());
+                    return Err("Stop request received".into());
                 }
                 restored
                     .recover_history()
                     .await
-                    .map_err(|error| format!("strict10履歴を復元できません: {error}"))?;
+                    .map_err(|error| format!("Cannot restore strict10 history: {error}"))?;
                 #[cfg(target_os = "linux")]
                 if signal::pending_linux_process_shutdown().is_some() {
-                    return Err("停止要求を受信しました".into());
+                    return Err("Stop request received".into());
                 }
             }
             #[cfg(target_os="linux")]
             {
-                let restored_saved=restored.persistence.as_ref().ok_or("復元先の会話がありません")?;
-                if !workflow_mode_overridden && resume_effect::ResumeSubjectV1::Persisted(restored_saved).identity()?!=frozen_resume {return Err("復元中に選択した会話が変更されました".into());}
+                let restored_saved=restored.persistence.as_ref().ok_or("No destination conversation")?;
+                if !workflow_mode_overridden && resume_effect::ResumeSubjectV1::Persisted(restored_saved).identity()?!=frozen_resume {return Err("The selected conversation changed during restoration".into());}
             }
             Ok::<_, String>(restored)
         }
@@ -10137,13 +10413,12 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 #[cfg(target_os = "linux")]
                 {
                     let result = (|| -> Result<(), String> {
-                        let workspace =
-                            rewind_workspace.ok_or("project mutation ownerがありません")?;
-                        let effects = management_effects.ok_or("管理効果ownerがありません")?;
+                        let workspace = rewind_workspace.ok_or("No project mutation owner")?;
+                        let effects = management_effects.ok_or("No management effect owner")?;
                         let target = restored
                             .persistence
                             .clone()
-                            .ok_or("選択したv2会話がありません")?;
+                            .ok_or("The selected v2 conversation does not exist")?;
                         // F15 or compatibility recovery has published this
                         // exact session. Use its verified new cursor.
                         let same_session_override = (workflow_mode_overridden
@@ -10179,17 +10454,17 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         let accepted = account::confirm(
                             terminal,
                             reader,
-                            "会話を選択",
+                            "Select conversation",
                             &selected.id,
-                            "選択した保存会話のworkspace対応と原文を確認し、この会話へ切り替えます。",
+                            "Verify the selected saved conversation's workspace association and original text, then switch to it.",
                         );
                         let mut candidate = Some(restored);
                         owner.execute(&prepared, from, to, accepted, || {
-                            *session = candidate.take().ok_or("復元候補がありません")?;
+                            *session = candidate.take().ok_or("No restore candidates")?;
                             Ok(())
                         })?;
                         if !accepted {
-                            return Err("会話の選択を取り消しました".into());
+                            return Err("Conversation selection cancelled".into());
                         }
                         Ok(())
                     })();
@@ -10213,7 +10488,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 *status = Status::Idle;
             }
             Err(error) => {
-                *status = Status::Notice(format!("v2セッションを再開できません: {error}"))
+                *status = Status::Notice(format!("Cannot resume the v2 session: {error}"))
             }
         }
         return;
@@ -10221,7 +10496,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
 
     if workflow_mode_overridden {
         *status =
-            Status::Notice("旧形式の会話への--workflow-mode適用には移行管理操作が必要です".into());
+            Status::Notice("Applying --workflow-mode to a legacy conversation requires a migration management operation".into());
         return;
     }
     let new_session_path = selected.path;
@@ -10238,18 +10513,20 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         &new_session_path.display().to_string(),
                     ),
                     Err(error) => {
-                        *status = Status::Notice(format!("会話の原文を読めません: {error}"));
+                        *status = Status::Notice(format!(
+                            "Cannot read the conversation source text: {error}"
+                        ));
                         return;
                     }
                 }
                 *status = Status::Notice(
-                    "旧形式の会話は保存済み作業ファイルとの対応記録がないため、閲覧のみ可能です"
+                    "The legacy conversation is view-only because it has no saved workspace file association"
                         .into(),
                 );
                 return;
             }
             Err(error) => {
-                *status = Status::Notice(format!("作業ファイルを確認できません: {error}"));
+                *status = Status::Notice(format!("Cannot verify workspace files: {error}"));
                 return;
             }
             Ok(false) => {}
@@ -10260,7 +10537,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
             if let Some(previous) = session.persistence.clone() {
                 let Some(project_id) = project_id.as_deref() else {
                     *status = Status::Notice(
-                        "プロジェクト識別子を取得できないため旧セッションを移行できません".into(),
+                        "Cannot migrate the legacy session without a project identifier".into(),
                     );
                     return;
                 };
@@ -10295,7 +10572,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                             && let Err(error) = validate_resume_workspace(owner, &persistence)
                         {
                             *status = Status::Notice(format!(
-                                "旧セッションを現在の作業ファイルへ結び付けられません: {error}"
+                                "Cannot bind the legacy session to current workspace files: {error}"
                             ));
                             return;
                         }
@@ -10305,8 +10582,9 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                             disable_files_md_auto_regenerate;
                         imported.workflow = workflow;
                         if let Err(error) = imported.attach(persistence) {
-                            *status =
-                                Status::Notice(format!("旧セッションを移行できません: {error}"));
+                            *status = Status::Notice(format!(
+                                "Cannot migrate the legacy session: {error}"
+                            ));
                             return;
                         }
                         imported.strict_history = strict_history;
@@ -10314,7 +10592,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         imported.examples = examples;
                         if let Err(error) = imported.recover_history().await {
                             *status =
-                                Status::Notice(format!("strict10履歴を復元できません: {error}"));
+                                Status::Notice(format!("Cannot restore strict10 history: {error}"));
                             return;
                         }
                         #[cfg(target_os = "linux")]
@@ -10324,7 +10602,8 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         *session = imported;
                     }
                     Err(error) => {
-                        *status = Status::Notice(format!("旧セッションを移行できません: {error}"));
+                        *status =
+                            Status::Notice(format!("Cannot migrate the legacy session: {error}"));
                         return;
                     }
                 }
@@ -10341,14 +10620,14 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
             local_lines.clear();
             *status = if truncated {
                 Status::Notice(format!(
-                    "{} に破損行があったため、その前までのメッセージを再開しました",
+                    "A corrupt line was found in {}. Resumed messages up to that point",
                     session_path.display()
                 ))
             } else {
                 Status::Idle
             };
         }
-        Err(e) => *status = Status::Notice(format!("セッションを再開できません: {e}")),
+        Err(e) => *status = Status::Notice(format!("Cannot resume the session: {e}")),
     }
 }
 
@@ -10410,7 +10689,7 @@ fn handle_new_session_with(
         let snapshot = match previous.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
+                *status = Status::Notice(format!("Cannot create a new v2 session: {error}"));
                 return false;
             }
         };
@@ -10436,7 +10715,7 @@ fn handle_new_session_with(
                 id
             }
             Err(error) => {
-                *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
+                *status = Status::Notice(format!("Cannot create a new v2 session: {error}"));
                 return false;
             }
         }
@@ -10529,11 +10808,9 @@ fn handle_fork_with(
                 *session_path = sessions_dir.join(format!("{id}.jsonl"));
                 *meta_path = session_path.with_extension("meta.json");
                 *session_started_at_millis = now_millis();
-                *status = Status::Notice(format!("v2セッションへ分岐しました: {id}"));
+                *status = Status::Notice(format!("Forked into v2 session: {id}"));
             }
-            Err(error) => {
-                *status = Status::Notice(format!("v2セッションを分岐できません: {error}"))
-            }
+            Err(error) => *status = Status::Notice(format!("Cannot fork the v2 session: {error}")),
         }
         return;
     }
@@ -10549,7 +10826,7 @@ fn handle_fork_with(
         Ok(origin) => origin,
         Err(error) => {
             *status = Status::Notice(format!(
-                "記憶の出自を確認できないため分岐できません: {error}"
+                "Cannot fork because memory provenance cannot be verified: {error}"
             ));
             return;
         }
@@ -10564,12 +10841,14 @@ fn handle_fork_with(
             match saved_tool_memory_namespace(std::path::Path::new(cwd_display), session_path) {
                 Ok((id, origins)) if origins.len() < MAX_TOOL_MEMORY_ORIGINS => Some(id),
                 Ok(_) => {
-                    *status = Status::Notice("記憶の系譜が上限に達したため分岐できません".into());
+                    *status = Status::Notice(
+                        "Cannot fork because memory lineage reached the limit".into(),
+                    );
                     return;
                 }
                 Err(error) => {
                     *status = Status::Notice(format!(
-                        "記憶の出自を確認できないため分岐できません: {error}"
+                        "Cannot fork because memory provenance cannot be verified: {error}"
                     ));
                     return;
                 }
@@ -10579,7 +10858,7 @@ fn handle_fork_with(
         };
     if needs_memory_origin && memory_origin.is_none() {
         *status = Status::Notice(
-            "記憶の出自を確認できないため分岐できません。元の会話はそのまま継続できます。".into(),
+            "Cannot fork because memory provenance cannot be verified. The original conversation can continue unchanged.".into(),
         );
         return;
     }
@@ -10616,7 +10895,7 @@ fn handle_fork_with(
 
     *status = Status::Notice(if memory_origin.is_some() {
         format!(
-            "分岐先: {}。祖先の記憶は参照専用で、新しい記憶はこの分岐に保存します。祖先の記憶を削除すると、この分岐の記憶利用も無効になります。",
+            "Fork destination: {}. Ancestor memory is read-only; new memory is saved in this fork. Deleting ancestor memory also disables memory use in this fork.",
             new_session_path.display()
         )
     } else {
@@ -10642,13 +10921,13 @@ fn handle_managed_new_session(
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) -> bool {
     if session.persistence.is_none() {
-        *status = Status::Notice("管理記録付きの/newにはv2セッションが必要です".into());
+        *status = Status::Notice("/new with management records requires a v2 session".into());
         return false;
     }
     let lease = match owner.try_mutation() {
         Ok(lease) => lease,
         Err(error) => {
-            *status = Status::Notice(format!("新しい会話を開始できません: {error}"));
+            *status = Status::Notice(format!("Cannot start a new conversation: {error}"));
             return false;
         }
     };
@@ -10697,13 +10976,13 @@ fn handle_managed_fork(
     status: &mut Status,
 ) {
     if session.persistence.is_none() {
-        *status = Status::Notice("管理記録付きの/forkにはv2セッションが必要です".into());
+        *status = Status::Notice("/fork with management records requires a v2 session".into());
         return;
     }
     let lease = match owner.try_mutation() {
         Ok(lease) => lease,
         Err(error) => {
-            *status = Status::Notice(format!("会話を分岐できません: {error}"));
+            *status = Status::Notice(format!("Cannot fork the conversation: {error}"));
             return;
         }
     };
@@ -10815,7 +11094,7 @@ fn handle_permissions<B: ratatui::backend::Backend, R: approver::KeyReader>(
             *status = Status::Notice(format!("permissions set to {picked:?}"));
         } else {
             *status = Status::Notice(format!(
-                "起動時の承認境界と両立しません。--approval {} で再起動してください",
+                "Incompatible with the startup approval boundary. Restart with --approval {}",
                 render::approval_cli_value(picked)
             ));
         }
@@ -10884,48 +11163,6 @@ async fn discover_connected_local_models() -> Vec<ConnectedLocalModel> {
         discover_local_runtime(Runtime::LmStudio, "http://127.0.0.1:1234/"),
     );
     ollama.into_iter().chain(lmstudio).collect()
-}
-
-#[cfg(target_os = "linux")]
-async fn model_inventory_read_lines(
-    request: &str,
-) -> Result<Vec<ratatui::text::Line<'static>>, String> {
-    if !request.is_empty() && request != "list" {
-        return Err("/models [list]。インストール・削除は提供していません".into());
-    }
-    let mut lines = vec![ratatui::text::Line::from(
-        "モデル一覧: 利用可能性は接続先の報告、インストール状態は未確認です。",
-    )];
-    let Ok(models) =
-        tokio::time::timeout(Duration::from_secs(3), discover_connected_local_models()).await
-    else {
-        lines.push(ratatui::text::Line::from(
-            "一覧取得の期限を超えました。利用可能性は未確認です。",
-        ));
-        return Ok(lines);
-    };
-    if models.is_empty() {
-        lines.push(ratatui::text::Line::from(
-            "観測できた生成対応モデルはありません。未接続・取得失敗・生成非対応は区別できません。",
-        ));
-    }
-    for model in models.iter().take(64) {
-        lines.push(ratatui::text::Line::from(
-            render::sanitize(&format!(
-                "{} / available=接続先の報告 / installed=未確認",
-                model.display_name()
-            ))
-            .escape_debug()
-            .to_string(),
-        ));
-    }
-    if models.len() > 64 {
-        lines.push(ratatui::text::Line::from(format!(
-            "残り{}件は表示上限のため省略しました",
-            models.len() - 64
-        )));
-    }
-    Ok(lines)
 }
 
 /// Runs the `/model` picker — three hosted choices plus one local-runtime
@@ -11343,6 +11580,23 @@ fn apply_copy_action(
     *status = Status::Notice(clipboard::copy_last_reply_with(session, copy_fn));
 }
 
+/// Reveal only a file identified by a completed mouse click.
+#[cfg(target_os = "macos")]
+fn reveal_history_file(
+    view: &mut conversation_view::ConversationViewState,
+    mouse: ratatui::crossterm::event::MouseEvent,
+    cwd: &Path,
+    area: ratatui::layout::Rect,
+) -> Option<Status> {
+    let path = view
+        .file_click
+        .mouse(mouse, &view.history, cwd, area, view.scroll_offset)?;
+    Some(match file_reveal::reveal(&path) {
+        Ok(()) => Status::Notice("Requested file reveal in Finder".into()),
+        Err(error) => Status::Error(error),
+    })
+}
+
 /// `Up`'s copy handler for mouse drag-selection, mirroring
 /// `apply_copy_action`'s injectable-`copy_fn` pattern (see its own doc
 /// comment for why: real clipboard I/O must never run unconditionally in
@@ -11372,37 +11626,37 @@ fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), Str
 fn mcp_state_lines(cwd: &std::path::Path, external_enabled: bool) -> Vec<String> {
     let ceiling = polaris_core::mcp::operation::ExternalCeiling::host_external(external_enabled);
     let mut lines = vec![format!(
-        "外部MCPホスト上限: {}",
+        "External MCP host ceiling: {}",
         if ceiling.permits_external() {
-            "許可"
+            "allowed"
         } else {
-            "拒否"
+            "denied"
         }
     )];
     let Ok(host) = polaris_core::mcp::local::LocalHost::open(cwd, false) else {
-        lines.push("MCPの設定を読めません。".into());
+        lines.push("Cannot read MCP configuration.".into());
         return lines;
     };
     // Show the same external ceiling that the active run actually uses.
     let report = match host.state_report(ceiling) {
         Ok(report) => report,
         Err(error) => {
-            lines.push(format!("MCPの状態を読めません: {error}"));
+            lines.push(format!("Cannot read MCP state: {error}"));
             return lines;
         }
     };
     if report.is_empty() {
-        lines.push("登録されたMCPサーバーはありません。".into());
+        lines.push("No registered MCP servers.".into());
         return lines;
     }
-    lines.push(format!("MCPサーバー {}件", report.len()));
+    lines.push(format!("{} MCP servers", report.len()));
     for server in report {
         let state = match (&server.quarantine, server.enabled_here) {
             // A refused server is refused whether or not this project
             // enabled it, so the reason comes first.
-            (Some(reason), _) => format!("使えません（{reason}）"),
-            (None, false) => "このプロジェクトでは無効".to_owned(),
-            (None, true) => "有効".to_owned(),
+            (Some(reason), _) => format!("unavailable ({reason})"),
+            (None, false) => "disabled for this project".to_owned(),
+            (None, true) => "enabled".to_owned(),
         };
         lines.push(format!("  {} — {state}", server.server_id));
     }
@@ -11416,24 +11670,30 @@ fn rewind_candidate_diagnostic(
     cwd: &std::path::Path,
 ) -> Vec<ratatui::text::Line<'static>> {
     let Some(owner) = owner else {
-        return vec!["巻き戻し候補: workspace ownerを確認できません".into()];
+        return vec!["Rewind candidates: cannot verify the workspace owner".into()];
     };
     let Some(data_root) = sessions_dir.parent() else {
-        return vec!["巻き戻し候補: 保存先を特定できません".into()];
+        return vec!["Rewind candidates: cannot locate storage".into()];
     };
     let project_root = polaris_core::project::resolve_root(cwd);
     let project_id = match persist::project_identity(&project_root) {
         Ok(project_id) => project_id,
         Err(error) => {
-            return vec![format!("巻き戻し候補: projectを確認できません: {error}").into()];
+            return vec![format!("Rewind candidates: cannot verify the project: {error}").into()];
         }
     };
     let diagnostics =
         polaris_core::rewind_admission::candidate_diagnostics(owner, data_root, &project_id);
     if diagnostics.is_empty() {
-        return vec!["巻き戻し候補: 拒否・判定不能なし".into()];
+        return vec!["Rewind candidates: none refused or indeterminate".into()];
     }
-    let mut lines = vec![format!("巻き戻し候補: 拒否・判定不能 {}件", diagnostics.len()).into()];
+    let mut lines = vec![
+        format!(
+            "Rewind candidates: {} refused or indeterminate",
+            diagnostics.len()
+        )
+        .into(),
+    ];
     for diagnostic in diagnostics.iter().take(128) {
         lines.push(
             format!(
@@ -11447,7 +11707,7 @@ fn rewind_candidate_diagnostic(
     if diagnostics.len() > 128 {
         lines.push(
             format!(
-                "  他 {}件。保存領域を停止状態で確認してください",
+                "  {} more. Inspect storage while processing is stopped",
                 diagnostics.len() - 128
             )
             .into(),
@@ -11485,27 +11745,31 @@ fn doctor_lines(
             format!(
                 "{} ({})",
                 path.display(),
-                if path.is_dir() { "存在" } else { "未作成" }
+                if path.is_dir() {
+                    "present"
+                } else {
+                    "not created"
+                }
             )
         }
-        _ => "利用不可 (保存先を特定できません)".to_owned(),
+        _ => "unavailable (cannot locate storage)".to_owned(),
     };
     let rules = polaris_core::constitution::reach(&project_root);
     let delivered = rules.iter().map(|rule| rule.delivered).sum::<usize>();
     [
-        "診断 (read-only)".to_owned(),
-        format!("設定: provider={provider_name}, model={model_name}"),
+        "Diagnostics (read-only)".to_owned(),
+        format!("Configuration: provider={provider_name}, model={model_name}"),
         format!(
-            "設定: ChatGPT認証ファイル={}, API keyファイル={}, 環境API key={}",
+            "Configuration: ChatGPT credential file={}, API key file={}, environment API key={}",
             saved_chatgpt, saved_api_key, env_api_key
         ),
         format!(
-            "利用条件: sandbox={}, approval={approval:?}",
+            "Conditions: sandbox={}, approval={approval:?}",
             sandbox.describe()
         ),
-        format!("利用条件: 外部MCP={mcp_external}; 個別サーバーは /mcp で確認"),
-        format!("利用条件: state={state}; 常時指示の到達行数={delivered}"),
-        "観測: この診断は認証・モデル・MCPへ送信しません。接続成功と実資源の可用性は未検証です。"
+        format!("Conditions: external MCP={mcp_external}; inspect individual servers with /mcp"),
+        format!("Conditions: state={state}; delivered always-on instruction lines={delivered}"),
+        "Observation: this diagnostic does not contact authentication, model, or MCP endpoints. Connection success and actual resource availability are unverified."
             .to_owned(),
     ]
     .into_iter()
@@ -11518,35 +11782,44 @@ fn cat_diagnostic_lines(
 ) -> Vec<ratatui::text::Line<'static>> {
     match owner {
         None => vec![
-            status_row("CAT 構成", "shadow ownerなし"),
-            status_row("CAT 導入", "未照合"),
-            status_row("CAT 検証", "未確認"),
-            status_row("CAT 観測", "未取得"),
+            status_row("CAT configuration", "no shadow owner"),
+            status_row("CAT installation", "not reconciled"),
+            status_row("CAT verification", "unverified"),
+            status_row("CAT observation", "not retrieved"),
         ],
         Some(owner) => match owner.translation_observation() {
             Ok((requested, installed, verified, attempted)) => vec![
-                status_row("CAT 構成", &requested.to_string()),
+                status_row("CAT configuration", &requested.to_string()),
                 status_row(
-                    "CAT 導入",
+                    "CAT installation",
                     match installed {
-                        Some(true) => "導入確認",
-                        Some(false) => "未導入",
-                        None => "未照合",
+                        Some(true) => "Installation check",
+                        Some(false) => "not installed",
+                        None => "not reconciled",
                     },
                 ),
-                status_row("CAT 検証", &verified.to_string()),
+                status_row("CAT verification", &verified.to_string()),
                 status_row(
-                    "CAT 観測",
-                    &format!("{attempted} attempts（保存済み観測。実行の成功とは別です）"),
+                    "CAT observation",
+                    &format!(
+                        "{attempted} attempts (saved observations; distinct from execution success)"
+                    ),
                 ),
             ],
-            Err(_) => vec![status_row("CAT", "状態を読めません。可用性は未確認です。")],
+            Err(_) => vec![status_row(
+                "CAT",
+                "Cannot read state. Availability is unverified.",
+            )],
         },
     }
 }
 
 struct StatusSnapshot<'a> {
     session: &'a polaris_core::session::Session,
+    session_path: Option<&'a Path>,
+    accounts: Result<Vec<ratatui::text::Line<'static>>, String>,
+    #[cfg(unix)]
+    binding: Option<&'a dyn account::BindingControl>,
     provider_name: &'a str,
     model_name: &'a str,
     usage_report: polaris_provider::UsageReport,
@@ -11584,7 +11857,7 @@ fn status_row(label: &str, value: &str) -> ratatui::text::Line<'static> {
     use ratatui::text::{Line, Span};
     use unicode_width::UnicodeWidthStr;
 
-    const LABEL_WIDTH: usize = 16;
+    const LABEL_WIDTH: usize = 21;
     let prefix = if label.is_empty() {
         " ".repeat(LABEL_WIDTH + 4)
     } else {
@@ -11602,6 +11875,10 @@ fn status_row(label: &str, value: &str) -> ratatui::text::Line<'static> {
 fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static>> {
     let StatusSnapshot {
         session,
+        session_path,
+        accounts,
+        #[cfg(unix)]
+        binding,
         provider_name,
         model_name,
         usage_report,
@@ -11622,40 +11899,75 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
     } = snapshot;
     let usage = usage_report.usage;
     let mut lines = Vec::new();
-    status_section(&mut lines, "Polaris 状態 (read-only)");
-    lines.push(status_row("モデル", model_name));
+    status_section(&mut lines, "Polaris status (read-only)");
+    lines.push(status_row("Model", model_name));
     lines.push(status_row("provider", provider_name));
     lines.push(status_row(
         "effort",
         &format!(
-            "{}（固定overrideの変更はTUI非対応）",
+            "{} (changing fixed overrides is unsupported in TUI)",
             fixed_effort.unwrap_or("automatic")
         ),
     ));
     lines.push(status_row(
-        "会話",
+        "Conversation",
         &format!("{} messages", session.messages.len()),
     ));
 
-    status_section(&mut lines, "利用条件");
-    lines.push(status_row("承認（現在）", &format!("{approval:?}")));
+    let conversation_id = match &session.persistence {
+        Some(saved) => Some(
+            saved
+                .snapshot()
+                .map(|snapshot| snapshot.state.session_id)
+                .unwrap_or_else(|_| "unreadable".into()),
+        ),
+        None => session_path
+            .and_then(|path| path.file_stem())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned),
+    };
     lines.push(status_row(
-        "承認（起動時）",
+        "Session ID",
+        conversation_id.as_deref().unwrap_or("unsaved"),
+    ));
+    status_section(&mut lines, "Account");
+    #[cfg(unix)]
+    lines.push(status_row(
+        "Active registration",
+        &binding
+            .and_then(|binding| binding.current())
+            .map(|(id, generation)| format!("{id} (generation {generation})"))
+            .unwrap_or_else(|| {
+                "no fixed registration (legacy authentication or external provider)".into()
+            }),
+    ));
+    match accounts {
+        Ok(accounts) => lines.extend(accounts),
+        Err(error) => lines.push(status_row(
+            "Registration state",
+            &format!("unverified: {error}"),
+        )),
+    }
+
+    status_section(&mut lines, "Conditions");
+    lines.push(status_row("Approval (current)", &format!("{approval:?}")));
+    lines.push(status_row(
+        "Approval (startup)",
         &format!("{startup_approval:?}"),
     ));
     lines.push(status_row("sandbox", sandbox.mode().as_str()));
     for (index, root) in sandbox.writable_roots().iter().enumerate() {
         lines.push(status_row(
-            if index == 0 { "書き込み可能" } else { "" },
+            if index == 0 { "Writable roots" } else { "" },
             &root.display().to_string(),
         ));
     }
     lines.push(status_row(
-        "外部MCP",
-        &format!("{mcp_external}（個別サーバーは /mcp で確認）"),
+        "External MCP",
+        &format!("{mcp_external} (inspect individual servers with /mcp)"),
     ));
 
-    status_section(&mut lines, "観測・workflow");
+    status_section(&mut lines, "Observations and workflow");
     lines.push(status_row(
         "tokens",
         &format!(
@@ -11664,7 +11976,7 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
         ),
     ));
     lines.push(status_row(
-        "欠測 / 失敗",
+        "Missing / failed",
         &format!(
             "{} / {}",
             usage_report.missing_responses, usage_report.failed_requests,
@@ -11674,7 +11986,7 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
         let state = workflow.state();
         lines.push(status_row("phase", &state.phase.to_string()));
         if state.skills.is_empty() {
-            lines.push(status_row("skills", "なし"));
+            lines.push(status_row("skills", "none"));
         } else {
             for (index, skill) in state.skills.iter().enumerate() {
                 lines.push(status_row(
@@ -11686,30 +11998,33 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
         lines.push(status_row("manifest", &state.skill_manifest_hash));
     }
 
-    status_section(&mut lines, "可用性");
+    status_section(&mut lines, "Availability");
     lines.push(status_row(
-        "実接続",
-        "未検証（認証・モデル・MCP。接続確認は行いません）",
+        "Live connections",
+        "unverified (authentication, model, MCP; no connection checks performed)",
     ));
     lines.push(status_row(
         "web-search",
-        "disabled（cached/live: 接続先の上限契約未確認・利用不可）",
+        "disabled (cached/live unavailable; endpoint capability contract unverified)",
     ));
-    lines.push(status_row("capacity", "観測は未接続（資源の空きは未確認）"));
+    lines.push(status_row(
+        "capacity",
+        "observation disconnected (resource capacity unverified)",
+    ));
 
-    status_section(&mut lines, "管理・診断");
+    status_section(&mut lines, "Management and diagnostics");
     lines.push(status_row(
         "audit",
         &format!(
-            "{}（変更は --audit を指定して再起動）",
+            "{} (restart with --audit to change)",
             audit_path
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "未指定".into())
+                .unwrap_or_else(|| "unspecified".into())
         ),
     ));
     lines.push(status_row(
-        "ホスト権限",
-        &format!("routine/review構成={turn_authority_present}（内容・承認tokenは非表示）"),
+        "Host authority",
+        &format!("routine/review configured={turn_authority_present} (content and approval tokens hidden)"),
     ));
     lines.extend(cat_diagnostic_lines(answer_finalizer));
     #[cfg(unix)]
@@ -11722,55 +12037,53 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
 }
 
 fn account_list_lines() -> Result<Vec<ratatui::text::Line<'static>>, String> {
-    use polaris_auth::accounts::{owner::AccountOwner, store::AccountState};
-
-    let home = std::env::var_os("HOME").ok_or("HOMEを特定できません")?;
-    polaris_auth::protection::use_trusted_home(std::path::Path::new(&home))
-        .map_err(|error| format!("認証の保存先を確認できません: {error}"))?;
-    let Some(owner) = AccountOwner::open_if_registered(polaris_auth::ISSUER)
-        .map_err(|error| format!("アカウントを開けません: {error}"))?
-    else {
-        return Ok(vec![ratatui::text::Line::from(
-            "登録はありません。単一認証を使用しています。",
-        )]);
+    use polaris_auth::accounts::store::{AccountState, AccountStore};
+    let snapshot = match AccountStore::read_only_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(polaris_auth::AuthError::ReadOnly) => {
+            let saved = polaris_auth::store::default_path()
+                .map_err(|_| "Authentication storage is unverified")?
+                .is_file();
+            return Ok(vec![status_row(
+                "Stored authentication",
+                if saved {
+                    "present (no registrations; connection unverified)"
+                } else {
+                    "absent (no registrations)"
+                },
+            )]);
+        }
+        Err(_) => {
+            return Err(
+                "Cannot read registrations. Inspect state with the CLI if recovery is required"
+                    .into(),
+            );
+        }
     };
-    let snapshot = owner
-        .snapshot()
-        .map_err(|error| format!("一覧を取得できません: {error}"))?;
-    let mut lines = vec![ratatui::text::Line::from(format!(
-        "登録アカウント: {}件",
-        snapshot.accounts.len()
-    ))];
+    let mut lines = vec![status_row(
+        "Registrations",
+        &snapshot.accounts.len().to_string(),
+    )];
     for account in snapshot.accounts {
         let state = match account.state {
-            AccountState::Registering => "登録中",
-            AccountState::Ready => "利用可",
-            AccountState::RefreshPending => "更新中",
-            AccountState::ReauthRequired => "再認証が必要",
-            AccountState::Disconnected => "解除済み",
+            AccountState::Registering => "registering",
+            AccountState::Ready => "credentials present",
+            AccountState::RefreshPending => "updating",
+            AccountState::ReauthRequired => "login required",
+            AccountState::Disconnected => "logged out",
         };
-        let usage = match owner.observation(&account.registration_id, "gpt-6-astra") {
-            Some(observed) => match observed.state {
-                polaris_auth::quota::ObservationState::Known(_) => "利用枠は取得済み",
-                polaris_auth::quota::ObservationState::Missing => "利用枠は未取得",
-                polaris_auth::quota::ObservationState::FetchFailed => "利用枠の取得に失敗",
-                polaris_auth::quota::ObservationState::MappingUnknown => "利用枠の対応は未検証",
-                polaris_auth::quota::ObservationState::Unsupported => "利用枠は非対応",
-            },
-            None => "利用枠は未取得",
-        };
-        let label = account.label.as_deref().unwrap_or("-");
-        lines.push(ratatui::text::Line::from(render::sanitize(&format!(
-            "  {}  {state}  {}  {usage}",
-            account.registration_id,
-            label.escape_debug()
-        ))));
+        lines.push(status_row(
+            "Registration",
+            &format!(
+                "{} / {} / {state}",
+                account.registration_id,
+                account.label.as_deref().unwrap_or("no display name")
+            ),
+        ));
     }
     Ok(lines)
 }
 
-/// Read-only memory access uses the same project identity and database as the
-/// CLI. A historical hit is evidence, never a current instruction or grant.
 fn memory_read_lines(
     cwd: &std::path::Path,
     state_dir: &std::path::Path,
@@ -11784,25 +12097,25 @@ fn memory_read_lines(
         return Ok(vec![ratatui::text::Line::from(USAGE)]);
     }
     if request.len() > 1024 || request.chars().any(char::is_control) {
-        return Err("記憶への照会は1024バイト以内の1行で指定してください".into());
+        return Err("Specify a memory query as one line within 1024 bytes".into());
     }
     let mut parts = request.split_whitespace();
     let operation = parts.next().unwrap_or("");
     if !matches!(operation, "search" | "get" | "source") {
-        return Err(format!("このTUIで利用できる記憶操作: {USAGE}"));
+        return Err(format!("Memory operations available in this TUI: {USAGE}"));
     }
     let project_id = persist::project_identity(cwd)
-        .map_err(|error| format!("プロジェクトを特定できません: {error}"))?;
+        .map_err(|error| format!("Cannot identify the project: {error}"))?;
     let store = MemoryStore::open_read_only(state_dir.join("memory.sqlite3"))
-        .map_err(|error| format!("保存済み記憶を開けません: {error}"))?;
+        .map_err(|error| format!("Cannot open saved memory: {error}"))?;
     let mut lines = vec![ratatui::text::Line::from(
-        "過去の記録です。現在の指示・承認ではありません。",
+        "Historical records, not current instructions or approvals.",
     )];
     match operation {
         "search" => {
             let query = request.strip_prefix("search").unwrap_or("").trim();
             if query.is_empty() {
-                return Err(format!("検索語が必要です: {USAGE}"));
+                return Err(format!("A search query is required: {USAGE}"));
             }
             let hits = store
                 .search(&SearchRequest {
@@ -11812,9 +12125,9 @@ fn memory_read_lines(
                     limit: 5,
                     excerpt_bytes: 512,
                 })
-                .map_err(|error| format!("記憶を検索できません: {error}"))?;
+                .map_err(|error| format!("Cannot search memory: {error}"))?;
             if hits.is_empty() {
-                lines.push(ratatui::text::Line::from("該当する記録はありません"));
+                lines.push(ratatui::text::Line::from("No matching records"));
             }
             for hit in hits {
                 lines.push(ratatui::text::Line::from(render::sanitize(&format!(
@@ -11833,21 +12146,21 @@ fn memory_read_lines(
                 .next()
                 .map(str::parse::<usize>)
                 .transpose()
-                .map_err(|_| "startはUTF-8 byte位置です")?
+                .map_err(|_| "start is a UTF-8 byte offset")?
                 .unwrap_or(0);
             let budget = parts
                 .next()
                 .map(str::parse::<usize>)
                 .transpose()
-                .map_err(|_| "max-bytesは整数です")?
+                .map_err(|_| "max-bytes must be an integer")?
                 .unwrap_or(4096);
             if parts.next().is_some() || budget > 4096 {
                 return Err("/memory get <session> <id> [start] [max-bytes:0..4096]".into());
             }
             let range = store
                 .get_range(&project_id, session, id, start, budget)
-                .map_err(|error| format!("記憶を取得できません: {error}"))?
-                .ok_or("該当する記録はありません")?;
+                .map_err(|error| format!("Cannot retrieve memory: {error}"))?
+                .ok_or("No matching records")?;
             lines.push(ratatui::text::Line::from(render::sanitize(&format!(
                 "{} / {} / {} / {} ({} / {} bytes)",
                 range.record.session_id,
@@ -11862,7 +12175,7 @@ fn memory_read_lines(
             }
             if range.end < range.total_bytes {
                 lines.push(ratatui::text::Line::from(
-                    "続きは /memory get <session> <id> <表示済みbyte位置> で確認できます。",
+                    "Continue with /memory get <session> <id> <displayed-byte-offset>.",
                 ));
             }
         }
@@ -11885,24 +12198,24 @@ fn memory_read_lines(
             {
                 format!("conversation://{id}")
             } else {
-                return Err("出典IDかconversation:// URIを指定してください".into());
+                return Err("Specify a source ID or conversation:// URI".into());
             };
             let data_root = sessions_dir
                 .parent()
-                .ok_or("会話の保存先を特定できません")?;
+                .ok_or("Cannot locate conversation storage")?;
             let persisted = polaris_core::session_store::PersistedSession::open(
                 data_root,
                 &state_dir.join("memory.sqlite3"),
                 &project_id,
                 session,
             )
-            .map_err(|error| format!("保存会話を開けません: {error}"))?;
+            .map_err(|error| format!("Cannot open the saved conversation: {error}"))?;
             let source = polaris_core::conversation_memory::read_source(
                 persisted.store.as_ref(),
                 &state_dir.join("memory.sqlite3"),
                 &uri,
             )
-            .map_err(|error| format!("出典を確認できません: {error}"))?;
+            .map_err(|error| format!("Cannot verify the source: {error}"))?;
             for text in source.lines() {
                 lines.push(ratatui::text::Line::from(render::sanitize(text)));
             }
@@ -11922,26 +12235,26 @@ fn decided_read_lines(cwd: &std::path::Path) -> Result<Vec<ratatui::text::Line<'
         Ok(file) => file
             .take(1024 * 1024 + 1)
             .read_to_end(&mut data)
-            .map_err(|error| format!("決定事項を読めません: {error}"))?,
+            .map_err(|error| format!("Cannot read decisions: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(format!("決定事項を読めません: {error}")),
+        Err(error) => return Err(format!("Cannot read decisions: {error}")),
     };
     if data.len() > 1024 * 1024 {
-        return Err("決定事項の台帳が1 MiBを超えるためTUIでは表示できません".into());
+        return Err("The decision ledger exceeds 1 MiB and cannot be displayed in TUI".into());
     }
-    let text = String::from_utf8(data).map_err(|_| "決定事項の台帳がUTF-8ではありません")?;
+    let text = String::from_utf8(data).map_err(|_| "The decision ledger is not UTF-8")?;
     let entries = polaris_core::decisions::parse(&text);
     let mut lines = vec![ratatui::text::Line::from(format!(
-        "記録済みの決定事項: {}件。過去の記録であり、現在の承認ではありません。",
+        "{} recorded decisions. Historical records, not current approvals.",
         entries.len()
     ))];
     if entries.is_empty() {
-        lines.push(ratatui::text::Line::from("記録はありません"));
+        lines.push(ratatui::text::Line::from("No records"));
     }
     let omitted = entries.len().saturating_sub(100);
     if omitted > 0 {
         lines.push(ratatui::text::Line::from(format!(
-            "古い{omitted}件は省略しました"
+            "Omitted {omitted} older records"
         )));
     }
     for entry in entries.into_iter().skip(omitted) {
@@ -11963,11 +12276,11 @@ fn compare_read_lines(
         return Ok(vec![ratatui::text::Line::from(USAGE)]);
     }
     if request.len() > 2048 || request.chars().any(char::is_control) {
-        return Err("比較するフォルダは2048バイト以内の1行で指定してください".into());
+        return Err("Specify folders to compare as one line within 2048 bytes".into());
     }
     let folders = request.split('|').map(str::trim).collect::<Vec<_>>();
     if !(2..=8).contains(&folders.len()) || folders.iter().any(|path| path.is_empty()) {
-        return Err(format!("{USAGE}（2〜8フォルダ）"));
+        return Err(format!("{USAGE} (2–8 folders)"));
     }
     let mut samples = Vec::with_capacity(folders.len());
     let mut lines = Vec::new();
@@ -11980,10 +12293,10 @@ fn compare_read_lines(
         };
         let id = full.display().to_string();
         let sampled = similarity::sample::folder(&id, &full)
-            .map_err(|error| format!("{} を読めません: {error}", render::sanitize(&id)))?;
+            .map_err(|error| format!("Cannot read {}: {error}", render::sanitize(&id)))?;
         if sampled.truncated {
             lines.push(ratatui::text::Line::from(render::sanitize(&format!(
-                "{id}: 一部だけの比較です。似ていない結果は確定しません"
+                "{id}: partial comparison. A low similarity result is not conclusive"
             ))));
         }
         samples.push(sampled.folder);
@@ -11991,18 +12304,16 @@ fn compare_read_lines(
     let graph = similarity::graph(&samples);
     if graph.omitted > 0 {
         lines.push(ratatui::text::Line::from(format!(
-            "{}件は上限のため比較していません",
+            "{} items were not compared because of the limit",
             graph.omitted
         )));
     }
     if graph.edges.is_empty() {
-        lines.push(ratatui::text::Line::from(
-            "似ているフォルダはありませんでした",
-        ));
+        lines.push(ratatui::text::Line::from("No similar folders found"));
     }
     for edge in graph.edges {
         lines.push(ratatui::text::Line::from(render::sanitize(&format!(
-            "{} / {}: 類似度 {}、共通 {}件",
+            "{} / {}: similarity {}, {} shared items",
             edge.left,
             edge.right,
             edge.similarity,
@@ -12011,16 +12322,16 @@ fn compare_read_lines(
     }
     for proposal in graph.proposals {
         let why = match proposal.suggestion {
-            Suggestion::SameWorkInTwoPlaces => "同じ作業が2箇所にある可能性",
-            Suggestion::SharedPart => "共通部分を切り出せる可能性",
+            Suggestion::SameWorkInTwoPlaces => "The same work may exist in two locations",
+            Suggestion::SharedPart => "A shared component may be extractable",
         };
         lines.push(ratatui::text::Line::from(render::sanitize(&format!(
-            "提案: {} / {}: {why}。{}",
+            "Suggestion: {} / {}: {why}. {}",
             proposal.left, proposal.right, proposal.because
         ))));
     }
     lines.push(ratatui::text::Line::from(
-        "提案は調査の手がかりです。移動・削除は行いません。",
+        "Suggestions are investigation leads. Nothing is moved or deleted.",
     ));
     Ok(lines)
 }
@@ -12039,7 +12350,7 @@ fn clear_mcp_prompt_on_session_change(
 
 fn mcp_prompt_choice(request: &str) -> Result<polaris_core::mcp::runtime::McpPromptChoice, String> {
     if request.len() > 2048 || request.chars().any(char::is_control) {
-        return Err("MCP prompt選択は2048バイト以内の1行で指定してください".into());
+        return Err("Specify MCP prompt selection as one line within 2048 bytes".into());
     }
     let mut parts = request.split_whitespace();
     if parts.next() != Some("prompt") {
@@ -12050,20 +12361,20 @@ fn mcp_prompt_choice(request: &str) -> Result<polaris_core::mcp::runtime::McpPro
         .ok_or("/mcp prompt <server>/<prompt> [key=value ...]")?;
     let (server, prompt) = spec
         .split_once('/')
-        .ok_or("MCP promptは server/prompt の形で指定してください")?;
+        .ok_or("Specify the MCP prompt as server/prompt")?;
     if server.is_empty() || prompt.is_empty() {
-        return Err("MCP promptのserverとpromptを指定してください".into());
+        return Err("Specify both the MCP server and prompt".into());
     }
     let mut arguments = serde_json::Map::new();
     for argument in parts {
         if arguments.len() >= 16 {
-            return Err("MCP promptの引数は16個までです".into());
+            return Err("At most 16 MCP prompt arguments are allowed".into());
         }
         let (key, value) = argument
             .split_once('=')
-            .ok_or("MCP prompt引数はkey=valueの形で指定してください")?;
+            .ok_or("Specify MCP prompt arguments as key=value")?;
         if key.is_empty() || arguments.contains_key(key) {
-            return Err("MCP prompt引数のキーが空または重複しています".into());
+            return Err("An MCP prompt argument key is empty or duplicated".into());
         }
         arguments.insert(key.into(), serde_json::Value::String(value.into()));
     }
@@ -12085,20 +12396,20 @@ fn management_effect_diagnostic(
         store.state_dir(),
     ) {
         Ok(Some(effect)) => vec![
-            status_row("管理操作", "未解決"),
-            status_row("操作ID", &effect.request.operation_id.to_string()),
-            status_row("対象", &effect.request.inventory.to_string()),
-            status_row("状態", &format!("{:?}", effect.state)),
-            status_row("記録番号", &effect.last_sequence.to_string()),
+            status_row("Management operations", "Unresolved"),
+            status_row("Operation ID", &effect.request.operation_id.to_string()),
+            status_row("Target", &effect.request.inventory.to_string()),
+            status_row("State", &format!("{:?}", effect.state)),
+            status_row("Record number", &effect.last_sequence.to_string()),
         ],
-        Ok(None) => vec![status_row("管理操作", "未解決なし")],
+        Ok(None) => vec![status_row("Management operations", "none unresolved")],
         Err(error) => vec![status_row(
-            "管理操作",
-            &format!("状態を確認できません ({error})"),
+            "Management operations",
+            &format!("Cannot verify state ({error})"),
         )],
     };
     if let Some(reason) = recovery_issue {
-        lines.push(status_row("復旧理由", reason));
+        lines.push(status_row("Recovery reason", reason));
     }
     lines
 }
@@ -12117,11 +12428,11 @@ fn management_clearance_error(
         store.state_dir(),
     ) {
         Ok(Some(effect)) => Some(format!(
-            "未解決の管理操作 {} ({}) があります。先に状態を確認してください",
+            "Unresolved management operation {} ({}). Inspect state first",
             effect.request.operation_id, effect.request.inventory
         )),
         Ok(None) => None,
-        Err(error) => Some(format!("管理操作の状態を確認できません: {error}")),
+        Err(error) => Some(format!("Cannot verify management operation state: {error}")),
     }
 }
 
@@ -12153,9 +12464,12 @@ fn apply_slash_action(
     }
     match action {
         slash::Action::SessionControl(_)
+        | slash::Action::Environment(_)
         | slash::Action::WorkspaceControl(_)
         | slash::Action::RuntimeControl(_) => {
-            *status = Status::Error("この操作には有効な端末と保存ownerが必要です".into());
+            *status = Status::Error(
+                "This operation requires an active terminal and storage owner".into(),
+            );
             SlashOutcome::Continue
         }
         slash::Action::Quit => SlashOutcome::Quit,
@@ -12176,37 +12490,20 @@ fn apply_slash_action(
             }
         }
         slash::Action::Status => {
-            *status = Status::Error("/status の表示経路を確認できません".into());
+            *status = Status::Error("Cannot verify the /status display path".into());
             SlashOutcome::Continue
         }
-        slash::Action::WebSearch(requested) => {
-            if !matches!(requested.as_str(), "" | "status" | "disabled") {
-                *status = Status::Error("Web検索は接続先の上限契約が未確認のため利用できません。disabledを使用してください。".into());
-            } else {
-                local_lines.push(ratatui::text::Line::from("Web検索: disabled。cached/liveは接続先の上限契約が未確認のため利用できません。送信は行っていません。"));
-                *status = Status::Notice("Web検索の利用条件を表示しました".into());
-            }
-            SlashOutcome::Continue
-        }
-        slash::Action::Account(requested) => {
-            if !requested.is_empty() && requested != "list" {
-                *status = Status::Error("/account は現在 list のみ利用できます".into());
-                return SlashOutcome::Continue;
-            }
-            match account_list_lines() {
-                Ok(lines) => {
-                    local_lines.extend(lines);
-                    *status = Status::Notice("アカウント一覧を表示しました".into());
-                }
-                Err(error) => *status = Status::Error(error),
-            }
+        slash::Action::Account(_) => {
+            *status = Status::Error(
+                "Authentication operations require an active terminal and storage owner".into(),
+            );
             SlashOutcome::Continue
         }
         slash::Action::Memory(requested) => {
             match memory_read_lines(cwd, state_dir, sessions_dir, &requested) {
                 Ok(lines) => {
                     local_lines.extend(lines);
-                    *status = Status::Notice("保存済み記憶の参照結果を表示しました".into());
+                    *status = Status::Notice("Saved memory reference result displayed".into());
                 }
                 Err(error) => *status = Status::Error(error),
             }
@@ -12214,13 +12511,13 @@ fn apply_slash_action(
         }
         slash::Action::Decided(requested) => {
             if !requested.is_empty() && requested != "list" {
-                *status = Status::Error("/decided は現在 list のみ利用できます".into());
+                *status = Status::Error("/decided currently supports only list".into());
                 return SlashOutcome::Continue;
             }
             match decided_read_lines(cwd) {
                 Ok(lines) => {
                     local_lines.extend(lines);
-                    *status = Status::Notice("決定事項を表示しました".into());
+                    *status = Status::Notice("Decisions displayed".into());
                 }
                 Err(error) => *status = Status::Error(error),
             }
@@ -12230,7 +12527,7 @@ fn apply_slash_action(
             match compare_read_lines(cwd, &requested) {
                 Ok(lines) => {
                     local_lines.extend(lines);
-                    *status = Status::Notice("フォルダ比較を表示しました".into());
+                    *status = Status::Notice("Folder comparison displayed".into());
                 }
                 Err(error) => *status = Status::Error(error),
             }
@@ -12238,30 +12535,36 @@ fn apply_slash_action(
         }
         #[cfg(target_os = "linux")]
         slash::Action::Apply(_) => {
-            *status = Status::Error("D27操作には実端末とsource-bound ownerが必要です".into());
+            *status = Status::Error(
+                "D27 operations require a real terminal and source-bound owner".into(),
+            );
             SlashOutcome::Continue
         }
         slash::Action::Sync(_) => {
-            *status = Status::Error("共有適用には対応OSの確認画面と共有ownerが必要です".into());
+            *status = Status::Error(
+                "Shared apply requires a supported OS confirmation screen and sharing owner".into(),
+            );
             SlashOutcome::Continue
         }
         slash::Action::Phase(requested) => {
             *status = if requested.is_empty() {
                 session.workflow.as_ref().map_or_else(
-                    || Status::Notice("workflowはこのセッションで無効です".into()),
+                    || Status::Notice("Workflow is disabled for this session".into()),
                     |workflow| {
-                        Status::Notice(format!("ワークフロー段階: {}", workflow.state().phase))
+                        Status::Notice(format!("Workflow phase: {}", workflow.state().phase))
                     },
                 )
             } else {
-                Status::Error("phase変更には管理操作の確認画面が必要です".into())
+                Status::Error(
+                    "Phase changes require a management operation confirmation screen".into(),
+                )
             };
             SlashOutcome::Continue
         }
         slash::Action::Workflow(requested) => {
             *status = if requested.is_empty() {
                 session.workflow.as_ref().map_or_else(
-                    || Status::Notice("workflowはこのセッションで無効です".into()),
+                    || Status::Notice("Workflow is disabled for this session".into()),
                     |workflow| {
                         let mode = if workflow.config.enabled {
                             match workflow.config.mode {
@@ -12275,7 +12578,9 @@ fn apply_slash_action(
                     },
                 )
             } else {
-                Status::Error("workflow変更には管理操作の確認画面が必要です".into())
+                Status::Error(
+                    "Workflow changes require a management operation confirmation screen".into(),
+                )
             };
             SlashOutcome::Continue
         }
@@ -12309,7 +12614,9 @@ fn apply_slash_action(
         }
         slash::Action::Mcp(requested) => {
             if !requested.is_empty() && requested != "list" {
-                *status = Status::Error("/mcp prompt の選択は入力受付画面で処理します".into());
+                *status = Status::Error(
+                    "/mcp prompt selection is handled by the input admission screen".into(),
+                );
                 return SlashOutcome::Continue;
             }
             for line in mcp_state_lines(cwd, mcp_external) {
@@ -12339,7 +12646,7 @@ fn apply_slash_action(
         slash::Action::Diff => {
             #[cfg(not(unix))]
             {
-                *status = Status::Error("Windowsでは /diff はまだ利用できません".into());
+                *status = Status::Error("/diff is not yet available on Windows".into());
                 SlashOutcome::Continue
             }
             #[cfg(unix)]
@@ -12349,7 +12656,7 @@ fn apply_slash_action(
                 let text = (|| -> Result<String, String> {
                     let project_root = polaris_core::project::resolve_root(cwd);
                     let root = std::fs::File::open(project_root)
-                        .map_err(|_| "Git情報を取得できません".to_string())?;
+                        .map_err(|_| "Cannot retrieve Git information".to_string())?;
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                     let read = |args: &[&str]| {
                         polaris_core::project_git::read_only_git(&root, args, deadline)
@@ -12446,7 +12753,8 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Logout => {
-            *status = Status::Error("解除には対象アカウントの確認画面が必要です".into());
+            *status =
+                Status::Error("Unlinking requires confirmation for the target account".into());
             SlashOutcome::Continue
         }
         slash::Action::Help => {
@@ -12786,7 +13094,7 @@ mod tests {
             .join("\n");
         assert!(lines.contains("same-project"), "{lines}");
         assert!(!lines.contains("other-project"), "{lines}");
-        assert!(lines.contains("現在の指示・承認ではありません"));
+        assert!(lines.contains("not current instructions or approvals"));
         let page = memory_read_lines(
             &project,
             &state_dir,
@@ -12840,7 +13148,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(lines.contains("keep the old name"), "{lines}");
-        assert!(lines.contains("現在の承認ではありません"), "{lines}");
+        assert!(lines.contains("not current approvals"), "{lines}");
         std::fs::write(
             root.path().join(polaris_core::decisions::PATH),
             "x".repeat(1024 * 1024 + 1),
@@ -12879,8 +13187,8 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(lines.contains("類似度"), "{lines}");
-        assert!(lines.contains("移動・削除は行いません"), "{lines}");
+        assert!(lines.contains("similarity"), "{lines}");
+        assert!(lines.contains("Nothing is moved or deleted"), "{lines}");
         for command in [
             "/compare left | missing".to_owned(),
             format!("/compare {} | right", "x".repeat(2049)),
@@ -12908,26 +13216,6 @@ mod tests {
             std::fs::read_to_string(right.join("same.txt")).unwrap(),
             "contents stay in place"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn readonly_acceptance_models_distinguishes_observation_and_installation() {
-        let Some(slash::Action::WorkspaceControl(request)) = slash::parse("/models list") else {
-            panic!("model inventory must reach the read-only command route");
-        };
-        let (verb, arguments) = request.split_once(' ').unwrap();
-        assert_eq!(verb, "models");
-        let lines = model_inventory_read_lines(arguments).await.unwrap();
-        assert!(lines[0].to_string().contains("接続先の報告"));
-        assert!(lines[0].to_string().contains("インストール状態は未確認"));
-        assert!(lines.len() <= 66);
-        assert!(
-            lines
-                .iter()
-                .all(|line| !line.to_string().contains(['\n', '\t', '\x1b']))
-        );
-        assert!(model_inventory_read_lines("install").await.is_err());
     }
 
     #[test]
@@ -13024,6 +13312,10 @@ mod tests {
         let session = Session::default();
         let lines = status_lines(StatusSnapshot {
             session: &session,
+            session_path: None,
+            accounts: Ok(Vec::new()),
+            #[cfg(unix)]
+            binding: None,
             provider_name: "provider\n管理操作: 未解決なし",
             model_name: "model\tname",
             usage_report: polaris_provider::UsageReport::default(),
@@ -13047,11 +13339,11 @@ mod tests {
             .join("\n");
         assert!(lines.iter().any(|line| {
             let line = line.to_string();
-            line.contains("承認（現在）:") && line.ends_with("Never")
+            line.contains("Approval (current):") && line.ends_with("Never")
         }));
         assert!(lines.iter().any(|line| {
             let line = line.to_string();
-            line.contains("承認（起動時）:") && line.ends_with("OnRequest")
+            line.contains("Approval (startup):") && line.ends_with("OnRequest")
         }));
         let blocked = store.blocker().unwrap().unwrap();
         assert!(
@@ -13059,9 +13351,9 @@ mod tests {
             "{text}"
         );
         for (label, value) in [
-            ("対象:", blocked.request.inventory.to_string()),
-            ("状態:", format!("{:?}", blocked.state)),
-            ("記録番号:", blocked.last_sequence.to_string()),
+            ("Target:", blocked.request.inventory.to_string()),
+            ("State:", format!("{:?}", blocked.state)),
+            ("Record number:", blocked.last_sequence.to_string()),
         ] {
             assert!(lines.iter().any(|line| {
                 let line = line.to_string();
@@ -13145,7 +13437,7 @@ mod tests {
         };
         assert!(screen.contains("saved question"), "{screen}");
         assert!(screen.contains("saved answer"), "{screen}");
-        assert!(screen.replace(' ', "").contains("閲覧のみ"), "{screen}");
+        assert!(screen.replace(' ', "").contains("viewonly"), "{screen}");
         assert_eq!(persistence.snapshot().unwrap().events.len(), 2);
     }
 
@@ -14579,9 +14871,9 @@ mod tests {
             .record_translation_installation(Some(true));
         let diagnostic = cat_diagnostic_lines(Some(&owner));
         for (label, value) in [
-            ("CAT 構成:", "false"),
-            ("CAT 導入:", "導入確認"),
-            ("CAT 検証:", "false"),
+            ("CAT configuration:", "false"),
+            ("CAT installation:", "Installation check"),
+            ("CAT verification:", "false"),
         ] {
             assert!(diagnostic.iter().any(|line| {
                 let line = line.to_string();
@@ -14590,9 +14882,9 @@ mod tests {
         }
         assert!(diagnostic.iter().any(|line| {
             let line = line.to_string();
-            line.contains("CAT 観測:")
+            line.contains("CAT observation:")
                 && line.contains("0 attempts")
-                && line.contains("保存済み観測。実行の成功とは別")
+                && line.contains("saved observations; distinct from execution success")
         }));
         assert!(schedule_tui_shadow(&owner, &session, "answer this", &control).unwrap());
         assert_eq!(owner.records().unwrap().len(), 1);
@@ -14857,7 +15149,7 @@ mod tests {
         let mut mcp = turn("mcp_fixture__tool");
         keep_or_roll_back(&mut mcp, 1).unwrap();
         assert_eq!(mcp.messages.len(), 3);
-        assert!(mcp.messages[2].content.contains("結果は不明"));
+        assert!(mcp.messages[2].content.contains("outcome is unknown"));
         let mut bash = turn("bash");
         keep_or_roll_back(&mut bash, 1).unwrap();
         assert_eq!(bash.messages.len(), 1);
@@ -15571,7 +15863,7 @@ mod tests {
             panic!("read confirmation")
         })
         .unwrap();
-        assert!(status.contains("参加中"));
+        assert!(status.contains("participating"));
         assert!(
             sync_action(&project, &state, "push", false, |_| panic!(
                 "unapproved push"
@@ -15581,19 +15873,19 @@ mod tests {
         assert!(
             sync_action(&project, &state, "pull", false, |_| false)
                 .unwrap()
-                .contains("取り消")
+                .contains("cancelled")
         );
         assert!(
             sync_action(&project, &state, "pull", false, |_| true)
                 .unwrap()
-                .contains("sourceへは未反映")
+                .contains("Source files are unchanged")
         );
         assert!(!project.join("received.txt").exists());
         assert_eq!(peer.head(), head);
         assert!(
             sync_action(&project, &state, "leave", false, |_| false)
                 .unwrap()
-                .contains("取り消")
+                .contains("cancelled")
         );
         assert!(
             participation::read(&state)
@@ -15604,7 +15896,7 @@ mod tests {
         assert!(
             sync_action(&project, &state, "leave", false, |_| true)
                 .unwrap()
-                .contains("解除")
+                .contains("left the share")
         );
         assert!(matches!(
             participation::read(&state).unwrap(),
@@ -15757,7 +16049,7 @@ mod tests {
             false
         })
         .unwrap();
-        assert!(cancelled.contains("取り消し"));
+        assert!(cancelled.contains("cancelled"));
         assert_eq!(std::fs::read(project.join("shared.txt")).unwrap(), b"local");
         assert_eq!(
             std::fs::read(state.join("sync/participation.json")).unwrap(),
@@ -15785,7 +16077,7 @@ mod tests {
         );
         std::fs::write(project.join("shared.txt"), b"local").unwrap();
         let applied = sync_action(&project, &state, "apply", false, |_| true).unwrap();
-        assert!(applied.contains("1件"));
+        assert!(applied.contains("1 items"));
         assert_eq!(
             std::fs::read(project.join("shared.txt")).unwrap(),
             b"agreed"
@@ -15806,7 +16098,7 @@ mod tests {
             panic!("already applied must not confirm")
         })
         .unwrap();
-        assert!(repeated.contains("反映済み"));
+        assert!(repeated.contains("already been applied"));
         assert!(
             sync_action(&project, &state, "recover wrong", false, |_| panic!(
                 "wrong recovery must refuse"
@@ -15934,7 +16226,7 @@ mod tests {
             |_| false,
         )
         .unwrap();
-        assert!(cancelled_recovery.contains("取り消し"));
+        assert!(cancelled_recovery.contains("cancelled"));
         // Mirror startup: C12 unknown must not hide the recovery command.
         let workspace = open_rewind_workspace(&unknown_project, &unknown_state).unwrap();
         {
@@ -16008,7 +16300,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                recovered.contains("未確定") && recovered.contains("再適用していません"),
+                recovered.contains("outcome is unknown") && recovered.contains("not reapplied"),
                 "{recovered}"
             );
             let after = std::fs::metadata(&source_file).unwrap();
@@ -16259,7 +16551,7 @@ mod tests {
             &mut status,
             "first line\nsecond\u{1b}[31m line",
             |preview, cache, preview_status| {
-                assert!(matches!(preview_status, Status::Notice(message) if message == "送信準備中（未受理）"));
+                assert!(matches!(preview_status, Status::Notice(message) if message == "Preparing send (not admitted)"));
                 terminal.draw(|f| {
                     draw_frame(
                         f,
@@ -17964,7 +18256,7 @@ mod tests {
             &mut status,
         );
         if let Status::Notice(text) = &status {
-            assert!(text.contains("分岐しました"), "{text}");
+            assert!(text.contains("Forked"), "{text}");
         } else {
             panic!("fork did not display its result");
         }
@@ -17983,45 +18275,6 @@ mod tests {
                     && matches!(e.state, ManagementEffectStateV1::Completed { .. }))
         );
         assert!(effects.blocker().unwrap().is_none());
-    }
-
-    #[test]
-    fn m3_remaining_web_search_reports_disabled_and_refuses_unverified_modes() {
-        let root = tempfile::tempdir().unwrap();
-        let mut session = Session::new();
-        session.push_user("original");
-        let mut status = Status::Idle;
-        let mut lines = Vec::new();
-        call(
-            slash::parse("/web-search").unwrap(),
-            &mut session,
-            &root.path().join("session.jsonl"),
-            &mut status,
-            &[],
-            root.path(),
-            &mut lines,
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("Web検索: disabled"))
-        );
-        let rendered = lines.len();
-        for mode in ["cached", "live"] {
-            call(
-                slash::parse(&format!("/web-search {mode}")).unwrap(),
-                &mut session,
-                &root.path().join("session.jsonl"),
-                &mut status,
-                &[],
-                root.path(),
-                &mut lines,
-            );
-            assert!(matches!(&status, Status::Error(text) if text.contains("上限契約")));
-            assert_eq!(lines.len(), rendered);
-        }
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "original");
     }
 
     #[tokio::test]
@@ -18284,7 +18537,7 @@ mod tests {
             &mut lines,
         )
         .await;
-        assert!(matches!(&status,Status::Error(message) if message.contains("取り消")));
+        assert!(matches!(&status,Status::Error(message) if message.contains("cancelled")));
         current.check_persistence().unwrap();
         assert_eq!(
             current.workflow.as_ref().unwrap().config.enabled,
@@ -18977,6 +19230,13 @@ mod tests {
 
         let local_lines = status_lines(StatusSnapshot {
             session: &session,
+            session_path: Some(Path::new("/synthetic/conversation-id.jsonl")),
+            accounts: Ok(vec![status_row(
+                "Registration",
+                "fixture-registration / fixture / credentials present",
+            )]),
+            #[cfg(unix)]
+            binding: None,
             provider_name: "openai",
             model_name: "gpt-5.4",
             usage_report: polaris_provider::UsageReport {
@@ -19006,11 +19266,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("cache 80"), "{text}");
+        assert!(text.contains("conversation-id"));
+        assert!(text.contains("fixture-registration / fixture / credentials present"));
         for (label, value) in [
-            ("CAT 構成:", "shadow ownerなし"),
-            ("CAT 導入:", "未照合"),
-            ("CAT 検証:", "未確認"),
-            ("CAT 観測:", "未取得"),
+            ("CAT configuration:", "no shadow owner"),
+            ("CAT installation:", "not reconciled"),
+            ("CAT verification:", "unverified"),
+            ("CAT observation:", "not retrieved"),
         ] {
             assert!(local_lines.iter().any(|line| {
                 let line = line.to_string();
@@ -19032,40 +19294,42 @@ mod tests {
         );
 
         for section in [
-            "Polaris 状態 (read-only)",
-            "利用条件",
-            "観測・workflow",
-            "可用性",
-            "管理・診断",
+            "Polaris status (read-only)",
+            "Account",
+            "Conditions",
+            "Observations and workflow",
+            "Availability",
+            "Management and diagnostics",
         ] {
             assert!(local_lines.iter().any(|line| line.to_string() == section));
         }
         assert!(text.contains("/tmp/audit\\nforged.jsonl"), "{text}");
         assert!(local_lines.iter().any(|line| {
             let line = line.to_string();
-            line.contains("effort:") && line.contains("automatic（固定overrideの変更はTUI非対応）")
+            line.contains("effort:")
+                && line.contains("automatic (changing fixed overrides is unsupported in TUI)")
         }));
-        assert!(text.contains("routine/review構成=false"));
-        assert!(text.contains("観測は未接続"));
-        assert!(text.contains("資源の空きは未確認"));
+        assert!(text.contains("routine/review configured=false"));
+        assert!(text.contains("observation disconnected"));
+        assert!(text.contains("resource capacity unverified"));
         assert!(local_lines.iter().any(|line| {
             let line = line.to_string();
             line.contains("web-search:")
                 && line.contains("disabled")
-                && line.contains("接続先の上限契約未確認・利用不可")
+                && line.contains("endpoint capability contract unverified")
         }));
         assert!(text.contains("in 100"));
         assert!(text.contains("out 20"));
         assert!(text.contains("total 120"));
         assert!(local_lines.iter().any(|line| {
             let line = line.to_string();
-            line.contains("欠測 / 失敗:") && line.ends_with("3 / 2")
+            line.contains("Missing / failed:") && line.ends_with("3 / 2")
         }));
         assert!(local_lines.iter().any(|line| {
             let line = line.to_string();
-            line.contains("外部MCP:") && line.contains("true") && line.contains("/mcp")
+            line.contains("External MCP:") && line.contains("true") && line.contains("/mcp")
         }));
-        assert!(text.contains("未検証（認証・モデル・MCP"));
+        assert!(text.contains("unverified (authentication, model, MCP"));
         assert!(text.contains("builtin:workflow-core"));
         assert!(text.contains("user:example"));
         assert!(text.contains(&workflow_state.skill_manifest_hash));
@@ -19080,7 +19344,9 @@ mod tests {
         for width in [80, 160] {
             let wrapped = render::wrap_history_lines(&history, width);
             assert!(
-                wrapped.len() <= 35,
+                // Account/session fields and English labels add rows. Keep a
+                // bounded summary while retaining every value at 80 columns.
+                wrapped.len() <= 48,
                 "{width} columns: {} rows",
                 wrapped.len()
             );
@@ -19090,14 +19356,14 @@ mod tests {
     }
 
     #[test]
-    fn status_rows_align_japanese_labels_and_keep_values_when_wrapped() {
+    fn status_rows_align_labels_and_keep_values_when_wrapped() {
         use unicode_width::UnicodeWidthStr;
 
         let value = "value";
-        for label in ["モデル", "provider", "承認（起動時）", ""] {
+        for label in ["Model", "provider", "Approval (startup)", ""] {
             let line = status_row(label, value).to_string();
             let start = line.find(value).unwrap();
-            assert_eq!(line[..start].width(), 20, "{line}");
+            assert_eq!(line[..start].width(), 25, "{line}");
         }
 
         let path = "/synthetic/project/with-a-long-directory-name/audit.jsonl";
@@ -19460,13 +19726,16 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         assert_eq!(local_lines.len(), 2, "{local_lines:?}");
-        assert_eq!(local_lines[0].to_string(), "外部MCPホスト上限: 拒否");
-        assert_eq!(permitted_lines[0], "外部MCPホスト上限: 許可");
+        assert_eq!(
+            local_lines[0].to_string(),
+            "External MCP host ceiling: denied"
+        );
+        assert_eq!(permitted_lines[0], "External MCP host ceiling: allowed");
         assert!(
             local_lines[1]
                 .spans
                 .iter()
-                .any(|span| span.content.contains("登録されたMCPサーバーはありません")),
+                .any(|span| span.content.contains("No registered MCP servers")),
             "{local_lines:?}"
         );
         // A local command: nothing is sent and nothing joins the history.
@@ -20219,7 +20488,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Git情報を取得できません"), "{rendered}");
+        assert!(
+            rendered.contains("Cannot retrieve Git information"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("large.txt"), "{rendered}");
     }
 
@@ -20346,9 +20618,7 @@ mod tool_memory_settings_tests {
             assert_eq!(started, 42);
             assert_eq!(serde_json::to_string(&session.messages).unwrap(), before);
             assert_eq!(std::fs::read_dir(logs.path()).unwrap().count(), 0);
-            assert!(
-                matches!(status, Status::Notice(message) if message.contains("分岐できません"))
-            );
+            assert!(matches!(status, Status::Notice(message) if message.contains("Cannot fork")));
         }
     }
 
@@ -20513,7 +20783,7 @@ mod tool_memory_settings_tests {
                         .as_deref(),
                     previous.file_stem().and_then(|id| id.to_str())
                 );
-                assert!(matches!(&status, Status::Notice(message) if message.contains("削除")));
+                assert!(matches!(&status, Status::Notice(message) if message.contains("Deleting")));
                 loaded = persist::load_session(&fork_path).unwrap().0;
                 configure_saved_tool_memory(
                     &mut loaded,

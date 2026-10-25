@@ -28,13 +28,13 @@ const MAX_EXECUTABLE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxCommandError {
-    #[error("sandbox管理効果: {0}")]
+    #[error("Sandbox management effect: {0}")]
     Effect(#[from] ManagementEffectStoreError),
-    #[error("sandbox保存: {0}")]
+    #[error("Sandbox storage: {0}")]
     Io(#[from] io::Error),
     #[error("sandbox: {0}")]
     Sandbox(#[from] SandboxError),
-    #[error("このsandbox操作は既に開始または確定しています。再実行しません")]
+    #[error("This sandbox operation has already started or finalized. It will not be rerun")]
     ExistingOperation,
 }
 
@@ -195,27 +195,30 @@ impl SandboxCommandOwnerV1<'_> {
             || argv.iter().any(|arg| arg.contains('\0'))
             || !Path::new(&argv[0]).is_absolute()
         {
-            return Err(invalid("commandは絶対pathのprogramを先頭にした64引数・8KiB以内のJSON配列で指定してください").into());
+            return Err(invalid("Specify command as a JSON array beginning with an absolute program path, within 64 arguments and 8 KiB").into());
         }
         let project = project.canonicalize()?;
         let before = session.snapshot()?;
         if before.state.project_id
             != project
                 .to_str()
-                .ok_or_else(|| invalid("project pathがUTF-8ではありません"))?
+                .ok_or_else(|| invalid("Project path is not UTF-8"))?
             || before.raw_offset != before.state.raw_commit_offset
             || before.raw_hash != before.state.raw_commit_hash
         {
-            return Err(invalid("sandboxと保存会話のprojectまたは原文markerが一致しません").into());
+            return Err(invalid(
+                "Sandbox and saved conversation project or source marker mismatch",
+            )
+            .into());
         }
         let program = Path::new(&argv[0]).canonicalize()?;
         argv[0] = program
             .to_str()
-            .ok_or_else(|| invalid("program pathがUTF-8ではありません"))?
+            .ok_or_else(|| invalid("Program path is not UTF-8"))?
             .to_owned();
         let policy = contained_policy(startup, &project)?;
         if !allowed_program(&policy, &project, &program) {
-            return Err(invalid("programが承認されたproject/runtimeの外にあります").into());
+            return Err(invalid("The program is outside the approved project/runtime").into());
         }
         let executable_hash = executable_hash(&program)?;
         #[cfg(target_os = "macos")]
@@ -397,7 +400,7 @@ impl SandboxCommandOwnerV1<'_> {
             || current.state.project_id
                 != project
                     .to_str()
-                    .ok_or_else(|| invalid("project pathが不正です"))?
+                    .ok_or_else(|| invalid("Invalid project path"))?
             || preview
                 .policy
                 .isolated_boundary()
@@ -411,7 +414,9 @@ impl SandboxCommandOwnerV1<'_> {
                     .canonicalize()?
             || executable_hash(Path::new(&preview.argv[0]))? != preview.executable_hash
         {
-            return Err(invalid("確認したsandboxのproject・会話・programが変わりました").into());
+            return Err(
+                invalid("The confirmed sandbox project, conversation, or program changed").into(),
+            );
         }
         Ok(())
     }
@@ -491,14 +496,14 @@ fn allowed_program(policy: &SandboxPolicy, project: &Path, program: &Path) -> bo
 fn executable_hash(program: &Path) -> io::Result<String> {
     let mut file = fs::File::open(program)?;
     if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_EXECUTABLE_BYTES {
-        return Err(invalid("programは32MiB以内の通常fileである必要があります"));
+        return Err(invalid("The program must be a regular file within 32 MiB"));
     }
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_EXECUTABLE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_EXECUTABLE_BYTES {
-        return Err(invalid("programが確認中に変わりました"));
+        return Err(invalid("The program changed during confirmation"));
     }
     Ok(content_hash(&bytes))
 }

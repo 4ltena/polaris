@@ -34,7 +34,7 @@ impl StrictSummaryProvider for ProviderSummary {
     ) -> Pin<Box<dyn Future<Output = io::Result<String>> + Send + 'a>> {
         Box::pin(async move {
             if request.model != "gpt-6-astra" || request.effort != "medium" {
-                return Err(io::Error::other("要約モデルの契約が一致しません"));
+                return Err(io::Error::other("Summarization model contract mismatch"));
             }
             // Reasoning blobs are transport state, never source evidence.
             let mut messages = request.messages;
@@ -53,7 +53,9 @@ impl StrictSummaryProvider for ProviderSummary {
                     crate::conversation_memory::structured::source_budget(&sources.sources)?;
                     crate::conversation_memory::structured::hint_budget(&sources.related_entities)?;
                     if !messages.is_empty() {
-                        return Err(io::Error::other("構造化sourceと要約本文が重複しています"));
+                        return Err(io::Error::other(
+                            "Structured source and summary body overlap",
+                        ));
                     }
                     (
                         format!(
@@ -67,7 +69,7 @@ impl StrictSummaryProvider for ProviderSummary {
             let tokens = crate::budget::count_tokens(&format!("{system}\n{input}"));
             if tokens > 32_000 {
                 return Err(io::Error::other(
-                    "要約の送信範囲が32,000参照tokensを超えました",
+                    "Summarization send scope exceeds 32,000 reference tokens",
                 ));
             }
             let response = self
@@ -81,7 +83,9 @@ impl StrictSummaryProvider for ProviderSummary {
                 .await
                 .map_err(io::Error::other)?;
             if !response.tool_calls.is_empty() || !response.hosted_web_search.is_empty() {
-                return Err(io::Error::other("要約応答が禁止されたtoolを呼び出しました"));
+                return Err(io::Error::other(
+                    "The summarization response called a prohibited tool",
+                ));
             }
             Ok(response.text)
         })
@@ -97,12 +101,12 @@ pub fn local_embedder(
     let model = config
         .model_path
         .clone()
-        .ok_or_else(|| io::Error::other("strict10にはembedding.model_pathが必要です"))?;
+        .ok_or_else(|| io::Error::other("strict10 requires embedding.model_path"))?;
     let revision = config
         .revision
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| io::Error::other("strict10にはembedding.revisionが必要です"))?;
+        .ok_or_else(|| io::Error::other("strict10 requires embedding.revision"))?;
     embedder_for(
         config,
         private_root,
@@ -135,7 +139,7 @@ pub fn managed_local_embedder(
 fn reject_legacy_runtime(config: &crate::config::EmbeddingConfig) -> io::Result<()> {
     if config.runtime.is_some() {
         return Err(io::Error::other(
-            "legacy embedding.runtimeは実行できません。読取専用runtime imageの修復が必要です",
+            "Cannot execute legacy embedding.runtime. Repair the read-only runtime image",
         ));
     }
     Ok(())
@@ -171,7 +175,7 @@ pub fn preselect_embedder(
         )
         .map(Some),
         _ => Err(io::Error::other(
-            "embedding.preselect_model_pathとpreselect_revisionは両方必要です",
+            "Both embedding.preselect_model_path and preselect_revision are required",
         )),
     }
 }
@@ -186,7 +190,7 @@ fn embedder_for(
     let python = config
         .runtime
         .clone()
-        .ok_or_else(|| io::Error::other("strict10にはembedding.runtimeが必要です"))?;
+        .ok_or_else(|| io::Error::other("strict10 requires embedding.runtime"))?;
     if !python.is_absolute()
         || !python.is_file()
         || !model.is_absolute()
@@ -194,13 +198,13 @@ fn embedder_for(
         || !private_root.is_absolute()
     {
         return Err(io::Error::other(
-            "埋め込みruntime・model・保存先は実在する絶対パスで指定してください",
+            "Specify the embedding runtime, model, and storage as existing absolute paths",
         ));
     }
     let dir = private_root.join("embedding-helper");
     std::fs::create_dir_all(&dir)?;
     if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
-        return Err(io::Error::other("helper保存先のリンクは使用できません"));
+        return Err(io::Error::other("Links in helper storage are not allowed"));
     }
     #[cfg(unix)]
     {
@@ -230,7 +234,9 @@ fn embedder_for(
             if std::fs::symlink_metadata(&helper)?.file_type().is_symlink()
                 || std::fs::read(&helper)? != source
             {
-                return Err(io::Error::other("既存helperの内容が同梱版と一致しません"));
+                return Err(io::Error::other(
+                    "Existing helper content does not match the bundled version",
+                ));
             }
         }
         Err(error) => return Err(error),

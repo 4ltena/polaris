@@ -316,7 +316,7 @@ fn the_refusal_does_not_blame_a_difference_delta_accepts() {
     // the length, not the reasoning item.
     let reason = super::why_refused(Some(&held), 1, std::slice::from_ref(&sent));
     assert!(
-        reason.starts_with("短い"),
+        reason.starts_with("shorter"),
         "継続なしの理由が長さになっていない: {reason}"
     );
 
@@ -324,14 +324,14 @@ fn the_refusal_does_not_blame_a_difference_delta_accepts() {
     let other = vec![sent, json!({"type": "message", "role": "assistant"})];
     let reason = super::why_refused(Some(&held), 1, &other);
     assert!(
-        reason.starts_with("1件目の.roleが違う"),
+        reason.starts_with("Item 1 differs at .role"),
         "本当の差を指していない: {reason}"
     );
 
-    assert_eq!(super::why_refused(None, 0, &other), "前の応答がない");
+    assert_eq!(super::why_refused(None, 0, &other), "no previous response");
     assert_eq!(
         super::why_refused(None, 3, &other),
-        "この形の継続がない（保持 3形）"
+        "no continuation in this form (3 forms retained)"
     );
 }
 
@@ -353,7 +353,7 @@ fn the_refusal_names_the_field_that_differs() {
     })];
     let reason = super::why_refused(Some(&held), 1, &sent);
     assert!(
-        reason.starts_with("0件目の.content[0].textが違う"),
+        reason.starts_with("Item 0 differs at .content[0].text"),
         "差のある項目を指していない: {reason}"
     );
     assert!(reason.contains("ledger.py"), "保持の中身がない: {reason}");

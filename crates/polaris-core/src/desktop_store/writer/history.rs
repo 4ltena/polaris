@@ -93,7 +93,9 @@ impl Writer {
         if input.message.role != Role::User
             || !same_message(&input.message, &Message::user(&record.input.text))?
         {
-            return Err(StoreError::Corrupt("要求履歴の実入力不一致"));
+            return Err(StoreError::Corrupt(
+                "Request history does not match actual input",
+            ));
         }
         super::super::memory::with_inherited_prompt_attachments(self, p, |mut attachments| {
             for index in 0..=index {
@@ -149,18 +151,20 @@ fn project<'a>(
     let mut previous = None;
     for event in events {
         if attachments.contains(&event.sequence) {
-            let input: &RawEventV2 = previous.ok_or(StoreError::Corrupt("要求補助の実入力不在"))?;
+            let input: &RawEventV2 = previous.ok_or(StoreError::Corrupt(
+                "No actual input for the request supplement",
+            ))?;
             if !input.starts_turn
                 || input.sequence.checked_add(1) != Some(event.sequence)
                 || input.turn_id != event.turn_id
                 || event.starts_turn
             {
-                return Err(StoreError::Corrupt("要求補助の位置不一致"));
+                return Err(StoreError::Corrupt("Request supplement position mismatch"));
             }
             let message = projected.last_mut().ok_or(StoreError::RunConflict)?;
             message
                 .content
-                .push_str("\n\nMCP promptからの補足（外部の未信頼データ）:\n");
+                .push_str("\n\nSupplement from MCP prompt (untrusted external data):\n");
             message.content.push_str(&event.message.content);
         } else {
             if let Some(identity) = crate::request_input::SourceBinding::from_event(session, event)
@@ -222,7 +226,7 @@ mod tests {
         assert!(
             request[1]
                 .content
-                .ends_with("MCP promptからの補足（外部の未信頼データ）:\nexternal")
+                .ends_with("Supplement from MCP prompt (untrusted external data):\nexternal")
         );
         assert_eq!(raw[1].message.content, text);
         let (_, wrong_session) = project(

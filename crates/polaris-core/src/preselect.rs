@@ -118,7 +118,7 @@ impl Index {
             if candidate.id.is_empty() || candidate.text.trim().is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "選定候補にidか説明が無いものがあります",
+                    "A selection candidate lacks an ID or description",
                 ));
             }
             match self
@@ -164,13 +164,13 @@ impl Index {
         let space = space_of(embedder);
         if self.space.as_deref() != Some(space.as_str()) {
             return Err(io::Error::other(format!(
-                "索引は{}で作られており、{space}では比較できません",
-                self.space.as_deref().unwrap_or("(未構築)")
+                "The index was built with {} and cannot be compared in {space}",
+                self.space.as_deref().unwrap_or("(not built)")
             )));
         }
         let chunks = embedder.embed_query(query).await?;
         if chunks.is_empty() {
-            return Err(io::Error::other("問い合わせの埋め込みが空です"));
+            return Err(io::Error::other("The query embedding is empty"));
         }
         for chunk in &chunks {
             check_dimension(embedder, chunk)?;
@@ -219,13 +219,15 @@ fn check_dimension(embedder: &dyn StrictEmbedder, vector: &[f32]) -> io::Result<
     let expected = embedder.metadata().dimension;
     if expected <= 0 || vector.len() as i64 != expected {
         return Err(io::Error::other(format!(
-            "埋め込みの次元が{}ではなく{}です",
+            "Embedding dimensions are not {} but {}",
             expected,
             vector.len()
         )));
     }
     if vector.iter().any(|value| !value.is_finite()) {
-        return Err(io::Error::other("埋め込みに有限でない値があります"));
+        return Err(io::Error::other(
+            "The embedding contains a non-finite value",
+        ));
     }
     Ok(())
 }

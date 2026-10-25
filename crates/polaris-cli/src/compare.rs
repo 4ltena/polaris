@@ -7,15 +7,15 @@ use std::process::ExitCode;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// 比較するフォルダ。2つ以上。
+    /// Folders to compare; specify at least two.
     #[arg(required = true, num_args = 2..)]
     folders: Vec<PathBuf>,
 }
 
 fn suggestion_text(suggestion: Suggestion) -> &'static str {
     match suggestion {
-        Suggestion::SameWorkInTwoPlaces => "同じ作業が2箇所にある可能性",
-        Suggestion::SharedPart => "共通部分を切り出せる可能性",
+        Suggestion::SameWorkInTwoPlaces => "The same work may exist in two locations",
+        Suggestion::SharedPart => "A shared component may be extractable",
     }
 }
 
@@ -34,25 +34,28 @@ pub fn run(args: Args) -> ExitCode {
                 folders.push(sampled.folder);
             }
             Err(_) => {
-                eprintln!("{id} を読めません。");
+                eprintln!("Cannot read {id}.");
                 return ExitCode::FAILURE;
             }
         }
     }
     let graph = similarity::graph(&folders);
     for id in &truncated {
-        println!("{id}: 上限まで読んだ一部です。似ていないという結果は当てになりません。");
+        println!("{id}: only a bounded portion was read. A low similarity result is unreliable.");
     }
     if graph.omitted > 0 {
-        println!("{}件は上限のため比較していません。", graph.omitted);
+        println!(
+            "{} items were not compared because of the limit.",
+            graph.omitted
+        );
     }
     if graph.edges.is_empty() {
-        println!("似ているフォルダはありませんでした。");
+        println!("No similar folders found.");
         return ExitCode::SUCCESS;
     }
     for edge in &graph.edges {
         println!(
-            "{}\t{}\t類似度 {}\t共通 {}件",
+            "{}\t{}\tsimilarity {}\t{} shared items",
             edge.left,
             edge.right,
             edge.similarity,
@@ -61,13 +64,13 @@ pub fn run(args: Args) -> ExitCode {
     }
     for proposal in &graph.proposals {
         println!(
-            "提案\t{} と {}\t{}\t{}",
+            "Suggestion\t{} and {}\t{}\t{}",
             proposal.left,
             proposal.right,
             suggestion_text(proposal.suggestion),
             proposal.because
         );
     }
-    println!("提案は見に行く理由です。移動も削除も行いません。");
+    println!("Suggestions identify locations to inspect. Nothing is moved or deleted.");
     ExitCode::SUCCESS
 }

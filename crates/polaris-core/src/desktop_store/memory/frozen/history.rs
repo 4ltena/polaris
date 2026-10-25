@@ -24,7 +24,9 @@ fn compare_copy<'a>(
     tail_start: u64,
 ) -> StoreResult<()> {
     for (index, source) in parent.enumerate() {
-        let event = child.next().ok_or(StoreError::Corrupt("継承原文の不足"))?;
+        let event = child
+            .next()
+            .ok_or(StoreError::Corrupt("Insufficient inherited source text"))?;
         if event.schema_version != 2
             || event.epoch != epoch
             || event.sequence != index as u64 + 1
@@ -32,11 +34,13 @@ fn compare_copy<'a>(
             || event.starts_turn != source.starts_turn
             || serde_json::to_vec(&event.message)? != serde_json::to_vec(&source.message)?
         {
-            return Err(StoreError::Corrupt("継承原文と固定親の不一致"));
+            return Err(StoreError::Corrupt(
+                "Inherited source text does not match the pinned parent",
+            ));
         }
     }
     if child.next().is_some() {
-        return Err(StoreError::Corrupt("継承原文の余剰"));
+        return Err(StoreError::Corrupt("Excess inherited source text"));
     }
     Ok(())
 }
@@ -58,13 +62,15 @@ pub(in crate::desktop_store) fn with_inherited_prompt_attachments<T>(
     let mut frames: Vec<Frame<'_>> = Vec::new();
     let mut retained = 0;
     loop {
-        let (grant, remaining) = ancestors
-            .split_last()
-            .ok_or(StoreError::Corrupt("継承原文の固定親不在"))?;
+        let (grant, remaining) = ancestors.split_last().ok_or(StoreError::Corrupt(
+            "No pinned parent for inherited source text",
+        ))?;
         let (owner, proof) =
             FrozenMemory::load_with_history(writer, work.clone(), grant, &mut |_| Ok(()))?;
         if !proof.all_terminal || proof.ancestors != remaining {
-            return Err(StoreError::Corrupt("継承原文の固定親run・祖先対応"));
+            return Err(StoreError::Corrupt(
+                "Inherited source pinned-parent run or ancestor association",
+            ));
         }
         let total = proof
             .inherited
@@ -81,7 +87,7 @@ pub(in crate::desktop_store) fn with_inherited_prompt_attachments<T>(
                 f.proof.inherited
             });
         if child_count != kept {
-            return Err(StoreError::Corrupt("継承原文のturn数不一致"));
+            return Err(StoreError::Corrupt("Inherited source turn count mismatch"));
         }
         let needs_parent = proof.inherited > 0 && tail_start <= proof.inherited;
         charge(

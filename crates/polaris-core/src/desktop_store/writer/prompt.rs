@@ -94,14 +94,16 @@ impl SavedMcpPrompt {
             || event.message.content.len() > MAX_VISIBLE_BYTES
             || content_hash(event.message.content.as_bytes()) != terminal.envelope_hash
         {
-            return Err(StoreError::Corrupt("MCP prompt補助原文の対応"));
+            return Err(StoreError::Corrupt(
+                "MCP prompt supplemental source association",
+            ));
         }
         let envelope: Envelope = serde_json::from_str(&event.message.content)?;
         if envelope.intent != self.intent
             || envelope.disposition != terminal.disposition
             || serde_json::to_string(&envelope)? != event.message.content
         {
-            return Err(StoreError::Corrupt("MCP prompt結果の出典・形式"));
+            return Err(StoreError::Corrupt("MCP prompt result source or format"));
         }
         validate_envelope(&envelope)
     }
@@ -459,7 +461,9 @@ impl Proof {
             .into_iter()
             .any(|h| !valid_hash(h))
         {
-            return Err(StoreError::Corrupt("MCP prompt選択と操作証拠の対応"));
+            return Err(StoreError::Corrupt(
+                "MCP prompt selection and operation evidence association",
+            ));
         }
         Ok(())
     }
@@ -493,7 +497,7 @@ fn check_input_event(
         || proof.input.hash != content_hash(&serde_json::to_vec(event)?)
         || !same_message(&event.message, &Message::user(input_text))?
     {
-        return Err(StoreError::Corrupt("MCP promptの利用者入力根拠"));
+        return Err(StoreError::Corrupt("MCP prompt user input evidence"));
     }
     Ok(())
 }
@@ -822,7 +826,7 @@ pub(in crate::desktop_store) fn validate_state(state: &Sidecar) -> StoreResult<(
                     .iter()
                     .any(|approval| approval.pending.operation_id == op.operation_id)
             {
-                return Err(StoreError::Corrupt("MCP prompt操作の対応"));
+                return Err(StoreError::Corrupt("MCP prompt operation association"));
             }
         }
     }
@@ -843,7 +847,7 @@ pub(in crate::desktop_store) fn validate_record(
         };
         if found.is_some() || op.mcp.is_some() || saved.terminal.is_some() != op.result_id.is_some()
         {
-            return Err(StoreError::Corrupt("MCP prompt操作の対応"));
+            return Err(StoreError::Corrupt("MCP prompt operation association"));
         }
         saved.intent.validate(record, &op.operation_id)?;
         if let Some(terminal) = &saved.terminal
@@ -910,7 +914,7 @@ pub(in crate::desktop_store) fn validate_transition(
             .find(|run| run.run.run_id == prior.run.run_id)
             .ok_or(StoreError::RunConflict)?;
         if prior.mcp_prompt != next.mcp_prompt {
-            return Err(StoreError::Corrupt("受理済みMCP prompt選択の変更"));
+            return Err(StoreError::Corrupt("Admitted MCP prompt selection changed"));
         }
         for operation in &prior.operations {
             let current = next
@@ -924,7 +928,11 @@ pub(in crate::desktop_store) fn validate_transition(
                         && (old.terminal.is_none() || old.terminal == new.terminal)
                         && (operation.result_id.is_none()
                             || current.unwrap().result_id == operation.result_id) => {}
-                _ => return Err(StoreError::Corrupt("MCP prompt証拠の変更・削除")),
+                _ => {
+                    return Err(StoreError::Corrupt(
+                        "MCP prompt evidence changed or deleted",
+                    ));
+                }
             }
         }
     }

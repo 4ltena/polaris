@@ -18,70 +18,70 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// このprojectを共有へ参加させる。資格情報は保存しない。
+    /// Join this project to a share without storing credential values.
     Join {
-        /// 同期専用のcanonical HTTPS remote。
+        /// Canonical HTTPS remote dedicated to sync.
         #[arg(long)]
         remote: Option<String>,
         #[arg(long)]
         share_id: Option<String>,
         #[arg(long)]
         invitation_id: Option<String>,
-        /// 招待の期限（UNIX秒）。過ぎていれば参加しない。
+        /// Invitation expiry in UNIX seconds. Expired invitations cannot join.
         #[arg(long)]
         expires: Option<u64>,
-        /// 常に除外するものに加えて共有しない名前。
+        /// Additional names to exclude from sharing, beyond mandatory exclusions.
         #[arg(long = "exclude")]
         excluded: Vec<String>,
-        /// 現在の共有参加の資格情報を明示的に再束縛する。
+        /// Explicitly rebind credentials for the current share participation.
         #[arg(long, conflicts_with_all = ["recover", "abandon"])]
         rebind_credential: bool,
-        /// 指定したC08操作を照合して完了する。
+        /// Reconcile and complete the specified C08 operation.
         #[arg(long, value_name = "OPERATION_ID", conflicts_with_all = ["rebind_credential", "abandon"])]
         recover: Option<String>,
-        /// 指定したC08操作を明示的に中止する。
+        /// Explicitly abandon the specified C08 operation.
         #[arg(long, value_name = "OPERATION_ID", conflicts_with_all = ["rebind_credential", "recover"])]
         abandon: Option<String>,
-        /// C08操作を明示確認して非対話で実行する。
+        /// Explicitly confirm the C08 operation for noninteractive execution.
         #[arg(long)]
         yes: bool,
-        /// Keychainで選択するアカウント名。
+        /// Account name to select in Keychain.
         #[arg(long)]
         account: Option<String>,
-        /// 曖昧なKeychain候補のredacted prefix。
+        /// Redacted prefix for selecting an ambiguous Keychain candidate.
         #[arg(long)]
         credential_choice: Option<String>,
-        /// intentのないjoin中止で、確認時の参加時刻を正確に再構成する。
+        /// Reconstruct the exact confirmed join timestamp when abandoning a join without intent.
         #[arg(long, requires_all = ["abandon", "remote"])]
         joined_at: Option<u64>,
     },
-    /// 参加状態と、解消待ちの衝突を表示する。
+    /// Show participation state and unresolved conflicts.
     Status,
-    /// 共有対象を記録して相手へ送る。
+    /// Record shared content and send it to the peer.
     Push {
-        /// 指定したC10操作を再送せず照合する。
+        /// Reconcile the specified C10 operation without resending.
         #[arg(long, value_name = "OPERATION_ID", conflicts_with = "abandon")]
         recover: Option<String>,
-        /// 指定したC10操作を新たな確認の後に中止する。
+        /// Abandon the specified C10 operation after fresh confirmation.
         #[arg(long, value_name = "OPERATION_ID", conflicts_with = "recover")]
         abandon: Option<String>,
-        /// 表示された操作の確定を非対話で明示的に許可する。
+        /// Explicitly approve finalizing the displayed operation noninteractively.
         #[arg(long)]
         yes: bool,
     },
-    /// 指定したC10操作を再送せず照合する。
+    /// Reconcile the specified C10 operation without resending.
     Recover { operation_id: String },
-    /// 指定したC10操作を新たな確認の後に中止する。
+    /// Abandon the specified C10 operation after fresh confirmation.
     Abandon {
         operation_id: String,
         #[arg(long)]
         yes: bool,
     },
-    /// 相手の変更を受け取り、機械的に解けるものだけ統合する。
+    /// Receive peer changes and merge only mechanically resolvable changes.
     Pull,
-    /// 受け取って統合済みの内容をprojectへ反映する。解消待ちがあれば行わない。
+    /// Apply received, merged content to the project only when no unresolved conflicts remain.
     Apply,
-    /// この端末の参加をやめる。共有履歴と相手側はそのまま。
+    /// Leave the share on this device. Shared history and peers remain unchanged.
     Leave,
 }
 
@@ -99,8 +99,9 @@ pub async fn run(args: Args) -> ExitCode {
 }
 
 fn state_dir() -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|_| "作業directoryを取得できません".to_string())?;
-    polaris_core::project::state_dir(&cwd).map_err(|_| "state directoryを用意できません".into())
+    let cwd =
+        std::env::current_dir().map_err(|_| "Cannot retrieve the working directory".to_string())?;
+    polaris_core::project::state_dir(&cwd).map_err(|_| "Cannot prepare the state directory".into())
 }
 
 /// The same bounds the shared tree is collected under.
@@ -122,10 +123,10 @@ fn now() -> u64 {
 
 fn joined(state: &std::path::Path) -> Result<Participation, String> {
     participation::read(state)
-        .map_err(|error| format!("参加状態を安全に確認できません: {error}"))?
+        .map_err(|error| format!("Cannot safely verify participation state: {error}"))?
         .participation()
         .cloned()
-        .ok_or_else(|| "このprojectは共有に参加していません。".to_string())
+        .ok_or_else(|| "This project has not joined a share.".to_string())
 }
 
 /// Why the merge could not settle a path, in the words a person acts on.
@@ -133,23 +134,26 @@ fn joined(state: &std::path::Path) -> Result<Participation, String> {
 #[cfg(not(target_os = "linux"))]
 fn kept_text(reason: Kept) -> &'static str {
     match reason {
-        Kept::Overlapping => "同じ箇所を双方が変更した",
-        Kept::Binary => "行単位で統合できない形式である",
-        Kept::DeleteVersusEdit => "一方が削除し、他方が変更した",
-        Kept::AmbiguousRename => "改名の対応先を一つに定められない",
+        Kept::Overlapping => "Both sides changed the same region",
+        Kept::Binary => "The format cannot be merged line by line",
+        Kept::DeleteVersusEdit => "One side deleted a file that the other changed",
+        Kept::AmbiguousRename => "Cannot uniquely resolve the rename target",
     }
 }
 
 fn execute(command: Command) -> Result<String, String> {
     if cfg!(windows) {
         return Err(match &command {
-            Command::Apply => "Windowsでは共有内容の反映は未対応です。変更していません。",
-            _ => "Windowsでは共有状態の保護機構が未対応です。変更していません。",
+            Command::Apply => {
+                "Applying shared content is unsupported on Windows. No changes were made."
+            }
+            _ => "Windows lacks shared-state protection support. No changes were made.",
         }
         .into());
     }
     let project = polaris_core::project::resolve_root(
-        &std::env::current_dir().map_err(|_| "作業directoryを取得できません".to_string())?,
+        &std::env::current_dir()
+            .map_err(|_| "Cannot retrieve the working directory".to_string())?,
     );
     // Recovery must reach its domain owner before ordinary composite admission.
     let command = match command {
@@ -185,32 +189,34 @@ fn execute(command: Command) -> Result<String, String> {
     } = command
     {
         let reconstruct_join = abandon.is_some() && remote.is_some();
-        let join =
-            if rebind_credential || recover.is_some() || (abandon.is_some() && !reconstruct_join) {
-                None
-            } else {
-                Some((
-                    ShareLink {
-                        remote: remote.ok_or_else(|| "--remoteが必要です".to_string())?,
-                        share_id: share_id.ok_or_else(|| "--share-idが必要です".to_string())?,
-                        invitation_id: invitation_id
-                            .ok_or_else(|| "--invitation-idが必要です".to_string())?,
-                        expires_unix_seconds: expires
-                            .ok_or_else(|| "--expiresが必要です".to_string())?,
-                    },
-                    ShareManifest {
-                        version: 1,
-                        excluded,
-                    },
-                    if reconstruct_join {
-                        joined_at.ok_or_else(|| {
-                            "join中止の再構成には確認時の--joined-atが必要です".to_string()
+        let join = if rebind_credential
+            || recover.is_some()
+            || (abandon.is_some() && !reconstruct_join)
+        {
+            None
+        } else {
+            Some((
+                ShareLink {
+                    remote: remote.ok_or_else(|| "--remote is required".to_string())?,
+                    share_id: share_id.ok_or_else(|| "--share-id is required".to_string())?,
+                    invitation_id: invitation_id
+                        .ok_or_else(|| "--invitation-id is required".to_string())?,
+                    expires_unix_seconds: expires
+                        .ok_or_else(|| "--expires is required".to_string())?,
+                },
+                ShareManifest {
+                    version: 1,
+                    excluded,
+                },
+                if reconstruct_join {
+                    joined_at.ok_or_else(|| {
+                            "Reconstructing a join abandonment requires the confirmed --joined-at timestamp".to_string()
                         })?
-                    } else {
-                        now()
-                    },
-                ))
-            };
+                } else {
+                    now()
+                },
+            ))
+        };
         return c08_command(
             &project,
             rebind_credential,
@@ -228,14 +234,14 @@ fn execute(command: Command) -> Result<String, String> {
                 polaris_core::apply_owner::ApplyOwnerError::Admission(error) => {
                     String::from_utf8(error.canonical_bytes()).expect("closed UTF-8 diagnostic")
                 }
-                error => format!("共有操作を開始できません: {error}"),
+                error => format!("Cannot start the sharing operation: {error}"),
             },
         )?;
     let state = state_dir()?;
     #[cfg(target_os = "linux")]
     if !matches!(&command, Command::Apply | Command::Status) {
         owner.ensure_sync_idle().map_err(|_| {
-            "未完了または実行中の操作があります。適用状態を確認してから共有操作を再開してください。".to_string()
+            "An operation is incomplete or active. Verify apply state before resuming sharing operations.".to_string()
         })?;
     }
     match command {
@@ -265,11 +271,11 @@ fn execute(command: Command) -> Result<String, String> {
                 );
             }
             let share = ShareLink {
-                remote: remote.ok_or_else(|| "--remoteが必要です".to_string())?,
-                share_id: share_id.ok_or_else(|| "--share-idが必要です".to_string())?,
+                remote: remote.ok_or_else(|| "--remote is required".to_string())?,
+                share_id: share_id.ok_or_else(|| "--share-id is required".to_string())?,
                 invitation_id: invitation_id
-                    .ok_or_else(|| "--invitation-idが必要です".to_string())?,
-                expires_unix_seconds: expires.ok_or_else(|| "--expiresが必要です".to_string())?,
+                    .ok_or_else(|| "--invitation-id is required".to_string())?,
+                expires_unix_seconds: expires.ok_or_else(|| "--expires is required".to_string())?,
             };
             let manifest = ShareManifest {
                 version: 1,
@@ -295,7 +301,7 @@ fn execute(command: Command) -> Result<String, String> {
                     let joined_unix_seconds = now();
                     share
                         .accept(joined_unix_seconds)
-                        .map_err(|_| "参加fixtureを作成できません".to_string())?;
+                        .map_err(|_| "Cannot create the participation fixture".to_string())?;
                     let value = Participation {
                         share,
                         manifest,
@@ -305,26 +311,25 @@ fn execute(command: Command) -> Result<String, String> {
                         unresolved: Vec::new(),
                     };
                     let sync = state.join("sync");
-                    std::fs::create_dir_all(&sync)
-                        .map_err(|_| "fixture保存場所を作成できません")?;
+                    std::fs::create_dir_all(&sync).map_err(|_| "Cannot create fixture storage")?;
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o700))
-                        .map_err(|_| "fixture保存場所を保護できません")?;
+                        .map_err(|_| "Cannot protect fixture storage")?;
                     let path = sync.join("participation.json");
                     std::fs::write(
                         &path,
-                        serde_json::to_vec(&value).map_err(|_| "fixtureを符号化できません")?,
+                        serde_json::to_vec(&value).map_err(|_| "Cannot encode the fixture")?,
                     )
-                    .map_err(|_| "fixtureを保存できません")?;
+                    .map_err(|_| "Cannot save the fixture")?;
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|_| "fixtureを保護できません")?;
+                        .map_err(|_| "Cannot protect the fixture")?;
                     value
                 };
                 #[cfg(not(target_os = "linux"))]
                 let participation = participation::join(&state, share, manifest, now())
-                    .map_err(|_| "参加fixtureを作成できません".to_string())?;
+                    .map_err(|_| "Cannot create the participation fixture".to_string())?;
                 Ok(format!(
-                    "参加しました: {} （共有対象の規則: {}）",
+                    "Joined: {} (sharing rules: {})",
                     participation.share.share_id,
                     participation.manifest.digest()
                 ))
@@ -335,13 +340,13 @@ fn execute(command: Command) -> Result<String, String> {
             #[cfg(target_os = "linux")]
             if let Some(intent) = owner
                 .active()
-                .map_err(|error| format!("適用状態を確認できません: {error}"))?
+                .map_err(|error| format!("Cannot verify apply state: {error}"))?
             {
                 return Ok(format!(
-                    "共有: {}\n最後に合意した内容: {}\n反映済みの内容: {}\n未完了の適用: {} ({:?})\n復旧用の控え: {}",
+                    "Share: {}\nLast agreed content: {}\nApplied content: {}\nIncomplete apply: {} ({:?})\nRecovery backup: {}",
                     held.share.share_id,
-                    held.agreed_commit.as_deref().unwrap_or("なし"),
-                    held.applied_commit.as_deref().unwrap_or("なし"),
+                    held.agreed_commit.as_deref().unwrap_or("none"),
+                    held.applied_commit.as_deref().unwrap_or("none"),
                     intent.descriptor().operation_key.as_hex(),
                     intent.latest().phase,
                     intent.descriptor().recovery_child
@@ -352,12 +357,12 @@ fn execute(command: Command) -> Result<String, String> {
                 .ok()
                 .and_then(|repository| repository.head());
             let message = format!(
-                "共有: {}\n最後に合意した内容: {}\n手元の記録: {}\n解消待ち: {}",
+                "Share: {}\nLast agreed content: {}\nLocal record: {}\nUnresolved: {}",
                 held.share.share_id,
-                held.agreed_commit.as_deref().unwrap_or("なし"),
-                head.as_deref().unwrap_or("なし"),
+                held.agreed_commit.as_deref().unwrap_or("none"),
+                head.as_deref().unwrap_or("none"),
                 if held.unresolved.is_empty() {
-                    "なし".to_string()
+                    "none".to_string()
                 } else {
                     held.unresolved.join(", ")
                 }
@@ -372,10 +377,10 @@ fn execute(command: Command) -> Result<String, String> {
             {
                 let exchange = owner
                     .pull_confirmed(true)
-                    .map_err(|_| "受信結果を確定できません。共有状態を確認してください。")?
+                    .map_err(|_| "Cannot finalize the receive result. Check shared state.")?
                     .expect("explicit pull accepted");
                 return Ok(format!(
-                    "受け取りました: {}件、解消待ち{}件。projectへの反映は別操作です。",
+                    "Received: {} items, {} unresolved. Applying to the project is a separate operation.",
                     exchange.changes.len(),
                     exchange.needs_attention().len()
                 ));
@@ -384,21 +389,21 @@ fn execute(command: Command) -> Result<String, String> {
             {
                 let mut held = joined(&state)?;
                 let repository = SyncRepository::open(SyncPaths::under(&state))
-                    .map_err(|error| format!("同期用の記録を開けません: {error}"))?;
+                    .map_err(|error| format!("Cannot open sync records: {error}"))?;
                 // The local edits are recorded first, so a clash with what is
                 // arriving is found now instead of silently disappearing.
                 repository
                     .stage_from(&project, &held.manifest)
-                    .map_err(|error| format!("共有対象を集められません: {error}"))?;
+                    .map_err(|error| format!("Cannot collect shared content: {error}"))?;
                 repository
                     .commit("polaris sync")
-                    .map_err(|error| format!("記録できません: {error}"))?;
-                repository.receive(&held.share.remote).map_err(|_| {
-                    "受信できません。remoteへの接続を確認してください。".to_string()
-                })?;
+                    .map_err(|error| format!("Cannot record: {error}"))?;
+                repository
+                    .receive(&held.share.remote)
+                    .map_err(|_| "Cannot receive. Check the remote connection.".to_string())?;
                 let exchange = repository
                     .merge_received()
-                    .map_err(|error| format!("統合できません: {error}"))?;
+                    .map_err(|error| format!("Cannot merge: {error}"))?;
                 held.unresolved = exchange
                     .needs_attention()
                     .iter()
@@ -413,7 +418,7 @@ fn execute(command: Command) -> Result<String, String> {
                 let published = owner.write_participation(&held);
                 #[cfg(not(target_os = "linux"))]
                 let published = participation::write(&state, &held);
-                published.map_err(|_| "参加状態を保存できません".to_string())?;
+                published.map_err(|_| "Cannot save participation state".to_string())?;
                 if exchange.unresolved {
                     // The merge already measured why each path was left: keeping
                     // only the path would make the person open every one of them
@@ -429,13 +434,13 @@ fn execute(command: Command) -> Result<String, String> {
                         })
                         .collect();
                     return Ok(format!(
-                        "双方の内容を残しました（{}件）。解消してから`polaris sync push`を実行してください。\n{}",
+                        "Both versions retained ({} items). Resolve them before running `polaris sync push`.\n{}",
                         waiting.len(),
                         waiting.join("\n")
                     ));
                 }
                 Ok(format!(
-                    "受け取りました: {}件の変更。projectへの反映は別の操作で行います。",
+                    "Received: {} changes. Apply them to the project separately.",
                     exchange.changes.len()
                 ))
             }
@@ -448,29 +453,26 @@ fn execute(command: Command) -> Result<String, String> {
                 let held = joined(&state)?;
                 if !held.unresolved.is_empty() {
                     return Err(format!(
-                        "解消待ちが{}件あります。先に解消してください。\n{}",
+                        "{} unresolved items. Resolve them first.\n{}",
                         held.unresolved.len(),
                         held.unresolved.join("\n")
                     ));
                 }
                 let Some(agreed) = held.agreed_commit.clone() else {
-                    return Err(
-                        "まだ合意した内容がありません。先に`polaris sync pull`を実行してください。"
-                            .into(),
-                    );
+                    return Err("No agreed content yet. Run `polaris sync pull` first.".into());
                 };
                 if held.applied_commit.as_deref() == Some(agreed.as_str()) {
                     // The same agreed state is never applied twice, however often
                     // it is redelivered.
-                    return Ok("この内容は反映済みです。".into());
+                    return Ok("This content has already been applied.".into());
                 }
                 let paths = SyncPaths::under(&state);
                 let staging = paths.work_tree.clone();
                 let repository = SyncRepository::open(paths)
-                    .map_err(|error| format!("同期用の記録を開けません: {error}"))?;
+                    .map_err(|error| format!("Cannot open sync records: {error}"))?;
                 if repository.head().as_deref() != Some(agreed.as_str()) {
                     return Err(
-                    "同期用の記録が合意内容と一致しません。先に`polaris sync pull`を実行してください。"
+                    "Sync records do not match the agreed content. Run `polaris sync pull` first."
                         .into(),
                 );
                 }
@@ -478,14 +480,14 @@ fn execute(command: Command) -> Result<String, String> {
                 // read here is the agreement and not what a previous command left.
                 repository
                     .restore(&agreed)
-                    .map_err(|error| format!("合意内容を取り出せません: {error}"))?;
+                    .map_err(|error| format!("Cannot retrieve agreed content: {error}"))?;
                 let (written, removed) = repository
                     .changed_paths(held.applied_commit.as_deref(), &agreed)
-                    .map_err(|error| format!("変更点を読み取れません: {error}"))?;
+                    .map_err(|error| format!("Cannot read changes: {error}"))?;
                 let changed = polaris_core::sync::apply::Changed { written, removed };
                 let recovery = state.join("sync/recovery");
                 std::fs::create_dir_all(&recovery)
-                    .map_err(|_| "復旧用の場所を用意できません".to_string())?;
+                    .map_err(|_| "Cannot prepare the recovery location".to_string())?;
                 let (report, shaped) = polaris_core::sync::apply::apply_agreed(
                     &project,
                     &staging,
@@ -494,19 +496,19 @@ fn execute(command: Command) -> Result<String, String> {
                     limits(),
                     &recovery,
                 )
-                .map_err(|error| format!("反映できません: {error}"))?;
+                .map_err(|error| format!("Cannot apply: {error}"))?;
                 if let Some(failure) = &report.failure {
-                    return Err(format!("反映できません: {failure:?}"));
+                    return Err(format!("Cannot apply: {failure:?}"));
                 }
                 let mut held = held;
                 held.applied_commit = Some(agreed);
                 participation::write(&state, &held)
-                    .map_err(|_| "参加状態を保存できません".to_string())?;
+                    .map_err(|_| "Cannot save participation state".to_string())?;
                 let deferred = if shaped.deferred.is_empty() {
                     String::new()
                 } else {
                     format!(
-                        "\n新しいdirectoryが要るため反映していないもの（{}件）:\n{}",
+                        "\nNot applied because new directories are required ({} items):\n{}",
                         shaped.deferred.len(),
                         shaped
                             .deferred
@@ -517,12 +519,12 @@ fn execute(command: Command) -> Result<String, String> {
                     )
                 };
                 Ok(format!(
-                    "{}件を反映しました。復旧用の控えは{}にあります。{deferred}",
+                    "Applied {} items. Recovery backup: {}.{deferred}",
                     report.entries.len(),
                     report
                         .recovery_path
                         .as_ref()
-                        .map_or_else(|| "なし".into(), |path| path.display().to_string())
+                        .map_or_else(|| "none".into(), |path| path.display().to_string())
                 ))
             }
         }
@@ -533,10 +535,10 @@ fn execute(command: Command) -> Result<String, String> {
                 .map(|p| p.expect("explicit leave accepted"));
             #[cfg(not(target_os = "linux"))]
             let left = participation::leave(&state);
-            if left.map_err(|error| format!("やめられません: {error}"))? {
-                Ok("この端末の参加をやめました。共有履歴と相手側はそのままです。".into())
+            if left.map_err(|error| format!("Cannot leave: {error}"))? {
+                Ok("This device left the share. Shared history and peers remain unchanged.".into())
             } else {
-                Ok("参加していません。".into())
+                Ok("Not participating.".into())
             }
         }
     }
@@ -557,13 +559,13 @@ fn apply_linux(
         let kind = match value.len() {
             40 => RevisionKindV1::GitSha1,
             64 => RevisionKindV1::GitSha256,
-            _ => return Err("合意revisionの形式を確認できません".into()),
+            _ => return Err("Cannot verify the agreed revision format".into()),
         };
         if !value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err("合意revisionの形式を確認できません".into());
+            return Err("Cannot verify the agreed revision format".into());
         }
         Ok(RevisionV1 {
             kind,
@@ -574,91 +576,91 @@ fn apply_linux(
     let recovery = state.join("sync/recovery");
     let active = owner
         .active()
-        .map_err(|error| format!("適用状態を確認できません: {error}"))?;
+        .map_err(|error| format!("Cannot verify apply state: {error}"))?;
     if let Some(active) = active {
         if active.descriptor().inventory_id != polaris_core::apply_intent::ApplyInventoryV1::C12 {
             return Err(format!(
-                "Desktopの適用が未完了です ({})。共有内容の適用は行っていません。",
+                "Desktop apply is incomplete ({}). Shared content was not applied.",
                 active.descriptor().operation_key.as_hex()
             ));
         }
         let parent = owner
             .c12_recovery_parent(false)
-            .map_err(|error| format!("復旧用の場所を安全に固定できません: {error}"))?;
+            .map_err(|error| format!("Cannot safely pin the recovery location: {error}"))?;
         let key = active.descriptor().operation_key.as_hex();
         return match owner
             .recover_current(&parent)
-            .map_err(|error| format!("前回の適用を復旧できません ({key}): {error}"))?
+            .map_err(|error| format!("Cannot recover the previous apply ({key}): {error}"))?
         {
             ApplyOwnerRecoveryV1::OutcomeUnknown(_) => Err(format!(
-                "適用結果が未確定です ({key})。新しい適用は行っていません。復旧用の控え: {}",
+                "Apply outcome is unknown ({key}). No new apply was performed. Recovery backup: {}",
                 recovery.display()
             )),
             ApplyOwnerRecoveryV1::Archived(_) => Err(format!(
-                "前回の操作を復旧して閉じました ({key})。今回は新しい適用を行っていません。参加状態を確認してください。"
+                "Recovered and closed the previous operation ({key}). No new apply was performed. Check participation state."
             )),
             ApplyOwnerRecoveryV1::Idle => {
-                Err("適用状態が変わりました。参加状態を確認してください。".into())
+                Err("Apply state changed. Check participation state.".into())
             }
         };
     }
     owner
         .ensure_sync_idle()
-        .map_err(|_| "未完了の操作があるため共有内容を反映できません。".to_string())?;
+        .map_err(|_| "Cannot apply shared content while an operation is incomplete.".to_string())?;
     let mut held = joined(state)?;
     if !held.unresolved.is_empty() {
         return Err(format!(
-            "解消待ちが{}件あります。先に解消してください。\n{}",
+            "{} unresolved items. Resolve them first.\n{}",
             held.unresolved.len(),
             held.unresolved.join("\n")
         ));
     }
-    let agreed = held.agreed_commit.clone().ok_or_else(|| {
-        "まだ合意した内容がありません。先に`polaris sync pull`を実行してください。".to_string()
-    })?;
+    let agreed = held
+        .agreed_commit
+        .clone()
+        .ok_or_else(|| "No agreed content yet. Run `polaris sync pull` first.".to_string())?;
     if held.applied_commit.as_deref() == Some(agreed.as_str()) {
-        return Ok("この内容は反映済みです。".into());
+        return Ok("This content has already been applied.".into());
     }
     // Reject a cross-device recovery location before creating its directory or
     // restoring a candidate. The retained owner covers all subsequent staging.
     let source_meta =
-        std::fs::metadata(project).map_err(|_| "projectを確認できません".to_string())?;
+        std::fs::metadata(project).map_err(|_| "Cannot verify the project".to_string())?;
     let state_meta =
-        std::fs::metadata(state).map_err(|_| "保存場所を確認できません".to_string())?;
+        std::fs::metadata(state).map_err(|_| "Cannot verify the storage location".to_string())?;
     if source_meta.dev() != state_meta.dev() {
-        return Err("共有内容の適用にはprojectと同じファイルシステムの復旧場所が必要です。".into());
+        return Err("Applying shared content requires a recovery location on the same filesystem as the project.".into());
     }
     let parent = owner
         .c12_recovery_parent(true)
-        .map_err(|error| format!("復旧用の場所を安全に固定できません: {error}"))?;
+        .map_err(|error| format!("Cannot safely pin the recovery location: {error}"))?;
     let paths = SyncPaths::under(state);
     let staging = paths.work_tree.clone();
     let repository = SyncRepository::open(paths)
-        .map_err(|error| format!("同期用の記録を開けません: {error}"))?;
+        .map_err(|error| format!("Cannot open sync records: {error}"))?;
     if repository.head().as_deref() != Some(agreed.as_str()) {
         return Err(
-            "同期用の記録が合意内容と一致しません。先に`polaris sync pull`を実行してください。"
-                .into(),
+            "Sync records do not match the agreed content. Run `polaris sync pull` first.".into(),
         );
     }
     repository
         .restore(&agreed)
-        .map_err(|error| format!("合意内容を取り出せません: {error}"))?;
+        .map_err(|error| format!("Cannot retrieve agreed content: {error}"))?;
     let (written, removed) = repository
         .changed_paths(held.applied_commit.as_deref(), &agreed)
-        .map_err(|error| format!("変更点を読み取れません: {error}"))?;
+        .map_err(|error| format!("Cannot read changes: {error}"))?;
     let agreed_revision = revision(&agreed)?;
     let previous_applied_revision = held.applied_commit.as_deref().map(revision).transpose()?;
     held.applied_commit = Some(agreed);
     let admission = C12ApplyAdmissionV1 {
         management_operation_id: ManagementOperationIdV1::random()
-            .map_err(|error| format!("操作IDを用意できません: {error}"))?,
+            .map_err(|error| format!("Cannot prepare an operation ID: {error}"))?,
         agreed_revision: agreed_revision.clone(),
         staged_revision: agreed_revision,
         previous_applied_revision,
         target_participation: owner
             .participation_target_bytes(&held)
-            .map_err(|error| format!("参加状態を確認できません: {error}"))?,
+            .map_err(|error| format!("Cannot verify participation state: {error}"))?,
     };
     let (report, _) = polaris_core::sync::apply::apply_agreed_m2a(
         owner,
@@ -671,21 +673,23 @@ fn apply_linux(
         &parent,
     )
     .map_err(|error| {
-        format!("反映を確定できません。参加状態と復旧用の控えを確認してください: {error}")
+        format!(
+            "Cannot finalize the apply. Check participation state and the recovery backup: {error}"
+        )
     })?;
     if let Some(failure) = report.failure {
         return Err(format!(
-            "適用結果が未確定です: {failure:?}。復旧用の控え: {}",
+            "Apply outcome is unknown: {failure:?}. Recovery backup: {}",
             recovery.display()
         ));
     }
     Ok(format!(
-        "{}件を反映しました。復旧用の控えは{}にあります。",
+        "Applied {} items. Recovery backup: {}.",
         report.entries.len(),
         report
             .recovery_path
             .as_ref()
-            .map_or_else(|| "なし".into(), |path| path.display().to_string())
+            .map_or_else(|| "none".into(), |path| path.display().to_string())
     ))
 }
 
@@ -698,7 +702,10 @@ fn c10_command(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project, recover, abandon, yes);
-        Err("c10_unavailable_platform: 共有送信はmacOSのData Protection Keychainでのみ利用できます。".into())
+        Err(
+            "c10_unavailable_platform: shared sends require the macOS Data Protection Keychain."
+                .into(),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -710,14 +717,14 @@ fn c10_command(
             value
                 .map(|value| {
                     ManagementOperationIdV1::from_str(&value)
-                        .map_err(|_| "C10 operation IDが不正です".to_string())
+                        .map_err(|_| "Invalid C10 operation ID".to_string())
                 })
                 .transpose()
         };
         let recover = parse(recover)?;
         let abandon = parse(abandon)?;
         if recover.is_some() && abandon.is_some() {
-            return Err("C10 recoverとabandonは同時に指定できません".into());
+            return Err("C10 recover and abandon cannot be specified together".into());
         }
         let host = CliC10Host {
             yes,
@@ -741,11 +748,13 @@ fn c10_command(
             let mut output = std::io::stderr().lock();
             writeln!(
                 output,
-                "C10 preview（確定はprepare後）\n{}",
+                "C10 preview (confirmation follows preparation)\n{}",
                 c10_summary(preview.summary())
             )
-            .map_err(|_| "C10 previewを表示できません")?;
-            output.flush().map_err(|_| "C10 previewを表示できません")?;
+            .map_err(|_| "Cannot display the C10 preview")?;
+            output
+                .flush()
+                .map_err(|_| "Cannot display the C10 preview")?;
             drop(output);
             let token = owner.prepare(preview).map_err(|error| error.to_string())?;
             match c10_confirm(yes, &c10_summary(token.summary()))? {
@@ -815,7 +824,7 @@ impl polaris_core::sync::push::SyncPushHostV1 for CliC10Host {
         }
         self.require_confirmation_channel()?;
         let summary = format!(
-            "C10中止: operation={operation}\nrequest={request}\n送信されなかったことの証明にはなりません。"
+            "C10 abandon: operation={operation}\nrequest={request}\nThis does not prove that nothing was sent."
         );
         if c10_confirm(self.yes, &summary).map_err(|_| SyncPushErrorV1::Permission)?
             != C08Confirmation::Accepted
@@ -854,7 +863,7 @@ impl polaris_core::sync::push::SyncPushHostV1 for CliC10Host {
 #[cfg(any(target_os = "macos", all(unix, test)))]
 fn c10_summary(summary: &polaris_core::sync::push::SyncPushConfirmationSummaryV1) -> String {
     format!(
-        "C10送信: operation={}\nrequest={}\nproject={}\n共有={}\nremote={}\nref={}\nmanifest={}\nexpected remote={:?}\npayload={}\n対象={}件・除外={}件\naccount registration={}\n操作={:?}",
+        "C10 send: operation={}\nrequest={}\nproject={}\nshare={}\nremote={}\nref={}\nmanifest={}\nexpected remote={:?}\npayload={}\nincluded={} excluded={}\naccount registration={}\noperation={:?}",
         summary.operation_id,
         summary.request_hash,
         summary.project,
@@ -878,13 +887,18 @@ fn c10_confirm(yes: bool, summary: &str) -> Result<C08Confirmation, String> {
         return Err("c10_permission_unavailable".into());
     }
     let mut output = std::io::stderr().lock();
-    writeln!(output, "{summary}").map_err(|_| "C10確認を表示できません")?;
-    output.flush().map_err(|_| "C10確認を表示できません")?;
+    writeln!(output, "{summary}").map_err(|_| "Cannot display C10 confirmation")?;
+    output
+        .flush()
+        .map_err(|_| "Cannot display C10 confirmation")?;
     if yes {
         return Ok(C08Confirmation::Accepted);
     }
-    write!(output, "このC10操作を確定しますか [y/N]: ").map_err(|_| "C10確認を表示できません")?;
-    output.flush().map_err(|_| "C10確認を表示できません")?;
+    write!(output, "Confirm this C10 operation? [y/N]: ")
+        .map_err(|_| "Cannot display C10 confirmation")?;
+    output
+        .flush()
+        .map_err(|_| "Cannot display C10 confirmation")?;
     read_c08_confirmation(&mut std::io::stdin().lock().take(257))
 }
 
@@ -892,24 +906,24 @@ fn c10_confirm(yes: bool, summary: &str) -> Result<C08Confirmation, String> {
 fn c10_outcome(outcome: polaris_core::sync::push::SyncPushOutcomeV1) -> Result<String, String> {
     use polaris_core::sync::push::SyncPushOutcomeV1;
     match outcome {
-        SyncPushOutcomeV1::NoChanges => Ok("C10: 共有内容は一致しています".into()),
+        SyncPushOutcomeV1::NoChanges => Ok("C10: shared content matches".into()),
         SyncPushOutcomeV1::Completed {
             operation_id,
             commit,
         } => Ok(format!(
-            "C10送信完了: operation={operation_id} commit={commit}"
+            "C10 send complete: operation={operation_id} commit={commit}"
         )),
         SyncPushOutcomeV1::Denied { operation_id } => {
-            Ok(format!("C10操作を取り消しました: operation={operation_id}"))
+            Ok(format!("C10 operation cancelled: operation={operation_id}"))
         }
         SyncPushOutcomeV1::ReconciledAbandon { operation_id } => Ok(format!(
-            "C10操作を照合して中止しました: operation={operation_id}（未送信の証明ではありません）"
+            "C10 operation reconciled and abandoned: operation={operation_id} (does not prove that nothing was sent)"
         )),
         SyncPushOutcomeV1::OutcomeUnknown { operation_id } => Err(format!(
-            "C10結果未確定: operation={operation_id}。再送せず polaris sync recover <operation-id> で照合してください"
+            "C10 outcome unknown: operation={operation_id}. Do not resend; reconcile with polaris sync recover <operation-id>"
         )),
         SyncPushOutcomeV1::PartialComplete { operation_id } => Err(format!(
-            "C10保存未完了: operation={operation_id}。再送せず polaris sync recover <operation-id> で照合してください"
+            "C10 persistence incomplete: operation={operation_id}. Do not resend; reconcile with polaris sync recover <operation-id>"
         )),
     }
 }
@@ -929,7 +943,7 @@ fn c08_command(
             project, rebind, recover, abandon, yes, account, choice, join,
         );
         Err(
-            "共有参加とcredential rebindはmacOSのData Protection Keychainでのみ利用できます。"
+            "Joining shares and rebinding credentials require the macOS Data Protection Keychain."
                 .into(),
         )
     }
@@ -940,38 +954,39 @@ fn c08_command(
         use polaris_core::sync::credential_rebind::CredentialRebindOwnerV1;
         use std::str::FromStr;
         if !yes && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            return Err("C08の確定にはTTY確認または--yesが必要です。".into());
+            return Err("C08 confirmation requires a TTY or --yes.".into());
         }
-        let home = std::env::var_os("HOME").ok_or_else(|| "HOMEを取得できません".to_string())?;
-        let exe = std::env::current_exe().map_err(|_| "実行binaryを取得できません".to_string())?;
+        let home = std::env::var_os("HOME").ok_or_else(|| "Cannot retrieve HOME".to_string())?;
+        let exe = std::env::current_exe()
+            .map_err(|_| "Cannot retrieve the executable path".to_string())?;
         let askpass = exe
             .parent()
-            .ok_or_else(|| "askpassの場所を取得できません".to_string())?
+            .ok_or_else(|| "Cannot locate askpass".to_string())?
             .join("polaris-git-askpass");
         let credentials = GitCredentialOwnerV1::new(
             std::path::Path::new(&home),
             std::path::Path::new("/usr/bin/git"),
             &askpass,
         )
-        .map_err(|_| "credential ownerを安全に初期化できません".to_string())?;
+        .map_err(|_| "Cannot safely initialize the credential owner".to_string())?;
         let owner = CredentialRebindOwnerV1::acquire(project, credentials)
-            .map_err(|_| "C08 ownerを取得できません".to_string())?;
+            .map_err(|_| "Cannot retrieve the C08 owner".to_string())?;
         let id = recover
             .as_ref()
             .or(abandon.as_ref())
             .map(|value| {
                 ManagementOperationIdV1::from_str(value)
-                    .map_err(|_| "operation IDが不正です".to_string())
+                    .map_err(|_| "Invalid operation ID".to_string())
             })
             .transpose()?;
         if let Some(id) = id {
             let needs_selection = owner
                 .recovery_needs_selection(id)
-                .map_err(|_| "C08の復旧条件を確認できません".to_string())?;
+                .map_err(|_| "Cannot verify C08 recovery conditions".to_string())?;
             let preview = if needs_selection {
                 if recover.is_some() {
                     return Err(
-                        "intentのない操作はexact requestを再構成した明示abandonが必要です。".into(),
+                        "An operation without intent requires explicit abandonment with the exact request reconstructed.".into(),
                     );
                 }
                 Some(c08_select_preview(
@@ -988,24 +1003,24 @@ fn c08_command(
                 Some(value) => Some(value.confirmation.clone()),
                 None => owner
                     .recovery_confirmation(id)
-                    .map_err(|_| "復旧確認内容を取得できません".to_string())?,
+                    .map_err(|_| "Cannot retrieve recovery confirmation details".to_string())?,
             };
             if c08_confirm(yes, confirmation.as_ref())? == C08Confirmation::Declined {
-                return Err("C08操作を取り消しました。".into());
+                return Err("C08 operation cancelled.".into());
             }
             if recover.is_some() {
                 owner
                     .recover(id)
-                    .map_err(|_| "C08操作を復旧できません".to_string())?;
-                return Ok("資格情報の再束縛を照合して完了しました。".into());
+                    .map_err(|_| "Cannot recover the C08 operation".to_string())?;
+                return Ok("Credential rebinding reconciled and completed.".into());
             }
             owner
                 .abandon(id, preview)
-                .map_err(|_| "C08操作を中止できません".to_string())?;
-            return Ok("資格情報の再束縛を中止しました。".into());
+                .map_err(|_| "Cannot abandon the C08 operation".to_string())?;
+            return Ok("Credential rebinding abandoned.".into());
         }
         if !rebind && join.is_none() {
-            return Err("C08操作を指定してください。".into());
+            return Err("Specify a C08 operation.".into());
         }
         let preview =
             c08_select_preview(&owner, project, account.as_deref(), choice.as_deref(), join)?;
@@ -1013,22 +1028,22 @@ fn c08_command(
         let operation_id = preview.operation_id;
         let token = owner
             .prepare(preview)
-            .map_err(|_| "C08操作を準備できません".to_string())?;
+            .map_err(|_| "Cannot prepare the C08 operation".to_string())?;
         println!("C08 operation: {}", operation_id.as_hex());
         // An input/output failure drops Prepared; it is not user denial.
         if c08_confirm(yes, Some(&summary))? == C08Confirmation::Declined {
             token
                 .deny()
-                .map_err(|_| "C08取消の記録を確定できません".to_string())?;
-            return Err("C08操作を取り消しました。".into());
+                .map_err(|_| "Cannot finalize the C08 cancellation record".to_string())?;
+            return Err("C08 operation cancelled.".into());
         }
         token
             .confirm()
-            .map_err(|_| "C08操作を確定できません".to_string())?;
+            .map_err(|_| "Cannot finalize the C08 operation".to_string())?;
         Ok(if rebind {
-            "資格情報の再束縛を確定しました。".into()
+            "Credential rebinding confirmed.".into()
         } else {
-            "資格情報を束縛して共有へ参加しました。".into()
+            "Credentials bound and share joined.".into()
         })
     }
 }
@@ -1040,44 +1055,44 @@ fn c08_select_preview(
     choice: Option<&str>,
     join: Option<(ShareLink, ShareManifest, u64)>,
 ) -> Result<polaris_core::sync::credential_rebind::CredentialRebindPreviewV1, String> {
-    let account = account.ok_or_else(|| "--accountが必要です".to_string())?;
+    let account = account.ok_or_else(|| "--account is required".to_string())?;
     if let Some((share, manifest, timestamp)) = join {
         let remote = share
             .production_remote()
-            .map_err(|_| "canonical HTTPS remoteが必要です".to_string())?;
+            .map_err(|_| "A canonical HTTPS remote is required".to_string())?;
         let binding = owner
             .select_candidate(&remote, account, 1, choice)
-            .map_err(|_| "Keychain候補を安全に選択できません".to_string())?;
+            .map_err(|_| "Cannot safely select a Keychain candidate".to_string())?;
         return owner
             .preview_join(binding, share, manifest, timestamp)
-            .map_err(|_| "joinの事前確認に失敗しました".to_string());
+            .map_err(|_| "Join preflight failed".to_string());
     }
     let state = polaris_core::project::state_dir(project)
-        .map_err(|_| "stateを取得できません".to_string())?;
-    let held =
-        participation::read(&state).map_err(|_| "参加状態を安全に確認できません".to_string())?;
+        .map_err(|_| "Cannot retrieve state".to_string())?;
+    let held = participation::read(&state)
+        .map_err(|_| "Cannot safely verify participation state".to_string())?;
     let source = held
         .participation()
-        .ok_or_else(|| "共有参加がありません。新規joinの入力が必要です。".to_string())?;
+        .ok_or_else(|| "No share participation. New join input is required.".to_string())?;
     let remote = source
         .share
         .production_remote()
-        .map_err(|_| "canonical HTTPS remoteが必要です".to_string())?;
+        .map_err(|_| "A canonical HTTPS remote is required".to_string())?;
     let generation = match &held {
         participation::ParticipationReadV2::LegacyParticipationOnly(_) => 1,
         participation::ParticipationReadV2::StaleCredentialBindingOnly(value) => value
             .credential_binding
             .generation()
             .checked_add(1)
-            .ok_or_else(|| "generationが上限です".to_string())?,
-        _ => return Err("再束縛の対象ではありません".into()),
+            .ok_or_else(|| "Generation limit reached".to_string())?,
+        _ => return Err("Not eligible for rebinding".into()),
     };
     let binding = owner
         .select_candidate(&remote, account, generation, choice)
-        .map_err(|_| "Keychain候補を安全に選択できません".to_string())?;
+        .map_err(|_| "Cannot safely select a Keychain candidate".to_string())?;
     owner
         .preview(binding)
-        .map_err(|_| "再束縛の事前確認に失敗しました".to_string())
+        .map_err(|_| "Rebind preflight failed".to_string())
 }
 #[cfg(any(unix, test))]
 #[derive(Debug, PartialEq, Eq)]
@@ -1095,17 +1110,17 @@ fn c08_confirm(
     }
     use std::io::{IsTerminal, Read, Write};
     if !std::io::stdin().is_terminal() {
-        return Err("C08の確定にはTTY確認または--yesが必要です。".into());
+        return Err("C08 confirmation requires a TTY or --yes.".into());
     }
     if let Some(summary) = summary {
-        let summary =
-            serde_json::to_string(summary).map_err(|_| "確認内容を表示できません".to_string())?;
+        let summary = serde_json::to_string(summary)
+            .map_err(|_| "Cannot display confirmation details".to_string())?;
         println!("{summary}");
     }
-    print!("このC08操作を確定しますか [y/N]: ");
+    print!("Confirm this C08 operation? [y/N]: ");
     std::io::stdout()
         .flush()
-        .map_err(|_| "確認を表示できません".to_string())?;
+        .map_err(|_| "Cannot display confirmation".to_string())?;
     read_c08_confirmation(&mut std::io::stdin().lock().take(257))
 }
 #[cfg(any(unix, test))]
@@ -1113,14 +1128,14 @@ fn read_c08_confirmation(reader: &mut impl std::io::BufRead) -> Result<C08Confir
     let mut answer = String::new();
     let count = reader
         .read_line(&mut answer)
-        .map_err(|_| "確認を読めません".to_string())?;
+        .map_err(|_| "Cannot read confirmation".to_string())?;
     if count == 0 || answer.len() > 256 || !answer.ends_with('\n') {
-        return Err("確認入力が不完全です".into());
+        return Err("Incomplete confirmation input".into());
     }
     match answer.trim() {
         "y" | "Y" => Ok(C08Confirmation::Accepted),
         "" | "n" | "N" => Ok(C08Confirmation::Declined),
-        _ => Err("確認入力が不正です".into()),
+        _ => Err("Invalid confirmation input".into()),
     }
 }
 #[cfg(all(test, unix))]
@@ -1186,18 +1201,18 @@ mod c10_adapter_tests {
         ] {
             let error = c10_outcome(outcome).unwrap_err();
             assert!(error.contains(&operation_id.as_hex()));
-            assert!(error.contains("再送せず"));
+            assert!(error.contains("Do not resend"));
         }
         assert!(c10_outcome(SyncPushOutcomeV1::NoChanges).is_ok());
         assert!(
             c10_outcome(SyncPushOutcomeV1::Denied { operation_id })
                 .unwrap()
-                .contains("取り消し")
+                .contains("cancelled")
         );
         assert!(
             c10_outcome(SyncPushOutcomeV1::ReconciledAbandon { operation_id })
                 .unwrap()
-                .contains("未送信の証明ではありません")
+                .contains("does not prove that nothing was sent")
         );
     }
 
@@ -1216,7 +1231,7 @@ mod c10_adapter_tests {
                 .is_ok()
         );
         let error = c10_command(root.path(), Some("invalid".into()), None, false).unwrap_err();
-        assert_eq!(error, "C10 operation IDが不正です");
+        assert_eq!(error, "Invalid C10 operation ID");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 

@@ -99,7 +99,7 @@ fn host_source_cannot_rename_even_an_entity_created_in_the_same_delta() {
     validate_response(&snapshot, 1, &original, &response.to_string()).unwrap();
     let intent = supplemental(&mut snapshot, &[1]);
     let error = validate_response(&snapshot, 1, &intent, &response.to_string()).unwrap_err();
-    assert!(error.to_string().contains("同一性変更"));
+    assert!(error.to_string().contains("identity change"));
 }
 
 fn relation_fixture(user_input: bool) -> (ConversationSnapshot, StructuredIntent, Value, u64) {
@@ -145,7 +145,7 @@ fn host_source_cannot_establish_entity_relations_but_real_user_input_can() {
     assert_eq!(accepted.delta.relations.len(), 1);
     let (snapshot, intent, response, turn) = relation_fixture(false);
     let error = validate_response(&snapshot, turn, &intent, &response.to_string()).unwrap_err();
-    assert!(error.to_string().contains("entity関係"));
+    assert!(error.to_string().contains("Entity relation"));
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn host_source_saved_receipts_cannot_promote_actions_or_overwrite_existing_fact_
             saved(&snapshot, &intent, &old)
                 .unwrap_err()
                 .to_string()
-                .contains("利用者入力")
+                .contains("user input")
         );
     }
     let mut snapshot = snapshot;
@@ -201,7 +201,7 @@ fn host_source_saved_receipts_cannot_promote_actions_or_overwrite_existing_fact_
         saved(&snapshot, &intent, &old)
             .unwrap_err()
             .to_string()
-            .contains("利用者入力")
+            .contains("user input")
     );
 }
 
@@ -224,7 +224,7 @@ fn host_source_saved_aliases_and_dependencies_require_real_user_input() {
             saved(&snapshot, &intent, &old)
                 .unwrap_err()
                 .to_string()
-                .contains("利用者入力")
+                .contains("user input")
         );
     }
 }
@@ -244,7 +244,7 @@ fn host_source_saved_entity_relations_cannot_gain_authority_on_reopen() {
         saved(&snapshot, &intent, &old)
             .unwrap_err()
             .to_string()
-            .contains("利用者入力")
+            .contains("user input")
     );
     old.delta.relations.clear();
     rebind(&mut old, &snapshot, &intent);

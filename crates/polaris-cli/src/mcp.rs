@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// 対象プロジェクト。既定は現在のディレクトリ。
+    /// Target project; defaults to the current directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
     #[command(subcommand)]
@@ -21,51 +21,43 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// 登録済みのサーバーと認証情報の参照名を表示する。値は表示しない。
+    /// List registered servers and credential reference names; credential values are hidden.
     List,
-    /// このプロジェクトでサーバーを使えるようにする。
+    /// Enable a server for this project.
     Enable { server: String },
-    /// このプロジェクトでサーバーを使わないようにする。
+    /// Disable a server for this project.
     Disable { server: String },
-    /// 認証情報をパイプで受け取り、参照名で保存する。
+    /// Read credentials from a pipe and store them under a reference name.
     SecretSet { reference: String },
-    /// 保存した認証情報を削除する。
+    /// Delete stored credentials.
     SecretDelete { reference: String },
-    /// サーバーへ接続してカタログを確認し、索引を更新する。モデルは使わない。
+    /// Connect to the server, verify its catalog, and update the index without using a model.
     Check { server: String },
-    /// CodexとClaudeの設定からサーバーを検出し、確認したものを登録する。
+    /// Discover servers in Codex and Claude configuration and register confirmed entries.
     Setup {
-        /// 1件ずつ答える代わりに、全件を承認する。**確認を省くのではなく、
-        /// 確認をこの引数に置く。** 画面は従来どおり全部出るので、何を
-        /// 承認したかは記録に残る。ツール実行のたびの確認は別の境界で、
-        /// これでは変わらない。
+        /// Approve all entries instead of answering individually. This flag supplies confirmation; all details remain displayed. Per-tool-call confirmation is a separate boundary and is unchanged.
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// 起動のたびに取得する形式のサーバーを、1度だけ取得して固定する。
-    /// 取得後は普通のローカル実行物として登録できるようになる。
+    /// Download and pin a server package once instead of on every launch. It can then be registered as a local executable.
     Materialize {
-        /// 設定に書かれたサーバー名。
+        /// Server name in the detected configuration.
         server: String,
-        /// 実行に使うinterpreter。省略時は取得の形式から決める。
-        /// npm形式はnode、PyPI形式はuvが管理するPython。
+        /// Runtime interpreter. Defaults to node for npm packages or uv-managed Python for PyPI packages.
         #[arg(long)]
         runtime: Option<PathBuf>,
-        /// 確認を省く。**省くのではなく、確認をこの引数に置く。**
-        /// 第三者のコードを取得して実行する操作なので、端末で1件ずつ答える
-        /// か、これを書いて実行するかのどちらかが要る。まとめて取得する
-        /// script のためにある。
+        /// Explicitly confirm the displayed download without an interactive answer. Downloads involve third-party code; either interactive confirmation or this flag is required. Intended for batch scripts.
         #[arg(long)]
         yes: bool,
     },
-    /// 登録済みUnity MCPのruntimeを固定配置し、次回起動用の設定を更新する。
+    /// Deploy a pinned runtime for an existing Unity MCP registration and update its next-launch configuration.
     Configure {
         server: String,
         #[arg(long, value_parser = ["unity-local-v2"])]
         preset: String,
         #[arg(long)]
         source: PathBuf,
-        /// 表示する構成内容を承認する。接続確認やtool実行は行わない。
+        /// Approve the displayed configuration. Does not check connections or execute tools.
         #[arg(long)]
         yes: bool,
     },
@@ -78,7 +70,7 @@ struct BulkApprover;
 impl Approver for BulkApprover {
     fn ask(&mut self, reason: &str) -> Decision {
         eprintln!("Approval required: {reason}");
-        eprintln!("Allow this? [y/N] y  (--yes により承認)");
+        eprintln!("Allow this? [y/N] y  (approved by --yes)");
         Decision::Allow
     }
 }
@@ -86,34 +78,36 @@ impl Approver for BulkApprover {
 fn refused(reason: polaris_core::mcp::setup::launcher::Refused) -> &'static str {
     use polaris_core::mcp::setup::launcher::Refused;
     match reason {
-        Refused::NotALauncher => "その名前の、起動のたびに取得する形式の設定が見つかりません。",
-        Refused::ManagerNotSupported => "この取得方法にはまだ対応していません（npmのみ）。",
-        Refused::FetchFailed => {
-            "取得できませんでした。ネットワークとパッケージ名を確認してください。"
+        Refused::NotALauncher => {
+            "No configuration with that name downloads a package on every launch."
         }
+        Refused::ManagerNotSupported => "This retrieval method is not yet supported (npm only).",
+        Refused::FetchFailed => "Download failed. Check the network and package name.",
         Refused::NoEntryPoint => {
-            "取得しましたが、パッケージが起動するファイルを示していないか、置き場所の外を指しています。"
+            "Downloaded, but the package has no entry point or points outside its storage location."
         }
-        Refused::RuntimeNotPinned => "指定されたinterpreterが見つかりません。",
-        Refused::NotSaved => "固定した内容を保存できません。",
+        Refused::RuntimeNotPinned => "The specified interpreter was not found.",
+        Refused::NotSaved => "Cannot save the pinned content.",
     }
 }
 
 fn message(error: Error) -> &'static str {
     match error {
-        Error::RevisionConflict => "設定が同時に変更されました。もう一度実行してください。",
-        Error::InvalidRegistration | Error::Limit => "登録内容が不正か上限を超えています。",
-        Error::Auth => "認証情報が見つからないか、参照されています。",
-        Error::Protection => "安全に使えない場所やファイルが含まれています。",
-        Error::Transport | Error::Timeout | Error::Protocol => "サーバーに接続できません。",
-        Error::StopUnconfirmed => "サーバーの停止を確認できません。",
-        _ => "MCPの設定を読み書きできません。",
+        Error::RevisionConflict => "Configuration changed concurrently. Run the command again.",
+        Error::InvalidRegistration | Error::Limit => {
+            "Registration is invalid or exceeds the limit."
+        }
+        Error::Auth => "Credentials are missing or still referenced.",
+        Error::Protection => "Contains locations or files that cannot be used safely.",
+        Error::Transport | Error::Timeout | Error::Protocol => "Cannot connect to the server.",
+        Error::StopUnconfirmed => "Cannot verify that the server stopped.",
+        _ => "Cannot read or write MCP configuration.",
     }
 }
 
 pub async fn run(args: Args) -> ExitCode {
     if cfg!(windows) {
-        eprintln!("WindowsではMCPの保護された保存先を利用できません。変更していません。");
+        eprintln!("Protected MCP storage is unavailable on Windows. No changes were made.");
         return ExitCode::FAILURE;
     }
     let cwd = args
@@ -154,10 +148,10 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
                     .map(|index| index.verified(registry))
             });
             let Some(registry) = snapshot.registry else {
-                println!("登録済みのサーバーはありません。`polaris mcp setup`で検出できます。");
+                println!("No registered servers. Discover them with `polaris mcp setup`.");
                 return Ok(());
             };
-            println!("登録の版 {}", registry.revision);
+            println!("Registry revision {}", registry.revision);
             for server in &registry.servers {
                 let destination = match &server.transport {
                     Destination::StreamableHttp { url, .. } => url.clone(),
@@ -167,13 +161,13 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
                 let checked = indexed
                     .as_ref()
                     .and_then(|index| index.get(&server.server_id))
-                    .map_or("カタログ未確認".to_owned(), |entry| {
-                        format!("ツール{}件", entry.tools.len())
+                    .map_or("catalog unverified".to_owned(), |entry| {
+                        format!("{} tools", entry.tools.len())
                     });
                 println!(
                     "{}\t{}\t{}\t{}",
                     server.server_id,
-                    if enabled { "有効" } else { "無効" },
+                    if enabled { "enabled" } else { "disabled" },
                     checked,
                     destination
                 );
@@ -181,7 +175,7 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
             if let Some(secrets) = snapshot.secrets {
                 let names: Vec<_> = secrets.references().collect();
                 println!(
-                    "認証情報の参照名（版 {}）: {}",
+                    "Credential references (revision {}): {}",
                     secrets.revision(),
                     names.join(", ")
                 );
@@ -192,16 +186,19 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
         Command::Disable { server } => toggle(host, cwd, &server, false),
         Command::SecretSet { reference } => {
             if io::stdin().is_terminal() {
-                return Err("端末に入力すると値が表示されるため、パイプで渡してください。".into());
+                return Err(
+                    "Pipe the value into this command; typing in a terminal would expose it."
+                        .into(),
+                );
             }
             let mut value = String::new();
             io::stdin()
                 .lock()
                 .read_line(&mut value)
-                .map_err(|_| "認証情報を読み込めません。".to_owned())?;
+                .map_err(|_| "Cannot read credentials.".to_owned())?;
             let value = value.trim_end_matches(['\r', '\n']);
             if value.is_empty() {
-                return Err("認証情報が空です。".into());
+                return Err("Credentials are empty.".into());
             }
             let revision = store
                 .load_secrets()
@@ -210,7 +207,7 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
             store
                 .update_secret(revision, &reference, Some(SecretValue::new(value)))
                 .map_err(fail)?;
-            println!("{reference} を保存しました。次の実行から使えます。");
+            println!("Saved {reference}. Available from the next run.");
             Ok(())
         }
         Command::SecretDelete { reference } => {
@@ -221,7 +218,7 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
             store
                 .update_secret(revision, &reference, None)
                 .map_err(fail)?;
-            println!("{reference} を削除しました。");
+            println!("Deleted {reference}.");
             Ok(())
         }
         Command::Check { server } => {
@@ -235,7 +232,9 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
             yes,
         } => materialize(&server, runtime.as_deref(), yes),
         // Configuration must enter through the noncreating preflight above.
-        Command::Configure { .. } => Err("構成には専用の読み取り準備経路が必要です。".into()),
+        Command::Configure { .. } => {
+            Err("Configuration requires the dedicated read preparation path.".into())
+        }
     }
 }
 
@@ -247,7 +246,7 @@ fn configure(
     _source: &std::path::Path,
     _confirmed: bool,
 ) -> Result<(), String> {
-    Err("このプラットフォームではMCP構成に必要な保護を確認できません。".into())
+    Err("Cannot verify the protections required for MCP configuration on this platform.".into())
 }
 
 #[cfg(unix)]
@@ -265,10 +264,10 @@ fn configure(
 
     // Refuse before opening even a noncreating store when no answer is possible.
     if !confirmed && !io::stdin().is_terminal() {
-        return Err("構成の確認には対話端末が必要です。--yes でも承認できます。".into());
+        return Err("Configuration confirmation requires an interactive terminal or --yes.".into());
     }
     if preset != "unity-local-v2" {
-        return Err("対応する構成presetではありません。".into());
+        return Err("Unsupported configuration preset.".into());
     }
     let safe = |text: String| text.escape_debug().to_string();
     let host = LocalHost::open_existing(cwd).map_err(|error| message(error).to_owned())?;
@@ -280,7 +279,7 @@ fn configure(
         crate::TerminalApprover.ask(&card)
     };
     if !matches!(decision, Decision::Allow) {
-        return Err("構成を取り消しました。".into());
+        return Err("Configuration cancelled.".into());
     }
 
     // The preparation holds no registry lock across the approval question.
@@ -301,7 +300,7 @@ fn configure(
         .apply(&host, &effects, &lease, &project)
         .map_err(safe)?;
     println!(
-        "{} を構成しました（登録の版 {}）。次の実行から反映します。\n配置先: {}\n接続確認は `polaris mcp check {}` で行います。",
+        "Configured {} (registry revision {}). Effective from the next run.\nDestination: {}\nCheck the connection with `polaris mcp check {}`.",
         receipt.server_id.escape_debug(),
         receipt.registry_revision,
         receipt.cwd.display().to_string().escape_debug(),
@@ -315,7 +314,7 @@ fn configure_card(preview: &polaris_core::mcp::configure::UnityLocalV2Preview) -
     let text = |value: &str| value.escape_debug().to_string();
     let path = |value: &std::path::Path| text(&value.display().to_string());
     let mut lines = vec![
-        "Unity MCPの固定配置と登録更新".into(),
+        "Pin Unity MCP deployment and update its registration".into(),
         format!(
             "preset: unity-local-v2 / server: {}",
             text(&preview.server_id)
@@ -325,50 +324,52 @@ fn configure_card(preview: &polaris_core::mcp::configure::UnityLocalV2Preview) -
         format!("node: {}", path(&preview.node)),
         format!("node SHA256: {}", text(&preview.node_sha256)),
         format!("entry: {}", path(&preview.entry)),
-        format!("新entry: {}", path(&preview.new_cwd.join("build/index.js"))),
+        format!("New entry: {}", path(&preview.new_cwd.join("build/index.js"))),
         format!("entry SHA256: {}", text(&preview.entry_sha256)),
         format!("manifest SHA256: {}", text(&preview.manifest_sha256)),
         format!(
-            "選択: {} files / {} bytes",
+            "Selected: {} files / {} bytes",
             preview.selected_files, preview.selected_bytes
         ),
-        "対象: build/、node_modules/、package.json、存在するlockfile".into(),
-        format!("現在cwd: {}", path(&preview.old_cwd)),
-        format!("配置先・新cwd: {}", path(&preview.new_cwd)),
+        "Scope: build/, node_modules/, package.json, and existing lockfiles".into(),
+        format!("Current cwd: {}", path(&preview.old_cwd)),
+        format!("Destination and new cwd: {}", path(&preview.new_cwd)),
         format!(
             "protocol: {:?} / sandbox: {}",
             preview.protocol_profile,
             text(&preview.sandbox_profile)
         ),
         format!(
-            "登録の版: {} → {}",
+            "Registry revision: {} → {}",
             preview.registry_before_revision, preview.registry_after_revision
         ),
-        "登録差分: cwd・entry引数・script pin・protocol・sandbox".into(),
-        "server ID・project集合・capabilities・timeouts・秘密参照は保持します。".into(),
-        "限定hardlink pair（9,817,266 bytes・同一inode/nlink=2を別々のnlink=1へコピー）:".into(),
+        "Registry changes: cwd, entry arguments, script pin, protocol, sandbox".into(),
+        "Server ID, project set, capabilities, timeouts, and secret references are retained.".into(),
+        "Bounded hardlink pair (9,817,266 bytes; same inode/nlink=2 copied into separate nlink=1 files):".into(),
         format!("pair SHA256: {}", text(&preview.hardlink_pair_sha256)),
     ];
     for entry in &preview.hardlink_pair {
         lines.push(format!("  {}", path(entry)));
     }
-    lines.push("固定除外:".into());
+    lines.push("Fixed exclusions:".into());
     for entry in &preview.fixed_exclusions {
         lines.push(format!("  {}", path(entry)));
     }
-    lines.push("保持する秘密参照名（値は表示しません）:".into());
+    lines.push("Retained secret reference names (values are hidden):".into());
     if preview.secret_references.is_empty() {
-        lines.push("  なし".into());
+        lines.push("  none".into());
     } else {
         for reference in &preview.secret_references {
             lines.push(format!("  {}", text(reference)));
         }
     }
-    lines.push("通信範囲: このMac内のloopbackのみ。".into());
+    lines.push("Network scope: loopback on this Mac only.".into());
     lines.push(
-        "C28の配置完了後にC27の登録を更新します。旧runtimeと未参照のコピーは保持します。".into(),
+        "The C27 registry is updated after C28 deployment completes. The old runtime and unreferenced copies are retained.".into(),
     );
-    lines.push("準備・配置ではプログラムの起動、download、接続確認は行いません。".into());
+    lines.push(
+        "Preparation and deployment do not launch programs, download, or check connections.".into(),
+    );
     lines.join("\n")
 }
 
@@ -440,7 +441,7 @@ fn materialize(
     _runtime: Option<&std::path::Path>,
     _confirmed: bool,
 ) -> Result<(), String> {
-    Err("このプラットフォームではMCPの取得に必要な保護を確認できません。".into())
+    Err("Cannot verify the protections required for MCP downloads on this platform.".into())
 }
 
 #[cfg(unix)]
@@ -450,36 +451,36 @@ fn materialize(
     confirmed: bool,
 ) -> Result<(), String> {
     if !confirmed && !io::stdin().is_terminal() {
-        return Err("取得の確認には対話端末が必要です。--yes でも進められます。".into());
+        return Err("Download confirmation requires an interactive terminal or --yes.".into());
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or("HOMEを読めません")?;
+        .ok_or("Cannot read HOME")?;
     println!(
-        "{server} のパッケージを1度だけ取得して固定します。\n         取得: npm または PyPI（いずれも導入時のcodeは実行しません）\n         置き場所: ~/.polaris/mcp/servers/ のこのサーバー専用ディレクトリ\n         実行に使うinterpreter: {}\n         ネットワーク: 使います\n         この操作は登録ではありません。登録は取得後に別途確認します。",
+        "Download and pin the package for {server} once.\n         Source: npm or PyPI (installation code is never executed)\n         Storage: a dedicated server directory under ~/.polaris/mcp/servers/\n         Runtime interpreter: {}\n         Network: used\n         This does not register the server. Registration is confirmed separately after download.",
         match runtime {
             Some(held) => held.display().to_string(),
-            None => "取得の形式から決めます".to_owned(),
+            None => "Determined by the download format".to_owned(),
         }
     );
     if !confirmed {
-        print!("続けますか? [y/N] ");
+        print!("Continue? [y/N] ");
         use std::io::Write;
         let _ = io::stdout().flush();
         let mut answer = String::new();
         io::stdin()
             .lock()
             .read_line(&mut answer)
-            .map_err(|_| "応答を読めません".to_owned())?;
+            .map_err(|_| "Cannot read the response".to_owned())?;
         if !matches!(answer.trim(), "y" | "Y") {
-            return Err("取得しませんでした。".into());
+            return Err("Download cancelled.".into());
         }
     }
     let detector = polaris_core::mcp::setup::Detector::new(home, search_path());
     match detector.materialise(server, runtime) {
         Ok(pinned) => {
             println!(
-                "{} {} を固定しました。\n実行: {} {}\n次に `polaris mcp setup` で登録します。",
+                "Pinned {} {}.\nRun: {} {}\nNext, register with `polaris mcp setup`.",
                 pinned.package,
                 pinned.version,
                 pinned.runtime.display(),
@@ -509,7 +510,7 @@ async fn check(host: &LocalHost, server: &str) -> Result<String, String> {
     let (mut runtime, quarantined) = host
         .runtime("mcp-check", "check", ExternalCeiling::Denied)
         .map_err(fail)?
-        .ok_or("このプロジェクトで有効なサーバーがありません。")?;
+        .ok_or("No enabled servers for this project.")?;
     if let Some(reason) = quarantined.get(server) {
         return Err(message(*reason).to_owned());
     }
@@ -521,14 +522,14 @@ async fn check(host: &LocalHost, server: &str) -> Result<String, String> {
         // person who had already answered the approval with "cannot be
         // confirmed" and nowhere to look — the worst shape a failure can
         // take, because the permission was already spent.
-        other => format!("カタログを確認できません（{other}）。"),
+        other => format!("Cannot verify the catalog ({other})."),
     })?;
     let (tools, partial) = store.save_catalog_entry(server, entry).map_err(fail)?;
     stopped.map_err(fail)?;
     Ok(format!(
-        "{server}: ツール{tools}件{}",
+        "{server}: {tools} tools{}",
         if partial {
-            "（上限のため一部）"
+            " (partial due to limit)"
         } else {
             ""
         }
@@ -559,7 +560,7 @@ pub async fn check_unchecked(host: &LocalHost) {
         match check(host, &server.server_id).await {
             Ok(line) => eprintln!("{line}"),
             Err(text) => eprintln!(
-                "{}: {text} 次の実行でも未確認として扱います。",
+                "{}: {text} It will remain unverified for the next run.",
                 server.server_id
             ),
         }
@@ -591,8 +592,8 @@ fn toggle(
         let prepared = owner.prepare(server_id, enable)?;
         owner.apply(&prepared, true)?;
         println!(
-            "{server_id} をこのプロジェクトで{}にしました。次の実行から反映します。",
-            if enable { "有効" } else { "無効" }
+            "{server_id} is now {} for this project. Effective from the next run.",
+            if enable { "enabled" } else { "disabled" }
         );
         Ok(())
     }
@@ -603,12 +604,12 @@ fn toggle(
         let mut registry = store
             .load_registry()
             .map_err(fail)?
-            .ok_or("登録済みのサーバーはありません。")?;
+            .ok_or("No registered servers.")?;
         let server = registry
             .servers
             .iter_mut()
             .find(|server| server.server_id == server_id)
-            .ok_or("そのサーバーは登録されていません。")?;
+            .ok_or("That server is not registered.")?;
         if enable {
             server.enabled_projects.insert(host.project().to_owned());
             host.validate(server).map_err(fail)?;
@@ -619,8 +620,8 @@ fn toggle(
         registry.revision += 1;
         store.save_registry(expected, &registry).map_err(fail)?;
         println!(
-            "{server_id} をこのプロジェクトで{}にしました。次の実行から反映します。",
-            if enable { "有効" } else { "無効" }
+            "{server_id} is now {} for this project. Effective from the next run.",
+            if enable { "enabled" } else { "disabled" }
         );
         Ok(())
     }
@@ -633,38 +634,44 @@ fn failure(body: &str) -> &'static str {
         .ok()
         .and_then(|held| held.get("error")?.as_str().map(str::to_owned));
     match code.as_deref() {
-        Some("denied") => "確認で許可されませんでした。",
+        Some("denied") => "Confirmation was denied.",
         Some("credential_changed") => {
-            "設定の認証情報が読み取り時から変わっています。もう一度実行してください。"
+            "Configured credentials changed since they were read. Run the command again."
         }
-        Some("unsafe_location") => "実行物か作業場所が安全に使えない場所にあります。",
-        Some("registry_changed") => "登録内容が同時に変更されました。もう一度実行してください。",
+        Some("unsafe_location") => "The executable or working directory cannot be used safely.",
+        Some("registry_changed") => "The registry changed concurrently. Run the command again.",
         Some("invalid") => {
-            "登録内容が受け付けられません。作業場所か実行物の条件を満たしていません。"
+            "Registration refused. The working directory or executable does not meet requirements."
         }
-        Some("stale") => "検出した内容が古くなっています。もう一度実行してください。",
-        _ => "登録を保存できませんでした。",
+        Some("stale") => "Detected configuration is stale. Run the command again.",
+        _ => "Could not save the registration.",
     }
 }
 
 fn reason(code: &str) -> &'static str {
     match code {
-        "launcher_not_supported" => "起動のたびにパッケージを取得する形式のため取り込めません",
-        "environment_reference" => "環境変数の名前だけが書かれていて、値が見つかりません",
-        "credential_in_arguments" => "引数やURLに認証情報らしき値があります",
-        "unsupported_transport" => "対応していない接続方式です",
-        "unsupported_auth" => "対応していない認証方式です",
-        "command_not_found" => "コマンドが見つかりません",
-        "command_not_absolute" => {
-            "commandが相対パスです。何を起点にするかを決められないので、絶対パスで書いてください"
+        "launcher_not_supported" => {
+            "Cannot import a configuration that downloads packages on every launch"
         }
-        "command_missing" => "commandがないか、文字列ではありません",
-        "argument_not_text" => "argsに文字列でない値があります",
-        "url_missing" => "urlがないか、文字列ではありません",
-        "url_not_usable" => "urlの形式を扱えません",
-        "unsupported_install_location" => "導入場所が共有の場所やhome直下のため取り込めません",
-        "already_registered" => "同じ内容で登録済みです",
-        _ => "設定を読み取れません",
+        "environment_reference" => {
+            "An environment variable name is specified, but its value is missing"
+        }
+        "credential_in_arguments" => "Arguments or the URL appear to contain credentials",
+        "unsupported_transport" => "Unsupported transport",
+        "unsupported_auth" => "Unsupported authentication method",
+        "command_not_found" => "Command not found",
+        "command_not_absolute" => {
+            "The command is relative and has no defined base. Specify an absolute path"
+        }
+        "command_missing" => "The command is missing or is not a string",
+        "argument_not_text" => "args contains a non-string value",
+        "url_missing" => "The URL is missing or is not a string",
+        "url_not_usable" => "Unsupported URL format",
+        "unsupported_install_location" => {
+            "Cannot import from a shared location or directly under home"
+        }
+        "already_registered" => "An identical registration already exists",
+        _ => "Cannot read configuration",
     }
 }
 
@@ -672,7 +679,7 @@ fn reason(code: &str) -> &'static str {
 /// still shows its full card and needs a terminal answer.
 async fn setup(host: &LocalHost, confirmed: bool) -> Result<(), String> {
     if !confirmed && !io::stdin().is_terminal() {
-        return Err("登録の確認には対話端末が必要です。-y でも進められます。".into());
+        return Err("Registration confirmation requires an interactive terminal or -y.".into());
     }
     let tool = host.setup_tool(ExternalCeiling::Allowed);
     let mut gate = Gate::new(ApprovalPolicy::Always);
@@ -691,15 +698,15 @@ async fn setup(host: &LocalHost, confirmed: bool) -> Result<(), String> {
             approver,
         )
         .await
-        .map_err(|_| "設定を検出できません。".to_owned())?;
+        .map_err(|_| "Cannot detect configuration.".to_owned())?;
     let detected: serde_json::Value =
-        serde_json::from_str(&detected).map_err(|_| "設定を検出できません。".to_owned())?;
+        serde_json::from_str(&detected).map_err(|_| "Cannot detect configuration.".to_owned())?;
     let candidates = detected["candidates"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     if candidates.is_empty() {
-        println!("CodexとClaudeの設定にMCPサーバーは見つかりませんでした。");
+        println!("No MCP servers found in Codex or Claude configuration.");
     }
     for candidate in candidates {
         let name = candidate["name"].as_str().unwrap_or("-");
@@ -716,11 +723,11 @@ async fn setup(host: &LocalHost, confirmed: bool) -> Result<(), String> {
             )
             .await;
         match result {
-            Ok(_) => println!("{name}: 登録しました。次の実行から使えます。"),
+            Ok(_) => println!("{name}: registered. Available from the next run."),
             // Taking the person's approval and then refusing without saying
             // why leaves them with nothing to act on. The code is already in
             // hand; only the printing was missing.
-            Err(text) => println!("{name}: 登録しませんでした。{}", failure(&text)),
+            Err(text) => println!("{name}: not registered. {}", failure(&text)),
         }
     }
     Ok(())

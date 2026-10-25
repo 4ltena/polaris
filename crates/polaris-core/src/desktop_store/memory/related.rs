@@ -6,7 +6,7 @@ impl MemorySnapshot {
     pub(crate) fn related_query(&self) -> StoreResult<&str> {
         if self.conversation.state.history_mode != HistoryMode::Structured10 {
             return Err(StoreError::Corrupt(
-                "関連検索は構造化記憶でのみ利用できます",
+                "Related search requires structured memory",
             ));
         }
         self.conversation
@@ -19,7 +19,9 @@ impl MemorySnapshot {
                     && event.message.role == polaris_provider::Role::User
             })
             .map(|event| event.message.content.as_str())
-            .ok_or(StoreError::Corrupt("関連要約の受理入力不在"))
+            .ok_or(StoreError::Corrupt(
+                "No admitted input for related summarization",
+            ))
     }
 }
 
@@ -58,7 +60,9 @@ impl Writer {
                 MemoryRetrievalStatus::ExtractionIncomplete
                     | MemoryRetrievalStatus::EvidenceBudgetExceeded
             ) {
-                return Err(StoreError::Corrupt("構造化記憶の根拠を準備できません"));
+                return Err(StoreError::Corrupt(
+                    "Cannot prepare structured memory evidence",
+                ));
             }
             let candidates =
                 self.related_memory_candidates_from_receipts(expected, &db, owners, Some(parts))?;
@@ -177,7 +181,9 @@ impl Writer {
                 })
             })
         }) {
-            return Err(StoreError::Corrupt("関連要約の埋め込み資源不一致"));
+            return Err(StoreError::Corrupt(
+                "Related summary embedding resource mismatch",
+            ));
         }
         let result = match embeddings {
             Some(parts) => db.related_summary_chunks_checked(&view, query, parts, verify),

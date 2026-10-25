@@ -14,18 +14,18 @@ use polaris_core::{decisions, project};
 pub struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    /// 決めたことを1文で。`polaris decided "…"` と直接書ける。
+    /// Record a decision in one statement; also accepts `polaris decided "…"`.
     what: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// 決めたことを1文で追記する。
+    /// Append a decision as one statement.
     Add {
-        /// 1文。読点も引用符も改行も、そのまま保たれる。
+        /// Statement to append. Punctuation, quotes, and newlines are preserved.
         what: String,
     },
-    /// 追記済みの一覧を古い順に出す。
+    /// List recorded decisions, oldest first.
     List,
 }
 
@@ -36,9 +36,10 @@ pub fn run(args: Args) -> Result<(), String> {
             (Some(Command::Add { .. }), _) | (None, Some(_))
         )
     {
-        return Err("Windowsでは決定事項の追記は未対応です。変更していません。".into());
+        return Err("Appending decisions is unsupported on Windows. No changes were made.".into());
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("作業ディレクトリを読めません: {e}"))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("Cannot read the working directory: {e}"))?;
     let root = project::resolve_root(&cwd);
 
     match (args.command, args.what) {
@@ -52,7 +53,7 @@ pub fn run(args: Args) -> Result<(), String> {
 
 fn add(root: &std::path::Path, what: &str) -> Result<(), String> {
     let at = now();
-    decisions::append(root, &at, what).map_err(|e| format!("追記できません: {e}"))?;
+    decisions::append(root, &at, what).map_err(|e| format!("Cannot append: {e}"))?;
     println!("{at}  {what}");
     println!("{}", root.join(decisions::PATH).display());
     Ok(())
@@ -62,7 +63,7 @@ fn list(root: &std::path::Path) -> Result<(), String> {
     let entries = decisions::load(root);
     if entries.is_empty() {
         println!(
-            "まだ1件も無い。`polaris decided \"…\"` で追記する。\n{}",
+            "No decisions yet. Append with `polaris decided \"…\"`.\n{}",
             root.join(decisions::PATH).display()
         );
         return Ok(());
@@ -71,7 +72,7 @@ fn list(root: &std::path::Path) -> Result<(), String> {
         println!("{}  {}", entry.at, entry.what);
     }
     println!(
-        "\n{}件  {}",
+        "\n{} items  {}",
         entries.len(),
         root.join(decisions::PATH).display()
     );

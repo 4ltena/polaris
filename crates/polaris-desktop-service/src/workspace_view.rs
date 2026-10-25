@@ -55,16 +55,16 @@ impl WorkspaceViewReader {
     pub fn read(&self, selected_path: Option<&str>) -> WorkspaceView {
         polaris_auth::protection::with_protected_paths(|registry| {
             let Ok(root) = open_absolute_regular(&self.source) else {
-                return unavailable("フォルダを開けませんでした。");
+                return unavailable("Could not open the folder.");
             };
             let Ok(metadata) = root.metadata() else {
-                return unavailable("フォルダを確認できませんでした。");
+                return unavailable("Could not verify the folder.");
             };
             if !metadata.is_dir()
                 || metadata.dev() != self.expected.device
                 || metadata.ino() != self.expected.inode
             {
-                return unavailable("選択したフォルダが変更されました。");
+                return unavailable("The selected folder changed.");
             }
             let mut files = Vec::new();
             let mut count = 0;
@@ -80,13 +80,14 @@ impl WorkspaceViewReader {
             );
             let mut notices = Vec::new();
             if count >= 4096 || files.len() >= MAX_FILES {
-                notices.push("一覧の上限に達したため一部のファイルを省略しています。".into());
+                notices
+                    .push("Some files were omitted because the listing limit was reached.".into());
             }
             let git = git_view(&root, &self.source, registry, selected_path, &mut files);
             if fs::symlink_metadata(&self.source).map_or(true, |m| {
                 m.dev() != metadata.dev() || m.ino() != metadata.ino()
             }) {
-                return unavailable("読み取り中にフォルダが変更されました。");
+                return unavailable("The folder changed while reading.");
             }
             let view = WorkspaceView {
                 state: ViewState::Ready,
@@ -95,11 +96,11 @@ impl WorkspaceViewReader {
                 notices,
             };
             if serde_json::to_vec(&view).map_or(true, |body| body.len() > 512 * 1024) {
-                return unavailable("表示情報が上限を超えています。");
+                return unavailable("Display information exceeds the limit.");
             }
             view
         })
-        .unwrap_or_else(|_| unavailable("認証保護を確認できませんでした。"))
+        .unwrap_or_else(|_| unavailable("Could not verify authentication protection."))
     }
 
     pub fn read_attachment(path: &Path) -> AttachmentView {
@@ -108,7 +109,7 @@ impl WorkspaceViewReader {
         });
         match result {
             Ok(Ok(view)) => view,
-            _ => attachment_unavailable("添付ファイルを安全に読み取れませんでした。"),
+            _ => attachment_unavailable("Could not safely read the attachment."),
         }
     }
 }
@@ -149,7 +150,7 @@ fn read_attachment_locked(
             .any(|protected| path.starts_with(protected))
     {
         return Ok(attachment_unavailable(
-            "認証保護対象の添付は読み取りません。",
+            "Authentication-protected attachments will not be read.",
         ));
     }
     let file = open_absolute_regular(path).map_err(|_| ())?;
@@ -163,7 +164,7 @@ fn read_attachment_locked(
             .any(|protected| protected.dev == metadata.dev() && protected.ino == metadata.ino())
     {
         return Ok(attachment_unavailable(
-            "添付ファイルは表示条件を満たしません。",
+            "The attachment does not meet display requirements.",
         ));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
@@ -171,18 +172,18 @@ fn read_attachment_locked(
         .read_to_end(&mut bytes)
         .map_err(|_| ())?;
     if bytes.len() > MAX_ATTACHMENT_BYTES {
-        return Ok(attachment_unavailable("添付ファイルが大きすぎます。"));
+        return Ok(attachment_unavailable("The attachment is too large."));
     }
     let text = match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => text,
         Ok(_) => {
             return Ok(attachment_unavailable(
-                "バイナリ形式の添付は読み取りません。",
+                "Binary attachments will not be read.",
             ));
         }
         Err(_) => {
             return Ok(attachment_unavailable(
-                "バイナリ形式の添付は読み取りません。",
+                "Binary attachments will not be read.",
             ));
         }
     };
@@ -382,7 +383,7 @@ fn walk(
         let mut reason = None;
         if selected == Some(path) {
             if metadata.len() > MAX_BODY_BYTES as u64 {
-                reason = Some("本文が64KiBを超えています。".into());
+                reason = Some("The body exceeds 64 KiB.".into());
             } else {
                 let mut bytes = Vec::new();
                 if file
@@ -391,15 +392,15 @@ fn walk(
                     .is_err()
                     || bytes.len() > MAX_BODY_BYTES
                 {
-                    reason = Some("本文を安全に読み取れませんでした。".into());
+                    reason = Some("Could not safely read the body.".into());
                 } else if let Ok(text) = String::from_utf8(bytes) {
                     if text.contains('\0') {
-                        reason = Some("バイナリ形式です。".into());
+                        reason = Some("Binary format.".into());
                     } else {
                         body = text;
                     }
                 } else {
-                    reason = Some("UTF-8テキストではありません。".into());
+                    reason = Some("Not UTF-8 text.".into());
                 }
             }
         }
@@ -436,11 +437,11 @@ fn git_view(
     files: &mut [FileView],
 ) -> GitView {
     let Ok(git) = open_at(root, OsStr::new(".git"), libc::O_RDONLY | libc::O_DIRECTORY) else {
-        return git_unavailable("Git管理外、または外部gitdirです。");
+        return git_unavailable("Outside Git management or uses an external gitdir.");
     };
     // Reject metadata aliases before Git can follow them. Git objects are never sent to the model.
     if !safe_git_tree(&git, &source.join(".git"), registry, &mut 0, 0) {
-        return git_unavailable("Gitメタデータの安全性を確認できません。");
+        return git_unavailable("Cannot verify Git metadata safety.");
     }
     if let Ok(config) = open_at(
         &git,
@@ -460,7 +461,9 @@ fn git_view(
                         .contains(marker)
                 })
         {
-            return git_unavailable("外部設定を含むGit情報は表示できません。");
+            return git_unavailable(
+                "Cannot display Git information containing external configuration.",
+            );
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -472,7 +475,7 @@ fn git_view(
         "--untracked-files=normal",
         "--ignore-submodules=all",
     ]) else {
-        return git_unavailable("Git状態を取得できませんでした。");
+        return git_unavailable("Could not retrieve Git status.");
     };
     for record in status.split(|b| *b == 0).filter(|b| b.len() > 3) {
         if let Ok(path) = std::str::from_utf8(&record[3..])
@@ -485,14 +488,14 @@ fn git_view(
                 || &record[..2] == b"AA"
                 || &record[..2] == b"DD"
             {
-                file.unavailable_reason = Some("Gitの競合を解消してください。".into());
+                file.unavailable_reason = Some("Resolve Git conflicts.".into());
             }
         }
     }
     let head = run(&["rev-parse", "--verify", "--short=12", "HEAD"])
         .ok()
         .and_then(|s| String::from_utf8(s).ok())
-        .unwrap_or_else(|| "コミットなし".into());
+        .unwrap_or_else(|| "no commits".into());
     let branch = run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .and_then(|s| String::from_utf8(s).ok())
@@ -514,7 +517,7 @@ fn git_view(
         ])
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
-        .or_else(|| Some("差分を取得できませんでした。".into()));
+        .or_else(|| Some("Could not retrieve the diff.".into()));
         file.staged_diff = run(&[
             "diff",
             "--cached",
@@ -527,7 +530,7 @@ fn git_view(
         ])
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
-        .or_else(|| Some("差分を取得できませんでした。".into()));
+        .or_else(|| Some("Could not retrieve the diff.".into()));
         if let Ok(log) = run(&[
             "log",
             "--no-decorate",
@@ -562,10 +565,10 @@ fn git_view(
                     ])
                     .ok()
                     .and_then(|v| String::from_utf8(v).ok())
-                    .unwrap_or_else(|| "差分を取得できませんでした。".into());
+                    .unwrap_or_else(|| "Could not retrieve the diff.".into());
                     revisions.push(polaris_desktop_protocol::workspace_view::RevisionView {
                         id: parts[0].into(),
-                        parent: parts[1].split_whitespace().next().unwrap_or("なし").into(),
+                        parent: parts[1].split_whitespace().next().unwrap_or("none").into(),
                         title: parts[2].into(),
                         file_id: path.into(),
                         body,
@@ -581,7 +584,7 @@ fn git_view(
         branch: Some(branch.trim().into()),
         head: Some(head.trim().into()),
         change_summary: Some(format!(
-            "変更 {}件 · upstream未取得",
+            "{} changes · upstream not fetched",
             files.iter().filter(|f| f.modified || f.staged).count()
         )),
         revisions,

@@ -41,10 +41,10 @@ impl DecisionFallback {
     pub fn disclosure(&self, primary: &DecisionConfig) -> Vec<String> {
         let mut lines = vec![
             format!(
-                "typed fallback: routing / 最大{}試行 / 各{}ms / 合計{}ms",
+                "typed fallback: routing / at most {} attempts / {} ms each / {} ms total",
                 self.max_attempts, self.attempt_timeout_ms, self.total_timeout_ms
             ),
-            "typed fallback: 各接続先へstateと質問を送信します（依頼・会話やファイル由来の内容・候補の説明等を含む場合があります）"
+            "typed fallback: state and questions are sent to each endpoint (may include requests, conversation or file content, and candidate descriptions)"
                 .into(),
         ];
         for (index, target) in std::iter::once(primary).chain(&self.targets).enumerate() {

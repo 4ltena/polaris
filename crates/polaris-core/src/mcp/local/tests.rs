@@ -792,7 +792,10 @@ async fn register_stdio_fixture(
     assert_eq!(approver.reasons.len(), 1);
     assert_eq!(
         approver.reasons[0],
-        format!("MCPサーバの登録\n{}", proposal.description(detected_name))
+        format!(
+            "Register MCP server\n{}",
+            proposal.description(detected_name)
+        )
     );
     eprintln!(
         "stdio callback_count={} approval_reason={} decision=Allow result={result:?}",

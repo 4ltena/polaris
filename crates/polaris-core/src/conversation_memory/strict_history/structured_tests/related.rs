@@ -155,7 +155,7 @@ async fn r34_search_rejects_missing_input_backend_and_injected_arguments() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("受理入力")
+            .contains("admitted input")
     );
     assert_eq!(embedding.queries.load(Ordering::SeqCst), 0);
     let (_root, mut session, _, embedding) = session_fixture();
@@ -187,7 +187,7 @@ async fn r34_search_rejects_missing_input_backend_and_injected_arguments() {
             )
             .await
             .unwrap_err()
-            .contains("予約URI")
+            .contains("reserved URI")
         );
     }
     assert_eq!(embedding.queries.load(Ordering::SeqCst), 0);
@@ -561,7 +561,7 @@ async fn r34_run_records_query_budget_omission_without_displacing_evidence_and_r
         let evidence = requests[0]
             .messages
             .iter()
-            .find(|message| message.content.contains("記憶の取得分類"))
+            .find(|message| message.content.contains("Memory retrieval classification"))
             .unwrap();
         assert!(evidence.content.contains("production"));
         assert!(crate::budget::count_tokens(&evidence.content) <= 768);

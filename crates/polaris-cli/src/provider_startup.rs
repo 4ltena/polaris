@@ -70,9 +70,7 @@ pub(super) async fn prepare(
         match provider_name.as_str() {
             "openai" => {
                 if args.account.is_some() {
-                    eprintln!(
-                        "--accountはcodexのみで使えます。POLARIS_PROVIDER=codexを指定してください。"
-                    );
+                    eprintln!("--account is supported only by codex. Set POLARIS_PROVIDER=codex.");
                     return Err(ExitCode::FAILURE);
                 }
                 let base = std::env::var("POLARIS_BASE_URL")
@@ -236,14 +234,14 @@ pub(super) async fn prepare(
             "llamacpp" => {
                 let Some(llama) = config.llama_cpp.clone() else {
                     eprintln!(
-                        "POLARIS_PROVIDER=llamacpp には `[llama_cpp]` の server・models_dir・build が要ります。"
+                        "POLARIS_PROVIDER=llamacpp requires server, models_dir, and build in [llama_cpp]."
                     );
                     return Err(ExitCode::FAILURE);
                 };
                 let state = match polaris_core::project::state_dir(project_root) {
                     Ok(directory) => directory,
                     Err(error) => {
-                        eprintln!("状態ディレクトリを特定できません: {error}");
+                        eprintln!("Cannot locate the state directory: {error}");
                         return Err(ExitCode::FAILURE);
                     }
                 };
@@ -251,7 +249,7 @@ pub(super) async fn prepare(
                     let server =
                         polaris_core::llama_server::LlamaServer::start(&llama, &state).await?;
                     let adapter = polaris_core::llama_server::adapter(&server)
-                        .map_err(|_| std::io::Error::other("問い合わせ口を作成できません"))?;
+                        .map_err(|_| std::io::Error::other("Cannot create the endpoint"))?;
                     let inventory = adapter
                         .inventory_with_load_state()
                         .await
@@ -262,7 +260,7 @@ pub(super) async fn prepare(
                         .ok_or_else(|| {
                             let names: Vec<&str> = inventory.iter().map(|held| held.id()).collect();
                             std::io::Error::other(format!(
-                                "{model} が {} にありません。あるのは {names:?}",
+                                "{model} is not in {}. Available: {names:?}",
                                 llama.models_dir.display()
                             ))
                         })?;
@@ -282,7 +280,7 @@ pub(super) async fn prepare(
                 let (server, provider) = match started {
                     Ok(started) => started,
                     Err(error) => {
-                        eprintln!("llama-serverを起動できません: {error}");
+                        eprintln!("Cannot start llama-server: {error}");
                         return Err(ExitCode::FAILURE);
                     }
                 };

@@ -34,11 +34,11 @@ impl polaris_tui::account::BindingControl for Binding {
         let owner = owner()?;
         let (id, generation) = owner
             .bind(&[], Some(registration))
-            .map_err(|_| "その登録へ切り替えられません".to_owned())?;
+            .map_err(|_| "Cannot switch to that registration".to_owned())?;
         *self
             .current
             .write()
-            .map_err(|_| "束縛状態を更新できません")? =
+            .map_err(|_| "Cannot update the account binding")? =
             Some(BoundTokenSource::new(owner, id.clone(), generation));
         Ok(id)
     }
@@ -59,19 +59,19 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 登録の一覧。利用枠の観測はprocessごとのため、別processの取得結果は出ない。
+    /// List registrations. Usage observations belong to this process; observations from other processes are not shown.
     List,
-    /// 新しいアカウントを登録する。ブラウザを開く。
+    /// Register a new account using the browser.
     Login {
-        /// 一覧に出す表示名。
+        /// Display name in the account list.
         #[arg(long)]
         label: Option<String>,
     },
-    /// 既存の登録を同じアカウントで認証し直す。
+    /// Reauthenticate an existing registration with the same account.
     Reauth { registration_id: String },
-    /// 登録を解除する。実行中のrunは次の送信で止まる。
+    /// Unlink a registration. Active runs stop at their next send.
     Logout { registration_id: String },
-    /// 表示名を設定する。
+    /// Set the display name.
     Label {
         registration_id: String,
         label: String,
@@ -80,7 +80,7 @@ enum Command {
 
 pub async fn run(args: Args) -> ExitCode {
     if cfg!(windows) {
-        eprintln!("Windowsではアカウントの保護された保存先を利用できません。変更していません。");
+        eprintln!("Protected account storage is unavailable on Windows. No changes were made.");
         return ExitCode::FAILURE;
     }
     let result = match args.command {
@@ -113,9 +113,9 @@ fn trusted_home() -> Option<std::path::PathBuf> {
 
 fn owner() -> Result<Arc<AccountOwner>, String> {
     if trusted_home().is_none() {
-        return Err("HOMEを特定できないためアカウントを扱えません。".into());
+        return Err("Cannot manage accounts because HOME could not be determined.".into());
     }
-    AccountOwner::open(ISSUER).map_err(|error| format!("アカウントを開けません: {error}"))
+    AccountOwner::open(ISSUER).map_err(|error| format!("Cannot open accounts: {error}"))
 }
 
 /// 登録が1件でもあるときだけ所有者を返す。
@@ -124,7 +124,7 @@ fn registered_owner() -> Result<Option<Arc<AccountOwner>>, String> {
         return Ok(None);
     }
     AccountOwner::open_if_registered(ISSUER)
-        .map_err(|error| format!("アカウントを開けません: {error}"))
+        .map_err(|error| format!("Cannot open accounts: {error}"))
 }
 
 pub(super) enum StartupAccounts {
@@ -151,7 +151,7 @@ pub(super) fn startup() -> Result<StartupAccounts, String> {
     };
     let snapshot = owner
         .snapshot()
-        .map_err(|error| format!("一覧を取得できません: {error}"))?;
+        .map_err(|error| format!("Cannot retrieve the list: {error}"))?;
     let states: Vec<_> = snapshot
         .accounts
         .iter()
@@ -166,27 +166,27 @@ pub(super) fn startup() -> Result<StartupAccounts, String> {
 
 fn state_label(state: AccountState) -> &'static str {
     match state {
-        AccountState::Registering => "登録中",
-        AccountState::Ready => "利用可",
-        AccountState::RefreshPending => "更新中",
-        AccountState::ReauthRequired => "再認証が必要",
-        AccountState::Disconnected => "解除済み",
+        AccountState::Registering => "registering",
+        AccountState::Ready => "available",
+        AccountState::RefreshPending => "updating",
+        AccountState::ReauthRequired => "reauthentication required",
+        AccountState::Disconnected => "unlinked",
     }
 }
 
 fn list() -> Result<(), String> {
     let Some(owner) = registered_owner()? else {
-        println!("登録はありません。単一認証を使用しています。");
+        println!("No registrations. Using legacy single-account authentication.");
         return Ok(());
     };
     let snapshot = owner
         .snapshot()
-        .map_err(|error| format!("一覧を取得できません: {error}"))?;
+        .map_err(|error| format!("Cannot retrieve the list: {error}"))?;
     for account in snapshot.accounts {
         // 観測はこのprocessのメモリだけにあるため、起動直後は常に未取得になる。
         let usage = match owner.observation(&account.registration_id, "gpt-6-astra") {
-            None => "利用枠: 未取得".to_string(),
-            Some(observed) => format!("利用枠: {}", observed_label(&observed.state)),
+            None => "Usage limits: not retrieved".to_string(),
+            Some(observed) => format!("Usage limits: {}", observed_label(&observed.state)),
         };
         println!(
             "{}  {}  {}  {}",
@@ -202,31 +202,36 @@ fn list() -> Result<(), String> {
 fn observed_label(state: &polaris_auth::quota::ObservationState) -> &'static str {
     use polaris_auth::quota::ObservationState;
     match state {
-        ObservationState::Known(_) => "取得済み",
-        ObservationState::Missing => "未取得",
-        ObservationState::FetchFailed => "取得失敗",
-        ObservationState::MappingUnknown => "対応未検証",
-        ObservationState::Unsupported => "非対応",
+        ObservationState::Known(_) => "retrieved",
+        ObservationState::Missing => "not retrieved",
+        ObservationState::FetchFailed => "retrieval failed",
+        ObservationState::MappingUnknown => "support unverified",
+        ObservationState::Unsupported => "unsupported",
     }
 }
 
 /// 予約を取る前に対話端末かどうかを確かめる。非対話ではslotを消費しない。
 async fn login(label: Option<String>) -> Result<(), String> {
     if !std::io::stderr().is_terminal() {
-        return Err("非対話の端末では登録できません。端末から実行してください。".into());
+        return Err(
+            "Registration requires an interactive terminal. Run this command in a terminal.".into(),
+        );
     }
     let owner = owner()?;
     let token = owner
         .register(label, callback, std::future::pending::<()>())
         .await
-        .map_err(|error| format!("登録できません: {error}"))?;
-    println!("登録しました: {}", token.registration_id);
+        .map_err(|error| format!("Cannot register: {error}"))?;
+    println!("Registered: {}", token.registration_id);
     Ok(())
 }
 
 async fn reauth(registration_id: &str) -> Result<(), String> {
     if !std::io::stderr().is_terminal() {
-        return Err("非対話の端末では再認証できません。端末から実行してください。".into());
+        return Err(
+            "Reauthentication requires an interactive terminal. Run this command in a terminal."
+                .into(),
+        );
     }
     let owner = owner()?;
     let generation = generation_of(&owner, registration_id)?;
@@ -238,15 +243,15 @@ async fn reauth(registration_id: &str) -> Result<(), String> {
             std::future::pending::<()>(),
         )
         .await
-        .map_err(|error| format!("再認証できません: {error}"))?;
-    println!("再認証しました: {registration_id}");
+        .map_err(|error| format!("Cannot reauthenticate: {error}"))?;
+    println!("Reauthenticated: {registration_id}");
     Ok(())
 }
 
 /// 認可URLを開き、折り返しのcodeを1回だけ受け取る。
 async fn callback(url: String, state: String) -> Result<String, AuthError> {
     let listener = polaris_auth::login::bind_callback().await?;
-    eprintln!("ブラウザで認可してください: {url}");
+    eprintln!("Authorize in your browser: {url}");
     let _ = std::process::Command::new(if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -260,11 +265,11 @@ async fn callback(url: String, state: String) -> Result<String, AuthError> {
 fn generation_of(owner: &AccountOwner, registration_id: &str) -> Result<u64, String> {
     Ok(owner
         .snapshot()
-        .map_err(|error| format!("一覧を取得できません: {error}"))?
+        .map_err(|error| format!("Cannot retrieve the list: {error}"))?
         .accounts
         .into_iter()
         .find(|account| account.registration_id == registration_id)
-        .ok_or("その登録IDはありません。")?
+        .ok_or("Registration ID not found.")?
         .generation)
 }
 
@@ -273,8 +278,8 @@ fn logout(registration_id: &str) -> Result<(), String> {
     let generation = generation_of(&owner, registration_id)?;
     owner
         .logout(registration_id, generation)
-        .map_err(|error| format!("解除できません: {error}"))?;
-    println!("解除しました: {registration_id}");
+        .map_err(|error| format!("Cannot unlink: {error}"))?;
+    println!("Unlinked: {registration_id}");
     Ok(())
 }
 
@@ -283,8 +288,8 @@ fn set_label(registration_id: &str, label: &str) -> Result<(), String> {
     let generation = generation_of(&owner, registration_id)?;
     owner
         .set_label(registration_id, generation, Some(label.to_owned()))
-        .map_err(|error| format!("表示名を設定できません: {error}"))?;
-    println!("表示名を設定しました: {registration_id}");
+        .map_err(|error| format!("Cannot set the display name: {error}"))?;
+    println!("Display name set: {registration_id}");
     Ok(())
 }
 
@@ -292,10 +297,7 @@ fn set_label(registration_id: &str, label: &str) -> Result<(), String> {
 pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
     let Some(owner) = registered_owner()? else {
         if explicit.is_some() {
-            return Err(
-                "登録済みのアカウントがありません。`polaris account login`で登録してください。"
-                    .into(),
-            );
+            return Err("No registered accounts. Register with `polaris account login`.".into());
         }
         let _ = BOUND.set(Arc::new(Binding {
             current: std::sync::RwLock::new(None),
@@ -315,19 +317,19 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
                         .map(|account| format!("polaris account reauth {}", account.registration_id))
                         .collect();
                     if reauth.is_empty() {
-                        "使用できる登録がありません。`polaris account list`で状態を確認してください。".into()
+                        "No usable registrations. Check their status with `polaris account list`.".into()
                     } else {
-                        format!("再認証が必要です。次を端末から実行してください:\n{}", reauth.join("\n"))
+                        format!("Reauthentication required. Run this command in a terminal:\n{}", reauth.join("\n"))
                     }
                 }
-                Err(error) => format!("アカウントを確認できません: {error}"),
+                Err(error) => format!("Cannot inspect accounts: {error}"),
             }
         }
         AuthError::Denied(reason) if reason == "no_selectable_account" => {
-            "利用枠が確認できないため自動選択できません。`--account <登録ID>`で指定してください。"
+            "Cannot select automatically because usage limits are unknown. Specify `--account <registration-id>`."
                 .to_string()
         }
-        other => format!("アカウントを選べません: {other}"),
+        other => format!("Cannot select an account: {other}"),
     }
         })?;
     let _ = BOUND.set(Arc::new(Binding {
@@ -371,7 +373,7 @@ pub fn require(
 ) -> Result<Arc<dyn polaris_provider::TokenSource>, String> {
     let Some(binding) = BOUND.get() else {
         if registered_owner()?.is_some() {
-            return Err("アカウントを固定する前に送信経路を作れません。".into());
+            return Err("Cannot create a transport before binding an account.".into());
         }
         return Ok(Arc::new(crate::AuthTokens {
             issuer: ISSUER.to_string(),

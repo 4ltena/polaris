@@ -60,7 +60,7 @@ fn a_second_writer_on_the_same_project_is_refused_rather_than_opened() {
         assert!(matches!(second, Err(StoreError::Busy)), "{second:?}");
         assert_eq!(
             refusal(&StoreError::Busy),
-            "この project の設定は別の場所で実行中です。終わってから実行してください。"
+            "This project's setup is running elsewhere. Wait for it to finish."
         );
         drop(held);
         // Once the first one lets go, the project opens again.

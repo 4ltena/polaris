@@ -20,6 +20,54 @@ struct Fixture {
 }
 
 #[test]
+fn environment_borrows_parent_lease_without_broadening_runtime_permissions() {
+    let Fixture {
+        _root,
+        _owner: owner,
+        lease,
+        store,
+    } = Fixture::new();
+    drop(lease);
+    let activity = owner.try_activity().unwrap();
+    assert!(matches!(
+        owner.try_mutation(),
+        Err(crate::project_mutation::ProjectMutationError::Busy)
+    ));
+    let mut environment = request(store.project_scope_hash(), 1);
+    environment.inventory = ManagementInventoryIdV1::parse("C43").unwrap();
+    environment.scope.permission = ManagementPermissionScopeV1::Project;
+    environment.rewind = ManagementRewindDispositionV1::IrreversibleRemote;
+    assert!(matches!(
+        store.prepare_runtime(&activity, store.cursor().unwrap(), environment.clone()),
+        Err(ManagementEffectStoreError::InvalidInventoryContract)
+    ));
+    let PrepareManagementEffectOutcomeV1::Prepared(prepared) = store
+        .prepare_environment_runtime(&activity, store.cursor().unwrap(), environment.clone())
+        .unwrap()
+    else {
+        panic!("fresh environment effect");
+    };
+    let mut competing = environment;
+    competing.operation_id = request(store.project_scope_hash(), 2).operation_id;
+    assert!(matches!(
+        store.prepare_environment_runtime(&activity, store.cursor().unwrap(), competing),
+        Err(ManagementEffectStoreError::UnresolvedEffect)
+    ));
+    let started = store
+        .start_environment_runtime(&activity, &prepared)
+        .unwrap();
+    store
+        .complete_environment_runtime(&activity, &started, hash("verified environment receipt"))
+        .unwrap();
+    let mut unrelated = request(store.project_scope_hash(), 2);
+    unrelated.inventory = ManagementInventoryIdV1::parse("C12").unwrap();
+    assert!(matches!(
+        store.prepare_environment_runtime(&activity, store.cursor().unwrap(), unrelated),
+        Err(ManagementEffectStoreError::InvalidInventoryContract)
+    ));
+}
+
+#[test]
 fn m3e_runtime_activity_effects_preserve_project_and_inventory_boundaries() {
     let Fixture {
         _root,

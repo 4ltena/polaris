@@ -648,9 +648,9 @@ fn approved_proposals_save_bound_secrets_before_the_registry_and_replace_by_id()
         .clone()
         .unwrap();
     let description = proposal.description("docs");
-    assert!(description.contains("接続先: https://docs.example.com/mcp"));
+    assert!(description.contains("Endpoint: https://docs.example.com/mcp"));
     assert!(description.contains("mcp_servers.docs.http_headers.authorization"));
-    assert!(description.contains("ネットワーク: 使います"));
+    assert!(description.contains("Network: used"));
     assert!(!description.contains("synthetic-a"));
     let store = polaris_mcp::store::Store::open(&home).unwrap();
     let admission = Admission {
@@ -690,7 +690,7 @@ fn approved_proposals_save_bound_secrets_before_the_registry_and_replace_by_id()
         Err(polaris_mcp::Error::Auth)
     );
     let stale = current(&store)[0].proposal.clone().unwrap();
-    assert!(stale.replaces && stale.description("docs").contains("置き換え"));
+    assert!(stale.replaces && stale.description("docs").contains("Replacement"));
     assert_ne!(
         stale.secrets[0].reference, reference,
         "live references stay untouched"
@@ -714,7 +714,7 @@ fn approved_proposals_save_bound_secrets_before_the_registry_and_replace_by_id()
     assert!(
         renamed
             .description("docs")
-            .contains("使わない操作: ツールの実行")
+            .contains("Disabled operations: tool calls")
     );
     assert_eq!(detector.register(&renamed, &admission).unwrap(), 3);
     let secrets = store.load_secrets().unwrap().unwrap();
@@ -738,14 +738,14 @@ fn approval_text_escapes_source_names_and_names_every_saved_field() {
     assert!(
         !description
             .lines()
-            .any(|line| line == "認証: なし" || line.starts_with("認証: なし"))
+            .any(|line| line == "Authentication: none" || line.starts_with("Authentication: none"))
     );
     assert!(description.contains("x\\n認証: なし"));
     for field in [
-        "先頭に「Bearer 」を付けてauthorization ヘッダー",
-        "通信方式: discover_2026",
-        "待ち時間: 接続",
-        "対象プロジェクト: project",
+        "with a leading \"Bearer \" as authorization header",
+        "Transport: discover_2026",
+        "Timeouts: connection",
+        "Target project: project",
     ] {
         assert!(description.contains(field), "{field}");
     }
@@ -830,8 +830,8 @@ fn stdio_proposals_get_a_private_cwd_and_pass_startup_admission_before_saving() 
                 limits: limits(),
             };
             let description = proposal.description("local");
-            assert!(description.contains("読取りを許可する場所"));
-            assert!(description.contains("ネットワーク: 使いません"));
+            assert!(description.contains("Readable locations"));
+            assert!(description.contains("Network: not used"));
             match detector.register(&proposal, &admission) {
                 Ok(1) => {
                     let cwd_meta = fs::symlink_metadata(cwd).unwrap();
@@ -931,8 +931,8 @@ fn stdio_proposals_get_a_private_cwd_and_pass_startup_admission_before_saving() 
         limits: limits(),
     };
     let description = proposal.description("local");
-    assert!(description.contains("読取りを許可する場所"));
-    assert!(description.contains("ネットワーク: 使いません"));
+    assert!(description.contains("Readable locations"));
+    assert!(description.contains("Network: not used"));
     #[cfg(not(target_os = "linux"))]
     assert_eq!(detector.register(&proposal, &admission).unwrap(), 1);
     let Destination::Stdio { cwd, .. } = &proposal.server.transport else {
@@ -980,13 +980,13 @@ fn known_app_servers_are_proposed_with_their_profiles_shown_on_the_card() {
     };
     assert_eq!(sandbox_profile, "loopback");
     let card = resolve.description("resolve");
-    assert!(card.contains("アプリ: DaVinci Resolve"));
-    assert!(card.contains("ネットワーク: このMac内での接続と待受だけ使います"));
-    assert!(card.contains("通信方式: auto_2024_compat"));
+    assert!(card.contains("App: DaVinci Resolve"));
+    assert!(card.contains("Network: Uses only connections and listeners within this Mac"));
+    assert!(card.contains("Transport: auto_2024_compat"));
     let unreal = by_name(&found, "unreal").proposal.clone().unwrap();
     let card = unreal.description("unreal");
-    assert!(card.contains("アプリ: Unreal Engine"));
-    assert!(card.contains("localhostは信頼境界ではなく"));
+    assert!(card.contains("App: Unreal Engine"));
+    assert!(card.contains("localhost is not a trust boundary"));
 }
 
 #[test]
@@ -1014,7 +1014,7 @@ async fn local_setup_needs_the_external_permission_and_a_gate_answer() {
     }
     impl Approver for Answers {
         fn ask(&mut self, reason: &str) -> Decision {
-            assert!(reason.contains("接続先: https://docs.example.com/mcp"));
+            assert!(reason.contains("Endpoint: https://docs.example.com/mcp"));
             self.asked += 1;
             self.decision
         }

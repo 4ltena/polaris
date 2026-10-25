@@ -63,7 +63,7 @@ impl Request {
     }
 
     fn refuse(self) {
-        let unavailable = || io::Error::other("workflow checkpointの所有者は停止しています");
+        let unavailable = || io::Error::other("The workflow checkpoint owner is stopped");
         match self {
             Self::Checkpoint { reply, .. } | Self::Confirm { reply, .. } => {
                 let _ = reply.send(Err(unavailable()));
@@ -139,7 +139,7 @@ impl DesktopWorkflow {
                 reply,
             })
             .await
-            .map_err(|_| io::Error::other("workflow checkpointの所有者が終了しました"))?;
+            .map_err(|_| io::Error::other("The workflow checkpoint owner has ended"))?;
         if matches!(response.await, Ok(Ok(()))) {
             return Ok(());
         }
@@ -153,10 +153,12 @@ impl DesktopWorkflow {
                 reply,
             })
             .await
-            .map_err(|_| io::Error::other("workflow checkpointの保存応答を確認できません"))?;
+            .map_err(|_| {
+                io::Error::other("Cannot verify the saved workflow checkpoint response")
+            })?;
         confirmation
             .await
-            .map_err(|_| io::Error::other("workflow checkpointの保存状態が不明です"))?
+            .map_err(|_| io::Error::other("Workflow checkpoint storage state is unknown"))?
     }
 }
 
@@ -168,10 +170,10 @@ impl DesktopWorkflow {
         self.requests
             .send(Request::TakeInstructions { reply })
             .await
-            .map_err(|_| io::Error::other("追加指示の所有者へ要求を渡せません"))?;
+            .map_err(|_| io::Error::other("Cannot deliver the request to the instruction owner"))?;
         response
             .await
-            .map_err(|_| io::Error::other("追加指示の応答を確認できません"))?
+            .map_err(|_| io::Error::other("Cannot verify the instruction response"))?
     }
 
     /// The state window: what changed since the revision the caller holds.
@@ -180,10 +182,12 @@ impl DesktopWorkflow {
         self.requests
             .send(Request::Window { since, reply })
             .await
-            .map_err(|_| io::Error::other("状態窓口の所有者へ要求を渡せません"))?;
+            .map_err(|_| {
+                io::Error::other("Cannot deliver the request to the state endpoint owner")
+            })?;
         response
             .await
-            .map_err(|_| io::Error::other("状態窓口の応答を確認できません"))?
+            .map_err(|_| io::Error::other("Cannot verify the state endpoint response"))?
     }
 
     pub async fn publish_and_approve_routine_contract(
@@ -199,10 +203,10 @@ impl DesktopWorkflow {
                 reply,
             })
             .await
-            .map_err(|_| io::Error::other("workflow artifactの所有者が終了しました"))?;
+            .map_err(|_| io::Error::other("The workflow artifact owner has ended"))?;
         response
             .await
-            .map_err(|_| io::Error::other("workflow artifactの保存状態が不明です"))?
+            .map_err(|_| io::Error::other("Workflow artifact storage state is unknown"))?
     }
 
     pub async fn publish_convergence_trusted(
@@ -218,10 +222,10 @@ impl DesktopWorkflow {
                 reply,
             })
             .await
-            .map_err(|_| io::Error::other("convergenceの保存所有者が終了しました"))?;
+            .map_err(|_| io::Error::other("The convergence storage owner has ended"))?;
         response
             .await
-            .map_err(|_| io::Error::other("convergenceの保存状態が不明です"))?
+            .map_err(|_| io::Error::other("Convergence storage state is unknown"))?
     }
 
     pub async fn read_workflow_artifact(
@@ -237,10 +241,10 @@ impl DesktopWorkflow {
                 reply,
             })
             .await
-            .map_err(|_| io::Error::other("workflow artifactの所有者が終了しました"))?;
+            .map_err(|_| io::Error::other("The workflow artifact owner has ended"))?;
         response
             .await
-            .map_err(|_| io::Error::other("workflow artifactの読取り結果を確認できません"))?
+            .map_err(|_| io::Error::other("Cannot verify the workflow artifact read result"))?
     }
 }
 

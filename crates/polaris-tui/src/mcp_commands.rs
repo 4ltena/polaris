@@ -13,6 +13,7 @@ mod journal;
 #[cfg(test)]
 mod management_tests;
 mod operations;
+pub(crate) use operations::confirm_card as confirm_environment_card;
 mod secret;
 
 pub(crate) fn state_lines(
@@ -21,26 +22,38 @@ pub(crate) fn state_lines(
 ) -> Result<Vec<Line<'static>>, String> {
     let mut lines = vec![
         Line::from(format!(
-            "外部MCPホスト上限: {}",
-            if external_enabled { "許可" } else { "拒否" }
+            "External MCP host ceiling: {}",
+            if external_enabled {
+                "allowed"
+            } else {
+                "denied"
+            }
         )),
         Line::from(if external_enabled {
-            "外部MCPを拒否するには --mcp-external を付けずに再起動してください。"
+            "To deny external MCP, restart without --mcp-external."
         } else {
-            "外部MCPを許可するには --mcp-external を指定して再起動してください。"
+            "To allow external MCP, restart with --mcp-external."
         }),
-        Line::from("以下は登録・入場状態です。接続成功や実行中runtimeの変更を意味しません。"),
-        Line::from("/mcp setup: 検出して登録内容を確認 / /mcp check <server>: カタログを確認"),
-        Line::from("/mcp materialize <名前>: パッケージを取得して固定（登録は別途確認）"),
-        Line::from("/mcp secret set: 専用の秘密入力 / /mcp secret delete <参照名>: 認証情報を削除"),
+        Line::from(
+            "Registration and admission state follows. This does not establish connection success or changes to the active runtime.",
+        ),
+        Line::from(
+            "/mcp setup: discover and review registrations / /mcp check <server>: verify catalog",
+        ),
+        Line::from(
+            "/mcp materialize <name>: download and pin a package (registration confirmed separately)",
+        ),
+        Line::from(
+            "/mcp secret set: dedicated secret input / /mcp secret delete <reference>: delete credentials",
+        ),
     ];
     let states = host
         .state_report(ExternalCeiling::host_external(external_enabled))
-        .map_err(|_| "MCPの登録・入場状態を読めません")?;
+        .map_err(|_| "Cannot read MCP registration and admission state")?;
     let registry = match host.store() {
         Some(store) => store
             .load_registry()
-            .map_err(|_| "MCP registryを読めません")?,
+            .map_err(|_| "Cannot read the MCP registry")?,
         None => None,
     };
     if registry.as_ref().is_some_and(|registry| {
@@ -52,36 +65,39 @@ pub(crate) fn state_lines(
                 })
             })
     }) {
-        return Err("閲覧中にMCP registryが変更されました。再表示してください".into());
+        return Err("MCP registry changed while viewing. Redisplay it".into());
     }
     if let Some(registry) = &registry {
-        lines.push(Line::from(format!("登録revision {}", registry.revision)));
+        lines.push(Line::from(format!(
+            "Registry revision {}",
+            registry.revision
+        )));
     }
     if let Some(store) = host.store()
         && let Some(secrets) = store
             .load_secrets()
-            .map_err(|_| "MCP認証情報の参照名を読めません")?
+            .map_err(|_| "Cannot read MCP credential reference names")?
     {
         for reference in secrets.references() {
             lines.push(Line::from(format!(
-                "認証情報の参照名: {}",
+                "Credential reference: {}",
                 render::sanitize(reference)
             )));
         }
     }
     if states.is_empty() {
-        lines.push(Line::from("登録されたMCPサーバーはありません。"));
+        lines.push(Line::from("No registered MCP servers."));
         return Ok(lines);
     }
     lines.push(Line::from(format!(
-        "MCPサーバー {}件（最大32件）",
+        "{} MCP servers (maximum 32)",
         states.len()
     )));
     for state in states {
         let status = match (&state.quarantine, state.enabled_here) {
-            (Some(reason), _) => format!("使えません（{}）", render::sanitize(reason)),
-            (None, false) => "このプロジェクトでは無効".to_owned(),
-            (None, true) => "有効".to_owned(),
+            (Some(reason), _) => format!("unavailable ({})", render::sanitize(reason)),
+            (None, false) => "disabled for this project".to_owned(),
+            (None, true) => "enabled".to_owned(),
         };
         lines.push(Line::from(format!(
             "{} — {status}",
@@ -113,7 +129,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
     (external_enabled, approval_policy): (bool, ApprovalPolicy),
     has_pending: bool,
 ) -> Result<Vec<Line<'static>>, String> {
-    let host = LocalHost::open(cwd, false).map_err(|_| "MCP保存領域を開けません")?;
+    let host = LocalHost::open(cwd, false).map_err(|_| "Cannot open MCP storage")?;
     handle_host(
         request,
         terminal,
@@ -140,37 +156,37 @@ pub(crate) async fn handle_host<B: Backend, R: KeyReader>(
         return state_lines(host, external_enabled);
     }
     if request.len() > 2048 || request.chars().any(char::is_control) {
-        return Err("MCP操作は2048バイト以内の1行で指定してください".into());
+        return Err("Specify an MCP operation as one line within 2048 bytes".into());
     }
     let parts: Vec<_> = request.split_whitespace().collect();
     let command = parts[0];
     match command {
         "configure" | "delete" => {
             return Err(
-                "このMCP操作は提供していません。/mcp setup で検出した登録を管理してください。"
+                "This MCP operation is not provided. Manage detected registrations with /mcp setup."
                     .into(),
             );
         }
         "prompt" => {
             return Err(
-                "/mcp prompt <server>/<prompt> [key=value ...] は次の入力の選択欄で扱います。"
+                "/mcp prompt <server>/<prompt> [key=value ...] is handled by the next-input selection screen."
                     .into(),
             );
         }
         "enable" | "disable" | "secret" | "check" | "setup" | "register" | "materialize" => {}
         _ => {
             return Err(
-                "/mcp list|enable|disable|check <server>、setup、register [名前]、materialize <名前>、secret set|delete、prompt <server>/<prompt>".into(),
+                "/mcp list|enable|disable|check <server>, setup, register [name], materialize <name>, secret set|delete, prompt <server>/<prompt>".into(),
             );
         }
     }
     if has_pending {
-        return Err("送信待ちの入力があるためMCP登録を変更できません".into());
+        return Err("Cannot change MCP registrations while input is queued".into());
     }
     let lease = Arc::new(
         workspace
             .try_mutation()
-            .map_err(|_| "実行中の操作があるためMCP登録を変更できません")?,
+            .map_err(|_| "Cannot change MCP registrations while an operation is active")?,
     );
     polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
         workspace.project_root(),
@@ -185,7 +201,7 @@ pub(crate) async fn handle_host<B: Backend, R: KeyReader>(
         || host.project() != polaris_core::project::project_id(workspace.project_root())
         || lease.store_root() != effects.state_dir().join("rewind-workspace")
     {
-        return Err("MCP管理ownerのprojectが一致しません".into());
+        return Err("MCP management owner project mismatch".into());
     }
     let journal = journal::Journal {
         effects,
@@ -204,7 +220,7 @@ pub(crate) async fn handle_host<B: Backend, R: KeyReader>(
         }
         ["materialize", rest @ ..] => return operations::materialize(rest, terminal, reader, host, (external_enabled, approval_policy), (&journal, &lease)).await,
         ["enable" | "disable", _] => {}
-        _ => return Err("MCP操作の引数が不正です。/mcp setup、check <server>、enable|disable <server>、secret set|delete を指定してください".into()),
+        _ => return Err("Invalid MCP operation arguments. Specify /mcp setup, check <server>, enable|disable <server>, or secret set|delete".into()),
     }
     let server_id = parts[1];
     let owner = McpRegistryChangeOwnerV1::new(host, effects, &lease, workspace.project_root())?;
@@ -213,28 +229,32 @@ pub(crate) async fn handle_host<B: Backend, R: KeyReader>(
         terminal,
         reader,
         if prepared.enabled() {
-            "MCPをこのプロジェクトで有効化"
+            "Enable MCP for this project"
         } else {
-            "MCPをこのプロジェクトで無効化"
+            "Disable MCP for this project"
         },
         prepared.server_id(),
         &format!(
-            "registry revision {}。次の実行から反映します。実行中runtime・起動時の外部MCP上限は変更しません。巻き戻しでは取り消せません。",
+            "registry revision {}. Effective from the next run. The active runtime and startup external MCP ceiling are unchanged. Rewind cannot undo this.",
             prepared.before_revision()
         ),
     );
     match owner.apply(&prepared, accepted)? {
         Some(revision) => Ok(vec![Line::from(format!(
-            "{} をこのプロジェクトで{}にしました（revision {revision}）。次の実行から反映します。外部MCP上限: {}。",
+            "{} is now {} for this project (revision {revision}). Effective from the next run. External MCP ceiling: {}.",
             render::sanitize(prepared.server_id()),
             if prepared.enabled() {
-                "有効"
+                "enabled"
             } else {
-                "無効"
+                "disabled"
             },
-            if external_enabled { "許可" } else { "拒否" },
+            if external_enabled {
+                "allowed"
+            } else {
+                "denied"
+            },
         ))]),
-        None => Ok(vec![Line::from("MCP登録の変更を取り消しました。")]),
+        None => Ok(vec![Line::from("MCP registration change cancelled.")]),
     }
 }
 
@@ -327,7 +347,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(output[0].to_string().contains("次の実行"));
+        assert!(output[0].to_string().contains("next run"));
         assert!(
             host.store()
                 .unwrap()
@@ -442,16 +462,16 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("外部MCPホスト上限: 拒否"));
+        assert!(text.contains("External MCP host ceiling: denied"));
         assert!(text.contains("--mcp-external"));
-        assert!(text.contains("fixture") && text.contains("最大32件"));
+        assert!(text.contains("fixture") && text.contains("maximum 32"));
         let allowed = state_lines(&host, true)
             .unwrap()
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(allowed.contains("外部MCPホスト上限: 許可"));
+        assert!(allowed.contains("External MCP host ceiling: allowed"));
         assert!(effects.blocker().unwrap().is_none());
         std::fs::write(home.join(".polaris/mcp/servers.json"), b"not-json").unwrap();
         assert!(state_lines(&host, false).is_err());

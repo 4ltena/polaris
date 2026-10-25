@@ -193,7 +193,7 @@ fn the_section_is_cut_between_entries_and_never_shows_more_than_the_cap() {
 async fn the_question_asks_whether_it_is_the_same_one_not_whether_it_is_useful() {
     let entries = vec![entry("2026-09-19", "判定器は既定offのまま")];
     let judge = Picks {
-        wanted: "同じ問いか",
+        wanted: "same as this past decision",
         asked: Mutex::new(Vec::new()),
     };
     let matched = route(&judge, &entries, "判定器の既定を変えるか")
@@ -202,7 +202,7 @@ async fn the_question_asks_whether_it_is_the_same_one_not_whether_it_is_useful()
     assert_eq!(matched.len(), 1);
     let asked = judge.asked.lock().unwrap();
     assert!(
-        !asked[0].contains("役に立つか"),
+        !asked[0].contains("helpful"),
         "the calibrated wording must not leak in here: {}",
         asked[0]
     );

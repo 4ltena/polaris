@@ -71,12 +71,12 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
     ) -> Result<Self, String> {
         let root = project_root
             .canonicalize()
-            .map_err(|_| "MCP projectを確認できません")?;
+            .map_err(|_| "Cannot verify the MCP project")?;
         if host.project() != crate::project::project_id(&root)
             || effects.project_scope_hash()
                 != ManagementEffectHashV1::digest(root.as_os_str().as_encoded_bytes())
         {
-            return Err("MCP hostと管理ownerのprojectが一致しません".into());
+            return Err("MCP host and management owner project mismatch".into());
         }
         Ok(Self {
             host,
@@ -89,12 +89,12 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
         &self,
         preparation: UnityLocalV2Preparation,
     ) -> Result<UnityLocalV2Receipt, String> {
-        let store = self.host.store().ok_or("MCP storeが存在しません")?;
+        let store = self.host.store().ok_or("MCP store does not exist")?;
         self.require_registry(preparation.before())?;
         preparation.revalidate()?;
 
         let c28_id = ManagementOperationIdV1::from_str(preparation.destination().operation_id())
-            .map_err(|_| "runtime配置IDを確認できません")?;
+            .map_err(|_| "Cannot verify the runtime deployment ID")?;
         let c28_request = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&(
                 "mcp-local-source-runtime-v1",
@@ -107,28 +107,28 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
                 &preparation.preview().entry_sha256,
                 preparation.before().revision,
             ))
-            .map_err(|_| "runtime配置内容を確認できません")?,
+            .map_err(|_| "Cannot verify runtime deployment content")?,
         );
         if local_source_fault("c28_before_prepare") {
-            return Err("C28 prepare前の試験faultです".into());
+            return Err("Test fault before C28 prepare".into());
         }
         let c28 = self.prepare_effect("C28", c28_id, preparation.before().revision, c28_request)?;
         if local_source_fault("c28_after_prepare") {
-            return Err("C28 prepare後の試験faultです".into());
+            return Err("Test fault after C28 prepare".into());
         }
         let c28_started = self
             .effects
             .start(self.lease, &c28)
             .map_err(|e| e.to_string())?;
         if local_source_fault("c28_after_start") {
-            return Err(self.unknown(&c28_started, "C28 start後の試験faultです".into()));
+            return Err(self.unknown(&c28_started, "Test fault after C28 start".into()));
         }
         let published = match preparation.publish_runtime(store) {
             Ok(value) => value,
             Err(error) => return Err(self.unknown(&c28_started, error)),
         };
         if local_source_fault("c28_after_publish") {
-            return Err(self.unknown(&c28_started, "C28 publish後の試験faultです".into()));
+            return Err(self.unknown(&c28_started, "Test fault after C28 publish".into()));
         }
         let c28_receipt = ManagementEffectHashV1::digest(
             format!(
@@ -150,10 +150,10 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
                 &c28_started,
                 ManagementUnknownReasonV1::ReceiptPersistenceFailed,
             );
-            return Err("Unity runtimeは配置済みですがC28 receiptが不明です".into());
+            return Err("Unity runtime is deployed, but the C28 receipt is unknown".into());
         }
         if local_source_fault("c28_after_complete") {
-            return Err("C28 complete後の試験faultです".into());
+            return Err("Test fault after C28 complete".into());
         }
 
         // C27 cannot begin before the completed C28 receipt. Its request binds
@@ -164,10 +164,10 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
             .servers
             .iter()
             .find(|server| server.server_id == preparation.preview().server_id)
-            .ok_or("更新対象のUnity MCPがありません")?;
+            .ok_or("No Unity MCP registration to update")?;
         let destination = target
             .destination_hash()
-            .map_err(|_| "更新後のUnity destinationが無効です")?;
+            .map_err(|_| "Invalid updated Unity destination")?;
         let c27_request = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&(
                 "mcp-local-source-registry-v1",
@@ -179,10 +179,10 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
                 published.path(),
                 published.receipt(),
             ))
-            .map_err(|_| "registry変更内容を確認できません")?,
+            .map_err(|_| "Cannot verify registry changes")?,
         );
         if local_source_fault("c27_before_prepare") {
-            return Err("C27 prepare前の試験faultです".into());
+            return Err("Test fault before C27 prepare".into());
         }
         let c27 = self.prepare_effect(
             "C27",
@@ -191,29 +191,29 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
             c27_request,
         )?;
         if local_source_fault("c27_after_prepare") {
-            return Err("C27 prepare後の試験faultです".into());
+            return Err("Test fault after C27 prepare".into());
         }
         let c27_started = self
             .effects
             .start(self.lease, &c27)
             .map_err(|e| e.to_string())?;
         if local_source_fault("c27_after_start") {
-            return Err(self.unknown(&c27_started, "C27 start後の試験faultです".into()));
+            return Err(self.unknown(&c27_started, "Test fault after C27 start".into()));
         }
         let live_recheck = (|| -> Result<(), String> {
             preparation.revalidate()?;
             self.require_registry(preparation.before())?;
             published.revalidate()?;
             if published.path() != preparation.destination().destination() {
-                return Err("配置済みUnity runtimeのidentityが一致しません".into());
+                return Err("Deployed Unity runtime identity mismatch".into());
             }
             self.host
                 .validate(target)
-                .map_err(|_| "配置済みUnity runtimeがhost入場検査に失敗しました".to_owned())?;
+                .map_err(|_| "Deployed Unity runtime failed host admission checks".to_owned())?;
             preparation
                 .next()
                 .validate()
-                .map_err(|_| "更新後のMCP registryが無効です".to_owned())
+                .map_err(|_| "Invalid updated MCP registry".to_owned())
         })();
         if let Err(error) = live_recheck {
             return Err(self.unknown(&c27_started, error));
@@ -228,19 +228,19 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
                 // without inventing a successful completion receipt.
                 return Err(self.unknown(
                     &c27_started,
-                    "registry CASは競合し、この操作によるregistry変更はありません。配置済みUnity runtimeは未参照で保持します"
+                    "Registry CAS conflicted; this operation made no registry change. The deployed Unity runtime is retained unreferenced"
                         .into(),
                 ));
             }
             Err(_) => {
                 return Err(self.unknown(
                     &c27_started,
-                    "Unity runtimeは保持しましたがregistry CASの結果が不明です".into(),
+                    "Unity runtime retained, but the registry CAS outcome is unknown".into(),
                 ));
             }
         }
         if local_source_fault("c27_after_save") {
-            return Err(self.unknown(&c27_started, "C27 save後の試験faultです".into()));
+            return Err(self.unknown(&c27_started, "Test fault after C27 save".into()));
         }
         if !store
             .load_registry()
@@ -248,7 +248,7 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
         {
             return Err(self.unknown(
                 &c27_started,
-                "Unity runtimeは保持しましたがregistry CASの結果が不明です".into(),
+                "Unity runtime retained, but the registry CAS outcome is unknown".into(),
             ));
         }
         let receipt = ManagementEffectHashV1::digest(
@@ -271,10 +271,10 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
                 &c27_started,
                 ManagementUnknownReasonV1::ReceiptPersistenceFailed,
             );
-            return Err("MCP registryは保存済みですがC27 receiptが不明です".into());
+            return Err("MCP registry saved, but the C27 receipt is unknown".into());
         }
         if local_source_fault("c27_after_complete") {
-            return Err("C27 complete後の試験faultです".into());
+            return Err("Test fault after C27 complete".into());
         }
         Ok(UnityLocalV2Receipt {
             server_id: preparation.preview().server_id.clone(),
@@ -285,14 +285,14 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
     }
 
     fn require_registry(&self, expected: &Registry) -> Result<(), String> {
-        let store = self.host.store().ok_or("MCP storeが存在しません")?;
+        let store = self.host.store().ok_or("MCP store does not exist")?;
         if store
             .load_snapshot_noncreating()
             .is_ok_and(|snapshot| snapshot.registry.as_ref() == Some(expected))
         {
             Ok(())
         } else {
-            Err("確認中にMCP registryまたはsecret参照が変更されました".into())
+            Err("MCP registry or secret references changed during confirmation".into())
         }
     }
 
@@ -306,7 +306,7 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
         let request = PrepareManagementEffectV1 {
             operation_id,
             inventory: ManagementInventoryIdV1::parse(inventory)
-                .map_err(|_| "MCP inventoryが無効です")?,
+                .map_err(|_| "Invalid MCP inventory")?,
             scope: ManagementEffectScopeV1 {
                 project: self.effects.project_scope_hash(),
                 session: None,
@@ -329,7 +329,7 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
         {
             PrepareManagementEffectOutcomeV1::Prepared(effect) => Ok(effect),
             PrepareManagementEffectOutcomeV1::Existing(_) => {
-                Err("MCP管理操作が既に存在します".into())
+                Err("MCP management operation already exists".into())
             }
         }
     }
@@ -340,6 +340,6 @@ impl<'a> McpLocalSourceChangeOwnerV1<'a> {
             started,
             ManagementUnknownReasonV1::UnclassifiedEffect,
         );
-        format!("{message}。再実行せず管理状態を照合してください")
+        format!("{message}. Do not rerun; reconcile management state")
     }
 }

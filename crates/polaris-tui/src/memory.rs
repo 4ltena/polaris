@@ -192,7 +192,7 @@ pub fn configure_saved_memory(
     if !compatible {
         session.before_compact = Some(Arc::new(|_| {
             Err(io::Error::other(
-                "元プロジェクトが異なるか不明なため、このセッションは記憶へ保存できません",
+                "Cannot save this session to memory because the source project differs or is unknown",
             ))
         }));
         return Ok(());

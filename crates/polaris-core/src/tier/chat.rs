@@ -27,10 +27,7 @@ fn system() -> String {
         .collect::<Vec<_>>()
         .join(" / ");
     format!(
-        "委譲する作業の重さを決める。番号の付いた依頼ごとに、{names} のいずれか1語だけを1行で返す。\n\
-         low は一つの明確な手順で終わる作業、medium は複数の手順を組み立てるが方針は依頼から読み取れる作業、\n\
-         ultra は方針そのものを決める必要がある作業を指す。\n\
-         行数は依頼の数と一致させる。説明、番号、記号、前置きは書かない。"
+        "Determine the weight of delegated work. For each numbered request, return exactly one word from {names} on its own line.\nlow means a task completed by one clear step; medium requires several steps with a direction evident from the request; ultra requires choosing the direction itself.\nReturn exactly one line per request. Do not include explanations, numbers, symbols, or introductory text."
     )
 }
 
@@ -50,7 +47,7 @@ impl TierDecider for ChatTierDecider {
             .iter()
             .enumerate()
             .map(|(index, (agent, task))| {
-                format!("{}. 型: {} / 依頼: {task}", index + 1, agent.name)
+                format!("{}. Type: {} / request: {task}", index + 1, agent.name)
             })
             .collect::<Vec<_>>()
             .join("\n");

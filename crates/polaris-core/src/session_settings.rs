@@ -60,15 +60,15 @@ impl SavedToolEmbeddingV1 {
             || self.model.trim().is_empty()
             || self.model.len() > 1024
         {
-            return Err(invalid("埋め込みURLとモデルの組が不正です"));
+            return Err(invalid("Invalid embedding URL and model pair"));
         }
         let (scheme, rest) = self
             .url
             .split_once("://")
-            .ok_or_else(|| invalid("埋め込みURLが不正です"))?;
+            .ok_or_else(|| invalid("Invalid embedding URL"))?;
         let authority = rest.split('/').next().unwrap_or_default();
         polaris_provider::local::Endpoint::parse(&format!("{scheme}://{authority}"))
-            .map_err(|_| invalid("埋め込みには認証情報のないループバックURLが必要です"))?;
+            .map_err(|_| invalid("Embeddings require a loopback URL without credentials"))?;
         Ok(())
     }
 }
@@ -121,7 +121,7 @@ impl SavedSessionSettingsV1 {
                 .compact_threshold
                 .is_some_and(|threshold| threshold < 1000)
         {
-            return Err(invalid("セッション設定が不正です"));
+            return Err(invalid("Invalid session settings"));
         }
         if let Some(embedding) = &self.tool_memory_embedding {
             embedding.validate()?;
@@ -140,7 +140,7 @@ impl SavedSessionSettingsV1 {
             })
         {
             return Err(invalid(
-                "role bindingは32件以内のrole名とdwarf|subgiant|giant|supergiantで指定してください",
+                "Specify at most 32 role bindings using role names and dwarf|subgiant|giant|supergiant",
             ));
         }
         Ok(())
@@ -165,7 +165,7 @@ impl SavedSessionDraftV1 {
 
     pub fn validate(&self) -> io::Result<()> {
         if self.text.len() > MAX_DRAFT_BYTES || (self.revision == 0 && !self.text.is_empty()) {
-            return Err(invalid("下書きの保存範囲が不正です"));
+            return Err(invalid("Invalid draft storage range"));
         }
         Ok(())
     }
@@ -242,7 +242,7 @@ pub(crate) fn validate_empty_history(snapshot: &ConversationSnapshot) -> io::Res
         || !state.ancestors.is_empty()
         || !state.admission_receipts.is_empty()
     {
-        return Err(invalid("履歴モードの変更は新しい空の会話で行ってください"));
+        return Err(invalid("Change history mode in a new, empty conversation"));
     }
     Ok(())
 }
@@ -265,14 +265,14 @@ fn invalid(message: &str) -> io::Error {
 fn advance(revision: u64) -> io::Result<u64> {
     revision
         .checked_add(1)
-        .ok_or_else(|| invalid("保存revisionが上限です"))
+        .ok_or_else(|| invalid("Saved revision limit reached"))
 }
 
 fn cas(expected: u64, actual: u64) -> io::Result<()> {
     if expected != actual {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            "保存revisionが変わりました",
+            "Saved revision changed",
         ));
     }
     Ok(())
@@ -287,7 +287,7 @@ fn change_goal(
     let goal = match operation {
         GoalOperationV1::Set { text } => {
             if text.trim().is_empty() {
-                return Err(invalid("goalは空にできません"));
+                return Err(invalid("The goal cannot be empty"));
             }
             SavedGoal {
                 text,
@@ -298,7 +298,7 @@ fn change_goal(
             }
         }
         operation => {
-            let previous = previous.ok_or_else(|| invalid("保存されたgoalがありません"))?;
+            let previous = previous.ok_or_else(|| invalid("No saved goal"))?;
             SavedGoal {
                 revision: DecimalU64::new(advance(expected)?),
                 active: !matches!(operation, GoalOperationV1::Clear) && previous.active,

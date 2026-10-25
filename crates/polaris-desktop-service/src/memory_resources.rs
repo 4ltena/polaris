@@ -30,41 +30,43 @@ const MAX_MODEL_FILES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ResourceError {
     #[error(
-        "structured10はデスクトップ版では選択・表示が未接続のため使用できません。CLI・TUIでは明示的に指定できます"
+        "structured10 is unavailable in the desktop app because selection and display are not connected. It can be selected explicitly in CLI and TUI"
     )]
     StructuredUnavailable,
     #[error(
-        "strict10はCodexまたはOpenAI接続で使用してください。ローカル主接続には対応していません"
+        "Use strict10 with a Codex or OpenAI connection. A local primary connection is unsupported"
     )]
     Provider,
     #[error(
-        "strict10には自動導入済み資源、またはOSユーザーの ~/.polaris/config.toml に [embedding] runtime・model_path・revision が必要です"
+        "strict10 requires automatically installed resources, or [embedding] runtime, model_path, and revision in the OS user's ~/.polaris/config.toml"
     )]
     Configuration,
     #[error(
-        "strict10資源には実在する絶対パスを指定してください。リンク・相対パス・プロジェクト内の実行資源は使用できません"
+        "Specify existing absolute paths for strict10 resources. Links, relative paths, and execution resources within the project are not allowed"
     )]
     Path,
     #[error(
-        "strict10のPython実行物を確認できません。本人またはroot所有の実行可能なmacOSバイナリを指定してください"
+        "Cannot verify the strict10 Python executable. Specify an executable macOS binary owned by the user or root"
     )]
     Runtime,
     #[error(
-        "strict10モデルのmanifest・revision・全ファイルのSHA-256が一致しません。固定snapshotを確認してください"
+        "strict10 model manifest, revision, or file SHA-256 mismatch. Check the pinned snapshot"
     )]
     Manifest,
-    #[error("strict10には384次元のmultilingual-e5-small（BertModel）の固定snapshotが必要です")]
+    #[error(
+        "strict10 requires a pinned snapshot of 384-dimensional multilingual-e5-small (BertModel)"
+    )]
     Architecture,
-    #[error("strict10の資源サイズ・ファイル数が検査上限を超えています")]
+    #[error("strict10 resource size or file count exceeds inspection limits")]
     Limit,
-    #[error("strict10の固定helperと専用保存先を準備できません")]
+    #[error("Cannot prepare the strict10 pinned helper and dedicated storage")]
     Helper,
     #[error(
-        "strict10のPython・torch・transformers・tokenizers・safetensorsをofflineで読み込めません。runtimeの構成を確認してください"
+        "Cannot load strict10 Python, torch, transformers, tokenizers, or safetensors offline. Check the runtime configuration"
     )]
     Readiness,
     #[error(
-        "strict10の検査中に実行資源が変更されました。固定snapshotを確認して接続し直してください"
+        "Execution resources changed during strict10 inspection. Verify the pinned snapshot and reconnect"
     )]
     Changed,
 }

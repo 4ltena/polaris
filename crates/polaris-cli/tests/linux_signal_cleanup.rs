@@ -1340,12 +1340,10 @@ fn linux_tui_local_acceptance_commands_draft_refusal_and_clean_exit() {
         case.marker(IDLE_MARKER, SCREEN_DEADLINE)?;
         for (command, result) in [
             ("/help", "commands listed"),
-            ("/status", "状態を表示しました"),
-            ("/doctor", "診断結果"),
-            ("/web-search", "Web検索の利用条件"),
-            ("/models", "モデル一覧"),
+            ("/status", "Status displayed"),
+            ("/doctor", "Diagnostic results"),
             ("/pwd", "project"),
-            ("/mcp", "外部MCP"),
+            ("/mcp", "External MCP"),
             ("/diff", "diff:"),
         ] {
             case.capture().map_err(|error| error.to_string())?;
@@ -1394,7 +1392,7 @@ fn linux_tui_local_acceptance_commands_draft_refusal_and_clean_exit() {
         fixture.await_request()?;
         let offset = case.raw.len();
         case.write_key(b"/run details\r")?;
-        case.marker_since(offset, "実行状態", SCREEN_DEADLINE)?;
+        case.marker_since(offset, "Execution state", SCREEN_DEADLINE)?;
         // Recall an older input while retaining the independent live draft.
         // Move to the start by byte-safe repeated Left on this ASCII fixture.
         case.write_key(b"DRAFT")?;
@@ -1405,7 +1403,7 @@ fn linux_tui_local_acceptance_commands_draft_refusal_and_clean_exit() {
         case.write_key(b"/quit ")?;
         let offset = case.raw.len();
         case.write_key(b"\r")?;
-        case.marker_since(offset, "送信待ち・下書き", SCREEN_DEADLINE)?;
+        case.marker_since(offset, "queued input and drafts", SCREEN_DEADLINE)?;
         if case
             .poll_exit()
             .map_err(|error| error.to_string())?

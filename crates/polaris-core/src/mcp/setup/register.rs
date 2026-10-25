@@ -71,15 +71,15 @@ impl Proposal {
     pub fn description(&self, name: &str) -> String {
         let server = &self.server;
         let path = |path: &Path| visible(&path.to_string_lossy());
-        let mut lines = vec![format!("名前: {}（{}）", visible(name), server.server_id)];
+        let mut lines = vec![format!("Name: {} ({})", visible(name), server.server_id)];
         if let Some(app) = crate::mcp::apps::find(server) {
             lines.push(format!(
-                "アプリ: {}（実機で確認していない定義です。任意のコードを実行するツールは呼び出すたびに確認します）",
+                "App: {} (definition unverified on a real device; arbitrary code execution tools require confirmation for every call)",
                 app.label
             ));
         }
         if self.replaces {
-            lines.push("置き換え: 同じ取得元の既存登録を、この内容で置き換えます".into());
+            lines.push("Replacement: replaces the existing registration from the same source with this configuration".into());
         }
         let mut delivery = BTreeMap::new();
         let (effects, network) = match &server.transport {
@@ -87,17 +87,17 @@ impl Proposal {
                 url,
                 secret_headers,
             } => {
-                lines.push(format!("接続先: {}", visible(url)));
+                lines.push(format!("Endpoint: {}", visible(url)));
                 if url.starts_with("http://") {
                     lines.push(
-                        "注意: localhostは信頼境界ではなく、このMacで同じ利用者が動かす他のプロセスも接続できます"
+                        "Note: localhost is not a trust boundary. Other processes running as the same user on this Mac can also connect"
                             .into(),
                     );
                 }
                 for (header, reference) in secret_headers {
-                    delivery.insert(reference, format!("{} ヘッダー", visible(header)));
+                    delivery.insert(reference, format!("{} header", visible(header)));
                 }
-                ("ファイルの書込みとコマンドの起動はありません", "使います")
+                ("No file writes or command launches", "used")
             }
             Destination::Stdio {
                 command,
@@ -110,43 +110,46 @@ impl Proposal {
                 script,
                 script_sha256,
             } => {
-                lines.push(format!("コマンド: {}", path(command)));
-                lines.push(format!("引数: {args:?}"));
+                lines.push(format!("Command: {}", path(command)));
+                lines.push(format!("Arguments: {args:?}"));
                 if let Some(digest) = executable_sha256 {
-                    lines.push(format!("実行物のSHA-256: {digest}"));
+                    lines.push(format!("Executable SHA-256: {digest}"));
                 }
                 if let (Some(script), Some(digest)) = (script, script_sha256) {
-                    lines.push(format!("スクリプト: {}（SHA-256 {digest}）", path(script)));
+                    lines.push(format!("Script: {} (SHA-256 {digest})", path(script)));
                 }
-                lines.push(format!("作業場所: {}", path(cwd)));
+                lines.push(format!("Working directory: {}", path(cwd)));
                 for root in readable_roots {
-                    lines.push(format!("読取りを許可する場所: {}", path(root)));
+                    lines.push(format!("Readable locations: {}", path(root)));
                 }
                 lines.push(format!("sandbox: {sandbox_profile}"));
                 for (variable, reference) in secret_env {
-                    delivery.insert(reference, format!("環境変数 {}", visible(variable)));
+                    delivery.insert(
+                        reference,
+                        format!("Environment variable {}", visible(variable)),
+                    );
                 }
                 (
-                    "このコンピュータ上でコマンドを起動します（作業場所だけに書込み可能）",
+                    "Launches a command on this computer (writes restricted to the working directory)",
                     match sandbox_profile.as_str() {
-                        "full-access" => "使います",
-                        "loopback" => "このMac内での接続と待受だけ使います",
-                        _ => "使いません",
+                        "full-access" => "used",
+                        "loopback" => "Uses only connections and listeners within this Mac",
+                        _ => "not used",
                     },
                 )
             }
         };
         if self.secrets.is_empty() {
-            lines.push("認証: なし".into());
+            lines.push("Authentication: none".into());
         }
         for binding in &self.secrets {
             let prefix = if binding.key_path.last().is_some_and(|k| k == "bearer_token") {
-                "先頭に「Bearer 」を付けて"
+                "with a leading \"Bearer \" "
             } else {
                 ""
             };
             lines.push(format!(
-                "認証: {} の {} を{prefix}{}として送ります。値は保存し、表示しません（参照名 {}）",
+                "Authentication: sends the value from source {} at {} {prefix}as {}. The value is stored but hidden (reference {})",
                 path(&binding.source),
                 visible(&binding.key_path.join(".")),
                 delivery.get(&binding.reference).map_or("", String::as_str),
@@ -155,12 +158,12 @@ impl Proposal {
         }
         let capabilities = &server.capabilities;
         let (enabled, disabled): (Vec<_>, Vec<_>) = [
-            (capabilities.catalog_metadata, "カタログの取得"),
-            (capabilities.resource_read, "資料の読取り"),
-            (capabilities.prompt_selection, "プロンプトの選択"),
+            (capabilities.catalog_metadata, "catalog retrieval"),
+            (capabilities.resource_read, "resource reads"),
+            (capabilities.prompt_selection, "prompt selection"),
             (
                 capabilities.tool_call,
-                "ツールの実行（実行のたびに確認します）",
+                "tool calls (confirmation required for every call)",
             ),
         ]
         .into_iter()
@@ -172,14 +175,14 @@ impl Proposal {
                 .collect::<Vec<_>>()
                 .join("、")
         };
-        lines.push(format!("使えるようにする操作: {}", labels(enabled)));
+        lines.push(format!("Enabled operations: {}", labels(enabled)));
         if !disabled.is_empty() {
-            lines.push(format!("使わない操作: {}", labels(disabled)));
+            lines.push(format!("Disabled operations: {}", labels(disabled)));
         }
-        lines.push(format!("このコンピュータ: {effects}"));
-        lines.push(format!("ネットワーク: {network}"));
+        lines.push(format!("This computer: {effects}"));
+        lines.push(format!("Network: {network}"));
         lines.push(format!(
-            "通信方式: {}",
+            "Transport: {}",
             serde_json::to_value(server.protocol_profile)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned))
@@ -187,7 +190,7 @@ impl Proposal {
         ));
         let t = &server.timeouts;
         lines.push(format!(
-            "待ち時間: 接続{}秒（再試行{}回）、カタログ取得{}秒、操作{}秒、カタログ保持{}秒",
+            "Timeouts: connection {} s ({} retries), catalog {} s, operation {} s, catalog retention {} s",
             t.connect_seconds,
             t.connect_retries,
             t.catalog_seconds,
@@ -195,8 +198,8 @@ impl Proposal {
             t.catalog_ttl_seconds
         ));
         let projects: Vec<_> = server.enabled_projects.iter().map(|p| visible(p)).collect();
-        lines.push(format!("対象プロジェクト: {}", projects.join("、")));
-        lines.push("反映: 次の接続から使えます。今の作業には加わりません".into());
+        lines.push(format!("Target project: {}", projects.join("、")));
+        lines.push("Effective from the next connection. Not added to the current run".into());
         lines.join("\n")
     }
 }

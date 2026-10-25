@@ -85,15 +85,17 @@ impl LlamaServer {
 
     /// Starts the configured server and waits until it answers.
     pub async fn start(config: &LlamaCppConfig, private_root: &Path) -> io::Result<Self> {
-        let server = check_file(&config.server, "llama-serverの実行ファイル")?;
-        let models = check_dir(&config.models_dir, "GGUFのディレクトリ")?;
+        let server = check_file(&config.server, "llama-server executable")?;
+        let models = check_dir(&config.models_dir, "GGUF directory")?;
         if config.build.trim().is_empty() {
             return Err(io::Error::other(
-                "llama_cpp.buildに固定するビルド識別子が必要です",
+                "llama_cpp.build requires a pinned build identifier",
             ));
         }
         if !private_root.is_absolute() {
-            return Err(io::Error::other("保存先は絶対パスで指定してください"));
+            return Err(io::Error::other(
+                "Specify the storage location as an absolute path",
+            ));
         }
         std::fs::create_dir_all(private_root)?;
 
@@ -140,10 +142,10 @@ impl LlamaServer {
 
         let child = command.spawn()?;
         let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"))
-            .map_err(|_| io::Error::other("起動先のendpointを組み立てられません"))?;
+            .map_err(|_| io::Error::other("Cannot construct the launch endpoint"))?;
         let probe =
             LocalAdapter::with_token(Runtime::LlamaCpp, endpoint.clone(), Some(token.clone()))
-                .map_err(|_| io::Error::other("llama-serverへの問い合わせ口を作成できません"))?;
+                .map_err(|_| io::Error::other("Cannot create the llama-server endpoint"))?;
         let mut held = Self {
             child,
             endpoint,
@@ -166,14 +168,14 @@ impl LlamaServer {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Err(io::Error::other(format!(
-                    "llama-serverが起動直後に終了しました（{status}）"
+                    "llama-server exited immediately after launch ({status})"
                 )));
             }
             if self.probe.health().await.is_ok() {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::other("llama-serverが応答しませんでした"));
+                return Err(io::Error::other("llama-server did not respond"));
             }
             tokio::time::sleep(READY_POLL).await;
         }
@@ -185,7 +187,7 @@ impl LlamaServer {
             .probe
             .props()
             .await
-            .map_err(|_| io::Error::other("llama-serverの/propsを読めません"))?;
+            .map_err(|_| io::Error::other("Cannot read llama-server /props"))?;
         build_matches(&value, pinned)
     }
 
@@ -209,7 +211,7 @@ fn build_matches(value: &serde_json::Value, pinned: &str) -> io::Result<()> {
         .unwrap_or_default();
     if observed != pinned {
         return Err(io::Error::other(format!(
-            "llama-serverのビルドが固定値と一致しません（設定 {pinned} / 実際 {observed}）"
+            "llama-server build does not match the pin (configured {pinned} / observed {observed})"
         )));
     }
     // Router mode is the contract the discovery side is written against.
@@ -217,9 +219,7 @@ fn build_matches(value: &serde_json::Value, pinned: &str) -> io::Result<()> {
     // `status`, which reads as a runtime with one model of unknown
     // residency rather than as the misconfiguration it is.
     if value.get("role").and_then(serde_json::Value::as_str) != Some("router") {
-        return Err(io::Error::other(
-            "llama-serverがrouterとして起動していません",
-        ));
+        return Err(io::Error::other("llama-server is not running as a router"));
     }
     Ok(())
 }
@@ -253,14 +253,12 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
 fn check_file(path: &Path, what: &str) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::other(format!(
-            "{what}は絶対パスで指定してください"
+            "Specify {what} as an absolute path"
         )));
     }
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(io::Error::other(format!(
-            "{what}が通常のファイルではありません"
-        )));
+        return Err(io::Error::other(format!("{what} is not a regular file")));
     }
     Ok(path.to_path_buf())
 }
@@ -268,14 +266,12 @@ fn check_file(path: &Path, what: &str) -> io::Result<PathBuf> {
 fn check_dir(path: &Path, what: &str) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::other(format!(
-            "{what}は絶対パスで指定してください"
+            "Specify {what} as an absolute path"
         )));
     }
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(io::Error::other(format!(
-            "{what}がディレクトリではありません"
-        )));
+        return Err(io::Error::other(format!("{what} is not a directory")));
     }
     Ok(path.to_path_buf())
 }

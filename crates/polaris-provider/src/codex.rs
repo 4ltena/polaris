@@ -438,12 +438,12 @@ impl CodexProvider {
         if held.is_none() {
             match crate::codex_ws::Session::open(&self.base, token).await {
                 Ok(session) => {
-                    note("接続しました");
+                    note("connected");
                     *held = Some(session);
                 }
                 // The upgrade failed: no socket, no error to the caller.
                 Err(error) => {
-                    note(&format!("接続できません（{error:?}）。HTTPへ落ちます"));
+                    note(&format!("Cannot connect ({error:?}). Falling back to HTTP"));
                     return None;
                 }
             }
@@ -477,7 +477,7 @@ impl CodexProvider {
         }) {
             Some((previous, delta)) => {
                 note(&format!(
-                    "継続あり。送る項目 {}件（全体 {}件）",
+                    "Continuation available. Sending {} items ({} total)",
                     delta.len(),
                     input.len()
                 ));
@@ -488,7 +488,7 @@ impl CodexProvider {
             }
             None => {
                 note(&format!(
-                    "継続なし（{}）。全体 {}件を送ります",
+                    "No continuation ({}). Sending all {} items",
                     session.why_no_continuation(&shape, &input),
                     input.len()
                 ));
@@ -518,11 +518,11 @@ impl CodexProvider {
         }
         match answer {
             Ok((completed, usage)) => {
-                note(&format!("応答 {usage:?}"));
+                note(&format!("Response {usage:?}"));
                 Some(Ok(completed))
             }
             Err(error) => {
-                note(&format!("失敗（{error:?}）。HTTPへ落ちます"));
+                note(&format!("Failed ({error:?}). Falling back to HTTP"));
                 // A broken socket is not reusable: the server's idea of the
                 // conversation and this one have parted ways.
                 *held = None;

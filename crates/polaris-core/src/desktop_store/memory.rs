@@ -42,7 +42,7 @@ impl MemoryResources {
             || !(1..=4096).contains(&self.embedding_dimension)
             || !hash(&self.fingerprint)
         {
-            return Err(StoreError::Corrupt("記憶資源の識別子"));
+            return Err(StoreError::Corrupt("Memory resource identifier"));
         }
         Ok(())
     }
@@ -214,7 +214,7 @@ fn memory(p: &Published) -> StoreResult<&SavedMemory> {
     p.state
         .conversation_memory
         .as_ref()
-        .ok_or(StoreError::Corrupt("記憶設定が未接続"))
+        .ok_or(StoreError::Corrupt("Memory configuration not connected"))
 }
 fn run_index(p: &Published, target: &RunTarget) -> StoreResult<usize> {
     p.state
@@ -331,7 +331,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                 )
                 || run.memory_resources.is_none()
             {
-                return Err(StoreError::Corrupt("実行の記憶状態"));
+                return Err(StoreError::Corrupt("Run memory state"));
             }
         }
         if let Some(resources) = &run.memory_resources {
@@ -348,7 +348,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
         || m.attempts.len() > 65_536
         || m.sources.len() > 65_536
     {
-        return Err(StoreError::Corrupt("記憶の保存版・世代"));
+        return Err(StoreError::Corrupt("Memory storage version or generation"));
     }
     let mut turns = BTreeSet::new();
     // Hash all required raw boundaries in one pass, including their newline.
@@ -384,15 +384,15 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                 .source_id
                 .starts_with(&format!("source-{}-", source.source.turn.get()))
         {
-            return Err(StoreError::Corrupt("記憶の公開出典"));
+            return Err(StoreError::Corrupt("Memory published source"));
         }
         let attempt = m
             .attempts
             .iter()
             .find(|a| a.source.turn == source.source.turn)
-            .ok_or(StoreError::Corrupt("公開記憶のattempt不在"))?;
+            .ok_or(StoreError::Corrupt("Missing published memory attempt"))?;
         if attempt.source != source.source {
-            return Err(StoreError::Corrupt("公開記憶の原文対応"));
+            return Err(StoreError::Corrupt("Published memory source association"));
         }
         match (
             &attempt.structured,
@@ -404,16 +404,22 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                 let response = structured
                     .response
                     .as_ref()
-                    .ok_or(StoreError::Corrupt("公開記憶の応答不在"))?;
+                    .ok_or(StoreError::Corrupt("Missing published memory response"))?;
                 if &response.delta.publication.publication_id != id
                     || &response.coverage != coverage
                     || u64::try_from(response.delta.publication.scope.generation).ok()
                         != Some(source.generation.get())
                 {
-                    return Err(StoreError::Corrupt("公開記憶と構造化応答の対応"));
+                    return Err(StoreError::Corrupt(
+                        "Published memory and structured response association",
+                    ));
                 }
             }
-            _ => return Err(StoreError::Corrupt("公開記憶の構造化対応")),
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "Published memory structured association",
+                ));
+            }
         }
     }
     let mut attempts = BTreeSet::new();
@@ -421,7 +427,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
         p.raw.iter().map(|e| (e.sequence, e)).collect();
     for attempt in &m.attempts {
         if !attempts.insert(attempt.source.turn) {
-            return Err(StoreError::Corrupt("要約の重複"));
+            return Err(StoreError::Corrupt("Duplicate summary"));
         }
         let op = p
             .state
@@ -433,11 +439,11 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                     .iter()
                     .find(|o| o.operation_id == attempt.operation_id)
             })
-            .ok_or(StoreError::Corrupt("要約の実行参照"))?;
+            .ok_or(StoreError::Corrupt("Summary run reference"))?;
         if let Some(summary) = &attempt.summary {
             crate::conversation_memory::validate_summary(summary, attempt.source.turn.get())?;
             if op.result_id.is_none() {
-                return Err(StoreError::Corrupt("要約結果が未確定"));
+                return Err(StoreError::Corrupt("Summary outcome unknown"));
             }
         }
         if let Some(structured) = &attempt.structured {
@@ -446,7 +452,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
             for source in &structured.intent.sources {
                 let event = source_events
                     .get(&source.sequence)
-                    .ok_or(StoreError::Corrupt("構造化source不在"))?;
+                    .ok_or(StoreError::Corrupt("Missing structured source"))?;
                 if previous.is_some_and(|p| p >= source.sequence)
                     || event.epoch != m.epoch.get()
                     || source.role != event.message.role
@@ -460,7 +466,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                             event.sequence
                         )
                 {
-                    return Err(StoreError::Corrupt("構造化sourceの原文拘束"));
+                    return Err(StoreError::Corrupt("Structured source text binding"));
                 }
                 previous = Some(source.sequence);
             }
@@ -498,7 +504,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                         structured.intent.coverage.prefix_hash.clone(),
                     ))
             {
-                return Err(StoreError::Corrupt("構造化coverageの保存内容"));
+                return Err(StoreError::Corrupt("Saved structured coverage content"));
             }
             if let Some(response) = &structured.response {
                 polaris_memory::structured::validate_delta(&response.delta)
@@ -513,7 +519,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                     || publication.prompt_version
                         != crate::conversation_memory::structured::STRUCTURED_PROMPT_VERSION
                 {
-                    return Err(StoreError::Corrupt("構造化応答の保存内容"));
+                    return Err(StoreError::Corrupt("Saved structured response content"));
                 }
             }
         }
@@ -529,7 +535,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
             || source.raw_offset > p.marker.raw_offset
             || source.content_revision > p.marker.content_revision
         {
-            return Err(StoreError::Corrupt("要約の原文参照"));
+            return Err(StoreError::Corrupt("Summary source reference"));
         }
     }
     Ok(())
@@ -576,7 +582,7 @@ fn validate_status(status: &MemoryStatus) -> StoreResult<()> {
             )
         ) && !status.retrieval_sources.is_empty())
     {
-        return Err(StoreError::Corrupt("記憶状態の上限"));
+        return Err(StoreError::Corrupt("Memory state limit"));
     }
     Ok(())
 }
@@ -614,7 +620,7 @@ impl Writer {
         next.state.runs[index].memory = Some(MemoryStatus {
             run_id: target.run_id.clone(),
             phase: MemoryPhase::Preparing,
-            detail: "会話記憶を準備しています".into(),
+            detail: "Preparing conversation memory".into(),
             recent_raw_turns: DecimalU64::new(0),
             retrieval_sources: vec![],
             reference_tokens: DecimalU64::new(0),
@@ -694,7 +700,7 @@ impl Writer {
     ) -> StoreResult<SummaryWork> {
         self.check_memory_snapshot(target, expected)?;
         if expected.expired_turn()? != Some(turn) {
-            return Err(StoreError::Corrupt("要約対象のターン"));
+            return Err(StoreError::Corrupt("Summary target turn"));
         }
         let digest = turn_hash(&expected.conversation, turn)?;
         let mut next = self.snapshot()?;
@@ -705,7 +711,7 @@ impl Writer {
             .cloned();
         if let Some(prior) = prior {
             if prior.source.turn_hash != digest {
-                return Err(StoreError::Corrupt("要約対象の原文変更"));
+                return Err(StoreError::Corrupt("Summary target source changed"));
             }
             let bytes = self.memory_raw_prefix(prior.source.raw_offset, &prior.source.raw_hash)?;
             let raw = bytes
@@ -719,7 +725,7 @@ impl Writer {
                     .as_ref()
                     != Some(&structured.intent)
                 {
-                    return Err(StoreError::Corrupt("保存済み構造化source map"));
+                    return Err(StoreError::Corrupt("Saved structured source map"));
                 }
                 if let Some(response) = &structured.response {
                     crate::conversation_memory::structured::validate_saved_response(
@@ -775,7 +781,7 @@ impl Writer {
                         &expected.conversation,
                     )
                     .map_err(std::io::Error::other)?
-                    .ok_or(StoreError::Corrupt("構造化抽出対象がありません"))?,
+                    .ok_or(StoreError::Corrupt("No structured extraction target"))?,
                 )
             } else {
                 None
@@ -880,7 +886,9 @@ impl Writer {
                         .ok_or(StoreError::Overflow)?,
                 )?
         {
-            return Err(StoreError::Corrupt("構造化抽出結果の出典・世代"));
+            return Err(StoreError::Corrupt(
+                "Structured extraction result source or generation",
+            ));
         }
         let saved = SavedStructuredResponse {
             summary: response.summary.clone(),
@@ -963,7 +971,7 @@ impl Writer {
             || pending.effort != "medium"
             || pending.prompt_version != "strict10-v1"
         {
-            return Err(StoreError::Corrupt("記憶の公開内容"));
+            return Err(StoreError::Corrupt("Published memory content"));
         }
         self.memory_raw_prefix(attempt.source.raw_offset, &attempt.source.raw_hash)?;
         view.visible_ids.push(pending.id.clone());
@@ -1017,7 +1025,7 @@ impl Writer {
                 != Some(response)
             || response.delta.publication.raw_hash != attempt.source.raw_hash
         {
-            return Err(StoreError::Corrupt("構造化記憶の公開内容"));
+            return Err(StoreError::Corrupt("Published structured memory content"));
         }
         let generation = memory(&next)?.generation.checked_add(1)?;
         let suffix = &attempt.source.raw_hash[..16];
@@ -1035,7 +1043,7 @@ impl Writer {
                     generation: view.scope.generation,
                 })
         {
-            return Err(StoreError::Corrupt("構造化記憶のscope"));
+            return Err(StoreError::Corrupt("Structured memory scope"));
         }
         self.memory_raw_prefix(attempt.source.raw_offset, &attempt.source.raw_hash)?;
         view.visible_ids.push(pending.id.clone());
@@ -1110,12 +1118,14 @@ impl Writer {
                         || reference.source.start_turn != number(receipt.source.turn.get())?
                         || reference.source.end_turn != reference.source.start_turn
                     {
-                        return Err(StoreError::Corrupt("原文参照の保存出典不一致"));
+                        return Err(StoreError::Corrupt(
+                            "Source reference does not match saved source",
+                        ));
                     }
                     let (start, end) = requested
                         .unwrap_or((reference.source.start_turn, reference.source.end_turn));
                     if start != reference.source.start_turn || end != reference.source.end_turn {
-                        return Err(StoreError::Corrupt("原文参照の範囲不一致"));
+                        return Err(StoreError::Corrupt("Source reference range mismatch"));
                     }
                     let events = owner.summary_raw(proof)?;
                     let payload = serde_json::to_string(&events)?;

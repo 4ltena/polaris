@@ -159,7 +159,7 @@ async fn actual_child_pipe_stream_history_and_ready_exit_without_stdin_eof() {
     assert_eq!(history.messages.len(), 2);
     assert_eq!(
         history.messages[1].text,
-        "こんにちは。これはfakeの応答です。"
+        "こんにちは。This is a fake response."
     );
     loop {
         client

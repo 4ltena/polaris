@@ -45,12 +45,14 @@ pub(in crate::desktop_store::memory) fn initialize(
                             && number(source.generation.get()).ok() == Some(scope.generation)
                             && source.structured_ids == ids
                     })
-                    .ok_or(StoreError::Corrupt("初期化時の固定owner範囲"))?;
+                    .ok_or(StoreError::Corrupt("Pinned owner scope at initialization"))?;
                 let owner = FrozenMemory::load(writer, work.clone(), source, &mut |delta| {
                     verifier.submit_structured(delta)
                 })?;
                 if &owner.resources != resources {
-                    return Err(StoreError::Corrupt("固定祖先の記憶資源不一致"));
+                    return Err(StoreError::Corrupt(
+                        "Pinned ancestor memory resource mismatch",
+                    ));
                 }
                 verifier
                     .verify_summaries(|pending| {

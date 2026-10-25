@@ -45,15 +45,15 @@ pub struct PreparedSessionSettingsV1 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionSettingsError {
-    #[error("セッション保存: {0}")]
+    #[error("Session storage: {0}")]
     Session(#[from] io::Error),
-    #[error("管理効果: {0}")]
+    #[error("Management effect: {0}")]
     Effect(#[from] ManagementEffectStoreError),
-    #[error("設定は既に同じ値です")]
+    #[error("Settings already have the same values")]
     NoChange,
-    #[error("確認後にセッション状態が変わりました")]
+    #[error("Session state changed after confirmation")]
     StalePreview,
-    #[error("この管理操作は既に開始または確定しています。再実行しません")]
+    #[error("This management operation has already started or finalized. It will not be rerun")]
     ExistingOperation,
 }
 
@@ -74,7 +74,9 @@ impl SessionSettingsOwnerV1<'_> {
         if before.raw_offset != before.state.raw_commit_offset
             || before.raw_hash != before.state.raw_commit_hash
         {
-            return Err(invalid("セッション設定前に未公開の原文があります").into());
+            return Err(
+                invalid("Unpublished source text exists before session configuration").into(),
+            );
         }
         let inventory = command.inventory();
         let mut candidate = before.state.clone();
@@ -85,7 +87,7 @@ impl SessionSettingsOwnerV1<'_> {
             } => {
                 cas(expected_revision, before.state.draft.revision)?;
                 if text.len() > MAX_DRAFT_BYTES {
-                    return Err(invalid("下書きが保存上限を超えています").into());
+                    return Err(invalid("The draft exceeds the storage limit").into());
                 }
                 let text = if text.trim().is_empty() {
                     String::new()
@@ -146,10 +148,13 @@ impl SessionSettingsOwnerV1<'_> {
                     } => {
                         cas(expected_revision, revision)?;
                         if provider != initial.provider {
-                            return Err(invalid("providerの変更には再起動が必要です").into());
+                            return Err(invalid("Changing the provider requires a restart").into());
                         }
                         if !matches!(effort.as_str(), "" | "auto") && effort != initial.effort {
-                            return Err(invalid("対話中に固定effortへ変更できません").into());
+                            return Err(invalid(
+                                "Cannot switch to a fixed effort during an interactive session",
+                            )
+                            .into());
                         }
                         settings.provider = provider;
                         settings.model = model;
@@ -358,7 +363,7 @@ fn check_preimage(
                     .join(&current.state.session_id),
             )?
     {
-        return Err(invalid("管理効果と保存対象セッションのprojectが一致しません").into());
+        return Err(invalid("Management effect and target session project mismatch").into());
     }
     if current.state != preview.before.state
         || current.raw_offset != preview.before.raw_offset

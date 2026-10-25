@@ -12,7 +12,7 @@ use ratatui::{
 use serde_json::Value;
 use std::time::Duration;
 
-pub(super) fn confirm_card<B: Backend, R: KeyReader>(
+pub(crate) fn confirm_card<B: Backend, R: KeyReader>(
     terminal: &RefCell<Terminal<B>>,
     reader: &mut R,
     title: &str,
@@ -46,9 +46,9 @@ pub(super) fn confirm_card<B: Backend, R: KeyReader>(
                     .map(|row| row.line)
                     .collect();
                 lines.push(Line::from(if ready {
-                    "y: 実行 / Esc: 取消 / ↑↓: 詳細"
+                    "y: execute / Esc: cancel / ↑↓: details"
                 } else {
-                    "↑↓: 全詳細を確認 / Esc: 取消"
+                    "↑↓: review all details / Esc: cancel"
                 }));
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -85,7 +85,7 @@ pub(super) fn progress<B: Backend>(
             );
         })
         .map(|_| ())
-        .map_err(|_| "MCP処理画面を表示できません".into())
+        .map_err(|_| "Cannot display the MCP processing screen".into())
 }
 
 pub(super) async fn wait<B: Backend, F: std::future::Future>(
@@ -99,7 +99,7 @@ pub(super) async fn wait<B: Backend, F: std::future::Future>(
     loop {
         tokio::select! {
             output = &mut future => {
-                return if display_error { Err("MCP処理中に端末表示を失いました。結果の照合が必要です".into()) } else { Ok(output) };
+                return if display_error { Err("Terminal display was lost during MCP processing. Outcome reconciliation is required".into()) } else { Ok(output) };
             }
             _ = timer.tick() => {
                 // Do not drop an owner while it still owns a connection or download.
@@ -112,12 +112,12 @@ pub(super) async fn wait<B: Backend, F: std::future::Future>(
 fn message(error: polaris_mcp::Error) -> &'static str {
     use polaris_mcp::Error;
     match error {
-        Error::RevisionConflict => "MCP設定が同時に変更されました。再表示してください",
-        Error::Auth => "MCP認証情報が見つからないか、参照されています",
-        Error::Protection => "MCP保存先・実行物の保護を確認できません",
-        Error::Transport | Error::Timeout | Error::Protocol => "MCPサーバーに接続できません",
-        Error::StopUnconfirmed => "MCPサーバーの停止を確認できません",
-        _ => "MCP設定を確認できません",
+        Error::RevisionConflict => "MCP configuration changed concurrently. Redisplay it",
+        Error::Auth => "MCP credentials are missing or still referenced",
+        Error::Protection => "Cannot verify MCP storage or executable protection",
+        Error::Transport | Error::Timeout | Error::Protocol => "Cannot connect to the MCP server",
+        Error::StopUnconfirmed => "Cannot verify that the MCP server stopped",
+        _ => "Cannot verify MCP configuration",
     }
 }
 
@@ -130,63 +130,63 @@ pub(super) async fn check<B: Backend, R: KeyReader>(
     journal: &Journal<'_>,
 ) -> Result<Vec<Line<'static>>, String> {
     if !ceiling.permits_external() {
-        return Err("外部MCPは起動時の上限で拒否されています".into());
+        return Err("External MCP is denied by the startup ceiling".into());
     }
     if approval_policy == ApprovalPolicy::Never {
-        return Err("現在の承認設定ではMCPカタログを変更できません".into());
+        return Err("Current approval settings do not permit MCP catalog changes".into());
     }
-    let store = host.store().ok_or("MCP serverが登録されていません")?;
+    let store = host.store().ok_or("MCP server is not registered")?;
     let registry = store
         .load_registry()
         .map_err(|error| message(error).to_owned())?
-        .ok_or("MCP serverが登録されていません")?;
+        .ok_or("MCP server is not registered")?;
     let server = registry
         .servers
         .iter()
         .find(|server| server.server_id == server_id)
-        .ok_or("そのMCP serverは登録されていません")?;
+        .ok_or("That MCP server is not registered")?;
     if !server.enabled_projects.contains(host.project()) {
-        return Err("そのMCP serverはこのプロジェクトで無効です".into());
+        return Err("That MCP server is disabled for this project".into());
     }
     host.validate(server)
         .map_err(|error| message(error).to_owned())?;
     let target = match &server.transport {
-        Destination::StreamableHttp { url, .. } => format!("接続先: {url}"),
+        Destination::StreamableHttp { url, .. } => format!("Endpoint: {url}"),
         Destination::Stdio {
             command, args, cwd, ..
         } => format!(
-            "実行: {} {args:?}\n作業場所: {}",
+            "Run: {} {args:?}\nWorking directory: {}",
             command.display(),
             cwd.display()
         ),
     };
     let detail = format!(
-        "MCPカタログを取得して索引を保存します\nserver: {server_id}\n{target}\nregistry revision {}\n接続timeout {}秒、カタログtimeout {}秒\nツールは実行しません。取得先へ通信し、stdioは登録済み実行物を起動します。\n索引の変更は巻き戻しでは取り消せません。",
+        "Retrieve the MCP catalog and save its index\nserver: {server_id}\n{target}\nregistry revision {}\nConnection timeout {} s, catalog timeout {} s\nNo tools are called. Contacts the endpoint; stdio launches the registered executable.\nRewind cannot undo index changes.",
         registry.revision, server.timeouts.connect_seconds, server.timeouts.catalog_seconds
     );
     let (mut runtime, quarantined) = host
         .runtime("tui-mcp-check", "check", ceiling)
         .map_err(|error| message(error).to_owned())?
-        .ok_or("このプロジェクトで有効なMCP serverがありません")?;
+        .ok_or("No MCP servers enabled for this project")?;
     if let Some(reason) = quarantined.get(server_id) {
         return Err(message(*reason).into());
     }
     let prepared = journal.prepare("C26", registry.revision, detail.as_bytes())?;
-    if !confirm_card(terminal, reader, "MCPカタログの確認", &detail) {
+    if !confirm_card(terminal, reader, "Verify MCP catalog", &detail) {
         journal.deny(&prepared)?;
-        return Ok(vec![Line::from("MCPカタログの確認を取り消しました")]);
+        return Ok(vec![Line::from("MCP catalog verification cancelled")]);
     }
     if !store
         .load_registry()
         .is_ok_and(|current| current.as_ref() == Some(&registry))
     {
         journal.deny(&prepared)?;
-        return Err("確認中にMCP registryが変更されました".into());
+        return Err("MCP registry changed during confirmation".into());
     }
     let started = journal.start(&prepared)?;
     let result = wait(
         terminal,
-        "MCPカタログを取得しています。接続と索引の保存を確認するまでお待ちください。",
+        "Retrieving the MCP catalog. Waiting for connection and index persistence to be verified.",
         async {
             let entry = runtime.index_entry(server_id, std::future::pending()).await;
             let stopped = runtime.shutdown().await;
@@ -203,7 +203,7 @@ pub(super) async fn check<B: Backend, R: KeyReader>(
         Ok(entry) => entry,
         Err(_) => {
             journal.complete(&started, b"mcp-catalog:stopped-without-index-update")?;
-            return Err("MCPカタログを取得できませんでした。索引は更新していません".into());
+            return Err("Could not retrieve the MCP catalog. The index is unchanged".into());
         }
     };
     let (tools, partial) = store
@@ -214,10 +214,10 @@ pub(super) async fn check<B: Backend, R: KeyReader>(
         format!("mcp-catalog:{server_id}:{tools}:{partial}").as_bytes(),
     )?;
     Ok(vec![Line::from(format!(
-        "{}: ツール{tools}件{}。索引を保存しました。",
+        "{}: {tools} tools{}. Index saved.",
         render::sanitize(server_id),
         if partial {
-            "（上限のため一部）"
+            " (partial due to limit)"
         } else {
             ""
         }
@@ -243,7 +243,7 @@ impl<B: Backend, R: KeyReader> Approver for RegistrationApprover<'_, '_, B, R> {
             if !confirm_card(
                 self.terminal,
                 self.reader,
-                "検出したMCPサーバーを登録",
+                "Register a detected MCP server",
                 reason,
             ) {
                 self.journal.deny(&prepared)?;
@@ -265,16 +265,16 @@ impl<B: Backend, R: KeyReader> Approver for RegistrationApprover<'_, '_, B, R> {
 
 fn reason(code: &str) -> &'static str {
     match code {
-        "launcher_not_supported" => "先に /mcp materialize <名前> で取得してください",
-        "already_registered" => "同じ内容で登録済みです",
+        "launcher_not_supported" => "Download first with /mcp materialize <name>",
+        "already_registered" => "An identical registration already exists",
         "credential_in_arguments" | "unsupported_auth" | "environment_reference" => {
-            "認証情報を安全に取り込めません"
+            "Cannot safely import credentials"
         }
-        "unsupported_transport" => "未対応の接続方式です",
+        "unsupported_transport" => "Unsupported transport",
         "command_not_found" | "command_not_absolute" | "command_missing" => {
-            "実行物の場所を確認できません"
+            "Cannot verify the executable location"
         }
-        _ => "設定が登録条件を満たしていません",
+        _ => "Configuration does not meet registration requirements",
     }
 }
 
@@ -290,7 +290,9 @@ fn select<B: Backend, R: KeyReader>(
             .draw(|frame| {
                 let visible = frame.area().height.saturating_sub(4).max(1) as usize;
                 let first = selected.saturating_sub(visible.saturating_sub(1));
-                let mut lines = vec![Line::from("↑↓: 選択 / Enter: 登録内容を確認 / Esc: 取消")];
+                let mut lines = vec![Line::from(
+                    "↑↓: select / Enter: review registration / Esc: cancel",
+                )];
                 lines.extend(candidates.iter().enumerate().skip(first).take(visible).map(
                     |(index, candidate)| {
                         Line::from(format!(
@@ -300,7 +302,7 @@ fn select<B: Backend, R: KeyReader>(
                             candidate["reason"]
                                 .as_str()
                                 .map(reason)
-                                .unwrap_or("登録内容を確認できます")
+                                .unwrap_or("Registration details available for review")
                         ))
                     },
                 ));
@@ -308,12 +310,12 @@ fn select<B: Backend, R: KeyReader>(
                     Paragraph::new(lines).block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title("検出したMCPサーバー"),
+                            .title("Detected MCP servers"),
                     ),
                     frame.area(),
                 );
             })
-            .map_err(|_| "MCP検出結果を表示できません")?;
+            .map_err(|_| "Cannot display MCP discovery results")?;
         match reader.read_key() {
             Ok(KeyCode::Down) => selected = (selected + 1).min(candidates.len() - 1),
             Ok(KeyCode::Up) => selected = selected.saturating_sub(1),
@@ -351,15 +353,15 @@ pub(super) async fn setup<B: Backend, R: KeyReader>(
             &mut approver,
         )
         .await
-        .map_err(|_| "MCP設定を検出できません")?;
+        .map_err(|_| "Cannot detect MCP configuration")?;
     let detected: Value =
-        serde_json::from_str(&detected).map_err(|_| "MCP検出結果を確認できません")?;
+        serde_json::from_str(&detected).map_err(|_| "Cannot verify MCP discovery results")?;
     let candidates = detected["candidates"]
         .as_array()
-        .ok_or("MCP検出結果を確認できません")?;
+        .ok_or("Cannot verify MCP discovery results")?;
     if candidates.is_empty() {
         return Ok(vec![Line::from(
-            "CodexとClaudeの設定にMCPサーバーは見つかりませんでした",
+            "No MCP servers found in Codex or Claude configuration",
         )]);
     }
     let selected = match name {
@@ -374,19 +376,20 @@ pub(super) async fn setup<B: Backend, R: KeyReader>(
                 [selected] => *selected,
                 [] => {
                     return Err(
-                        "その名前のMCP検出候補がありません。/mcp setup で選択してください".into(),
+                        "No detected MCP candidate with that name. Select one with /mcp setup"
+                            .into(),
                     );
                 }
                 _ => {
                     return Err(
-                        "同じ名前の候補が複数あります。/mcp setup で選択してください".into(),
+                        "Multiple candidates share that name. Select one with /mcp setup".into(),
                     );
                 }
             }
         }
         None => match select(terminal, approver.reader, candidates)? {
             Some(selected) => selected,
-            None => return Ok(vec![Line::from("MCP登録を取り消しました")]),
+            None => return Ok(vec![Line::from("MCP registration cancelled")]),
         },
     };
     let selected = &candidates[selected];
@@ -397,7 +400,7 @@ pub(super) async fn setup<B: Backend, R: KeyReader>(
         .store()
         .map(|store| store.load_registry())
         .transpose()
-        .map_err(|_| "MCP registryを確認できません")?
+        .map_err(|_| "Cannot verify the MCP registry")?
         .flatten()
         .map_or(0, |registry| registry.revision);
     let result = tool
@@ -415,7 +418,7 @@ pub(super) async fn setup<B: Backend, R: KeyReader>(
         (Ok(receipt), Some(started)) => {
             journal.complete(&started, receipt.as_bytes())?;
             Ok(vec![Line::from(format!(
-                "{} を登録しました。次の実行から反映します。",
+                "Registered {}. Effective from the next run.",
                 render::sanitize(selected["name"].as_str().unwrap_or("MCP server"))
             ))])
         }
@@ -424,11 +427,12 @@ pub(super) async fn setup<B: Backend, R: KeyReader>(
             registration_failure(&body),
             journal.unknown(&started)
         )),
-        (Err(_), None) if approver.cancelled => Ok(vec![Line::from("MCP登録を取り消しました")]),
+        (Err(_), None) if approver.cancelled => Ok(vec![Line::from("MCP registration cancelled")]),
         (Err(_), None) => Err(
-            "MCP登録を許可されませんでした。起動時の外部MCP上限と承認設定を確認してください".into(),
+            "MCP registration denied. Check the startup external MCP ceiling and approval settings"
+                .into(),
         ),
-        (Ok(_), None) => Err("MCP登録の管理記録を確認できません".into()),
+        (Ok(_), None) => Err("Cannot verify MCP registration management records".into()),
     }
 }
 
@@ -437,11 +441,11 @@ fn registration_failure(body: &str) -> &'static str {
         .ok()
         .and_then(|value| value.get("error")?.as_str().map(str::to_owned));
     match code.as_deref() {
-        Some("credential_changed") => "検出後に取得元の認証情報が変更されました",
-        Some("registry_changed") => "確認中にMCP registryが変更されました",
-        Some("unsafe_location") => "実行物か保存先の保護を確認できません",
-        Some("invalid") => "MCP設定が登録条件を満たしていません",
-        _ => "MCP登録を保存できませんでした",
+        Some("credential_changed") => "Source credentials changed after discovery",
+        Some("registry_changed") => "MCP registry changed during confirmation",
+        Some("unsafe_location") => "Cannot verify executable or storage protection",
+        Some("invalid") => "MCP configuration does not meet registration requirements",
+        _ => "Could not save the MCP registration",
     }
 }
 
@@ -459,10 +463,10 @@ pub(super) async fn materialize<B: Backend, R: KeyReader>(
     let (name, runtime) = match parts {
         [name] => (*name, None),
         [name, "--runtime", runtime] => (*name, Some(std::path::Path::new(runtime))),
-        _ => return Err("/mcp materialize <検出名> [--runtime <絶対パス>]".into()),
+        _ => return Err("/mcp materialize <detected-name> [--runtime <absolute-path>]".into()),
     };
     if !permission.0 || permission.1 == ApprovalPolicy::Never {
-        return Err("MCPの取得には起動時の外部MCP許可と承認可能な設定が必要です".into());
+        return Err("MCP downloads require startup external MCP permission and settings that permit approval".into());
     }
     let home = host.account_home().to_owned();
     let name_owned = name.to_owned();
@@ -483,17 +487,17 @@ pub(super) async fn materialize<B: Backend, R: KeyReader>(
     });
     let (detector, plan) = wait(
         terminal,
-        "取得するMCPパッケージとinterpreterを確認しています。まだ取得は開始していません。",
+        "Checking the MCP package and interpreter. Download has not started.",
         preparation,
     )
     .await?
-    .map_err(|_| "MCP取得内容の確認を完了できません")?
+    .map_err(|_| "Cannot complete MCP download review")?
     .map_err(materialize_refusal)?;
     let detail = format!("server: {name}\n{}", plan.description());
     let prepared = journal.prepare("C28", 0, detail.as_bytes())?;
-    if !confirm_card(terminal, reader, "MCPパッケージを取得して固定", &detail) {
+    if !confirm_card(terminal, reader, "Download and pin MCP package", &detail) {
         journal.deny(&prepared)?;
-        return Ok(vec![Line::from("MCPパッケージの取得を取り消しました")]);
+        return Ok(vec![Line::from("MCP package download cancelled")]);
     }
     let started = journal.start(&prepared)?;
     let held_lease = Arc::clone(lease);
@@ -503,14 +507,14 @@ pub(super) async fn materialize<B: Backend, R: KeyReader>(
         let _lease = held_lease;
         detector.materialise_prepared_quiet(plan)
     });
-    let pinned = wait(terminal, "MCPパッケージを取得しています。\n取得が終了するまで待っています。Escは送信取消にはなりません。\n登録は取得後に /mcp setup で別途確認します。", worker)
+    let pinned = wait(terminal, "Downloading the MCP package.\nWaiting for the download to finish. Esc does not cancel the transfer.\nReview registration separately afterward with /mcp setup.", worker)
         .await.map_err(|_| journal.unknown(&started))?
         .map_err(|_| journal.unknown(&started))?
         .map_err(|reason| format!("{}。{}", materialize_refusal(reason), journal.unknown(&started)))?;
     let receipt = serde_json::to_vec(&pinned).map_err(|_| journal.unknown(&started))?;
     journal.complete(&started, &receipt)?;
     Ok(vec![Line::from(format!(
-        "{} {} を固定しました。/mcp setup で登録内容を確認してください。",
+        "Pinned {} {}. Review registration with /mcp setup.",
         render::sanitize(&pinned.package),
         render::sanitize(&pinned.version)
     ))])
@@ -519,12 +523,12 @@ pub(super) async fn materialize<B: Backend, R: KeyReader>(
 fn materialize_refusal(reason: polaris_core::mcp::setup::launcher::Refused) -> String {
     use polaris_core::mcp::setup::launcher::Refused;
     match reason {
-        Refused::NotALauncher => "その検出名の安全な取得設定が見つかりません",
-        Refused::ManagerNotSupported => "そのパッケージ取得方法には対応していません",
-        Refused::FetchFailed => "MCPパッケージを取得できません",
-        Refused::NoEntryPoint => "取得したMCPパッケージの実行入口を確認できません",
-        Refused::RuntimeNotPinned => "実行に使うinterpreterの絶対パスを確認できません",
-        Refused::NotSaved => "MCPパッケージを安全な保存先へ固定できません",
+        Refused::NotALauncher => "No safe download configuration for that detected name",
+        Refused::ManagerNotSupported => "Unsupported package download method",
+        Refused::FetchFailed => "Cannot download the MCP package",
+        Refused::NoEntryPoint => "Cannot verify the downloaded MCP package entry point",
+        Refused::RuntimeNotPinned => "Cannot verify the runtime interpreter's absolute path",
+        Refused::NotSaved => "Cannot pin the MCP package in safe storage",
     }
     .into()
 }

@@ -26,23 +26,23 @@ pub struct WorkspaceChangeOwnerV1<'a> {
 impl WorkspaceChangeOwnerV1<'_> {
     pub fn preview_git(&self, plan: recipe::git::GitPlan) -> Result<GitRecipePreviewV1, String> {
         let root = crate::project_mutation::open_directory_nofollow(self.workspace.project_root())
-            .map_err(|_| "対象フォルダを開けません")?;
-        let identity = root.metadata().map_err(|_| "対象を確認できません")?;
+            .map_err(|_| "Cannot open the target folder")?;
+        let identity = root.metadata().map_err(|_| "Cannot verify the target")?;
         if self.source_identity != (identity.dev(), identity.ino())
             || ManagementEffectHashV1::digest(
                 self.workspace.project_root().as_os_str().as_encoded_bytes(),
             ) != self.effects.project_scope_hash()
         {
-            return Err("起動時のsourceまたはproject束縛が変更されました".into());
+            return Err("Startup source or project binding changed".into());
         }
         match plan {
             recipe::git::GitPlan::TidyOnly => {}
             recipe::git::GitPlan::NotApplicable { reason } => {
-                return Err(format!("Git設定は適用できません: {reason:?}"));
+                return Err(format!("Cannot apply Git settings: {reason:?}"));
             }
         }
         let before = recipe::ignore_rules::read(self.workspace.project_root())
-            .map_err(|_| ".gitignoreを安全に読めません")?;
+            .map_err(|_| "Cannot safely read .gitignore")?;
         let (additions, withheld) = recipe::ignore_rules::plan_additions(&before, RULES);
         Ok(GitRecipePreviewV1 {
             before,
@@ -66,10 +66,10 @@ impl WorkspaceChangeOwnerV1<'_> {
         let lease = self
             .workspace
             .try_mutation()
-            .map_err(|_| "実行中の操作があります")?;
+            .map_err(|_| "An operation is active")?;
         self.workspace
             .require_quiescent_with_lease(&lease)
-            .map_err(|_| "復旧待ちの操作があります")?;
+            .map_err(|_| "An operation awaits recovery")?;
         crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
             self.workspace.project_root(),
             self.effects.state_dir(),
@@ -79,10 +79,12 @@ impl WorkspaceChangeOwnerV1<'_> {
         let cursor = self
             .effects
             .cursor()
-            .map_err(|_| "管理効果を確認できません")?;
+            .map_err(|_| "Cannot verify the management effect")?;
         let request = PrepareManagementEffectV1 {
-            operation_id: ManagementOperationIdV1::random().map_err(|_| "操作IDを作れません")?,
-            inventory: ManagementInventoryIdV1::parse("C31").map_err(|_| "操作を確認できません")?,
+            operation_id: ManagementOperationIdV1::random()
+                .map_err(|_| "Cannot create an operation ID")?,
+            inventory: ManagementInventoryIdV1::parse("C31")
+                .map_err(|_| "Cannot verify the operation")?,
             scope: ManagementEffectScopeV1 {
                 project: self.effects.project_scope_hash(),
                 session: None,
@@ -93,21 +95,21 @@ impl WorkspaceChangeOwnerV1<'_> {
             },
             request_hash: ManagementEffectHashV1::digest(
                 &serde_json::to_vec(&(&preview.before, &preview.additions))
-                    .map_err(|_| "計画を確認できません")?,
+                    .map_err(|_| "Cannot verify the plan")?,
             ),
             rewind: ManagementRewindDispositionV1::IrreversibleLocal,
         };
         let PrepareManagementEffectOutcomeV1::Prepared(prepared) = self
             .effects
             .prepare(&lease, cursor, request)
-            .map_err(|_| "Git設定の管理効果を準備できません")?
+            .map_err(|_| "Cannot prepare the Git settings management effect")?
         else {
-            return Err("操作が既に記録されています".into());
+            return Err("The operation is already recorded".into());
         };
         if !accepted {
             self.effects
                 .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
-                .map_err(|_| "取消を記録できません")?;
+                .map_err(|_| "Cannot record cancellation")?;
             return Ok(None);
         }
         let fresh = match self.preview_git(current_plan) {
@@ -119,20 +121,20 @@ impl WorkspaceChangeOwnerV1<'_> {
                         &prepared,
                         ManagementDenialReasonV1::ResourceUnavailable,
                     )
-                    .map_err(|_| "拒否を記録できません")?;
+                    .map_err(|_| "Cannot record refusal")?;
                 return Err(error);
             }
         };
         if fresh.before != preview.before || fresh.additions != preview.additions {
             self.effects
                 .deny(&lease, &prepared, ManagementDenialReasonV1::StaleRequest)
-                .map_err(|_| "変更された計画の拒否を記録できません")?;
-            return Err(".gitignoreまたはGit配置が確認中に変更されました".into());
+                .map_err(|_| "Cannot record refusal of the changed plan")?;
+            return Err(".gitignore or Git layout changed during confirmation".into());
         }
         let started = self
             .effects
             .start(&lease, &prepared)
-            .map_err(|_| "開始を記録できません")?;
+            .map_err(|_| "Cannot record the start")?;
         let result = self.execute_git(&prepared, preview);
         match result {
             Ok(receipt) => {
@@ -142,7 +144,7 @@ impl WorkspaceChangeOwnerV1<'_> {
                         &started,
                         ManagementEffectHashV1::digest(receipt.postimage_hash.as_bytes()),
                     )
-                    .map_err(|_| "保存後の記録に失敗しました。再実行しないでください")?;
+                    .map_err(|_| "Recording failed after saving. Do not rerun")?;
                 Ok(Some(receipt))
             }
             Err(error) => {
@@ -152,7 +154,7 @@ impl WorkspaceChangeOwnerV1<'_> {
                         &started,
                         ManagementUnknownReasonV1::UnclassifiedEffect,
                     )
-                    .map_err(|_| "結果と管理効果が不明です。再実行しないでください")?;
+                    .map_err(|_| "The outcome and management effect are unknown. Do not rerun")?;
                 Err(error)
             }
         }
@@ -165,7 +167,7 @@ impl WorkspaceChangeOwnerV1<'_> {
     ) -> Result<GitRecipeReceiptV1, String> {
         let root = self.workspace.project_root();
         let (mut writer, _, session) =
-            recipe::session::open(root).map_err(|_| "既存recipe台帳を開けません")?;
+            recipe::session::open(root).map_err(|_| "Cannot open the existing recipe ledger")?;
         let run_id = format!("git-tidy-{}", prepared.operation_id().as_hex());
         let target = recipe::session::start_run_with_attempt(
             &mut writer,
@@ -173,10 +175,10 @@ impl WorkspaceChangeOwnerV1<'_> {
             &run_id,
             &prepared.operation_id().as_hex(),
         )
-        .map_err(|_| "recipe実行を記録できません")?;
+        .map_err(|_| "Cannot record recipe execution")?;
         let operation =
             recipe::session::operation(&format!("gitignore-{}", prepared.operation_id().as_hex()))
-                .map_err(|_| "recipe操作を確認できません")?;
+                .map_err(|_| "Cannot verify the recipe operation")?;
         writer
             .record_recipe_intent(
                 &target,
@@ -196,7 +198,7 @@ impl WorkspaceChangeOwnerV1<'_> {
                     environment: std::env::consts::OS.into(),
                 },
             )
-            .map_err(|_| "recipe intentを保存できません")?;
+            .map_err(|_| "Cannot save recipe intent")?;
         let rules = preview
             .additions
             .iter()
@@ -216,7 +218,7 @@ impl WorkspaceChangeOwnerV1<'_> {
                 ),
             },
             Err(_) => recipe::confirm::Verdict::Unknown {
-                reason: "保存結果を確認できません".into(),
+                reason: "Cannot verify the saved result".into(),
             },
         };
         let terminal = recipe::confirm::terminal(
@@ -230,15 +232,15 @@ impl WorkspaceChangeOwnerV1<'_> {
         );
         writer
             .record_recipe_terminal(&target, &operation, terminal)
-            .map_err(|_| "recipe終端を保存できません")?;
+            .map_err(|_| "Cannot save the recipe terminal state")?;
         let result_id = polaris_desktop_protocol::ids::ResultId::new(format!(
             "gitignore-{}",
             prepared.operation_id().as_hex()
         ))
-        .map_err(|_| "recipe結果IDを確認できません")?;
+        .map_err(|_| "Cannot verify the recipe result ID")?;
         writer
             .record_operation_result(&target, &operation, result_id.clone())
-            .map_err(|_| "recipe結果を記録できません")?;
+            .map_err(|_| "Cannot record the recipe result")?;
         writer
             .finish(
                 &target,
@@ -249,8 +251,9 @@ impl WorkspaceChangeOwnerV1<'_> {
                 },
                 result_id,
             )
-            .map_err(|_| "recipe実行の終端を保存できません")?;
-        let after = written.map_err(|_| "Git設定の保存結果が不明です。再実行しません")?;
+            .map_err(|_| "Cannot save the recipe execution terminal state")?;
+        let after = written
+            .map_err(|_| "The Git settings save outcome is unknown. It will not be rerun")?;
         Ok(GitRecipeReceiptV1 {
             run_id,
             attempt_id: target.attempt_id.as_str().to_owned(),
@@ -262,13 +265,13 @@ impl WorkspaceChangeOwnerV1<'_> {
 
 pub fn nextjs_plan(root: &Path) -> Result<recipe::Plan, String> {
     // Read-only planning does not create a recipe ledger or run install.
-    let directory =
-        crate::project_mutation::open_directory_nofollow(root).map_err(|_| "対象を開けません")?;
+    let directory = crate::project_mutation::open_directory_nofollow(root)
+        .map_err(|_| "Cannot open the target")?;
     let has = |name: &str,
                registry: &polaris_auth::protection::ProtectedPathsSnapshot|
      -> Result<bool, String> {
         use std::os::fd::{AsRawFd, FromRawFd};
-        let name = std::ffi::CString::new(name).map_err(|_| "対象名を確認できません")?;
+        let name = std::ffi::CString::new(name).map_err(|_| "Cannot verify the target name")?;
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -280,11 +283,11 @@ pub fn nextjs_plan(root: &Path) -> Result<recipe::Plan, String> {
             return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
                 Ok(false)
             } else {
-                Err("manifestまたはlockfileを安全に確認できません".into())
+                Err("Cannot safely verify the manifest or lockfile".into())
             };
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata().map_err(|_| "manifestを確認できません")?;
+        let metadata = file.metadata().map_err(|_| "Cannot verify the manifest")?;
         if !metadata.is_file()
             || metadata.nlink() != 1
             || metadata.len() > 1024 * 1024
@@ -293,7 +296,7 @@ pub fn nextjs_plan(root: &Path) -> Result<recipe::Plan, String> {
                 .iter()
                 .any(|protected| protected.dev == metadata.dev() && protected.ino == metadata.ino())
         {
-            return Err("manifestまたはlockfileが表示条件を満たしません".into());
+            return Err("The manifest or lockfile does not meet display requirements".into());
         }
         Ok(true)
     };
@@ -310,7 +313,7 @@ pub fn nextjs_plan(root: &Path) -> Result<recipe::Plan, String> {
                 .iter()
                 .any(|protected| path.starts_with(protected))
             {
-                return Err("保護対象のmanifestは読み取りません".into());
+                return Err("Protected manifests will not be read".into());
             }
         }
         let has_manifest = has("package.json", registry)?;
@@ -334,5 +337,5 @@ pub fn nextjs_plan(root: &Path) -> Result<recipe::Plan, String> {
             },
         ))
     })
-    .map_err(|_| "認証保護を確認できません")?
+    .map_err(|_| "Cannot verify authentication protection")?
 }

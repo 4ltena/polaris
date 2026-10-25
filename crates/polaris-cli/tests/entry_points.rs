@@ -62,7 +62,7 @@ fn two_copies_of_the_same_work_are_reported_and_an_unrelated_folder_is_not() {
     assert!(ok, "{text}");
     assert!(text.contains('a') && text.contains('b'), "{text}");
     assert!(
-        text.contains("移動も削除も行いません"),
+        text.contains("Nothing is moved or deleted"),
         "a suggestion must not read as an instruction: {text}"
     );
     // Nothing is moved or removed by looking.
@@ -78,7 +78,7 @@ fn folders_with_nothing_in_common_come_back_as_nothing_to_look_at() {
     write(dir.path(), "b/only-there.py", "y");
     let (ok, text) = run(&["compare", "a", "b"], dir.path());
     assert!(ok, "{text}");
-    assert!(text.contains("似ているフォルダはありません"), "{text}");
+    assert!(text.contains("No similar folders found"), "{text}");
 }
 
 #[test]
@@ -110,9 +110,9 @@ fn the_handoff_names_the_generation_and_the_files_git_says_changed() {
         text.contains("- new.txt"),
         "an untracked file is still something to try: {text}"
     );
-    assert!(text.contains("実装世代: run "), "{text}");
+    assert!(text.contains("Implementation generation: run "), "{text}");
     assert!(
-        text.contains("実機での合格は含まない"),
+        text.contains("does not establish acceptance on a real device"),
         "the prompt must not read as a passing result: {text}"
     );
 }
@@ -132,7 +132,7 @@ fn a_run_that_changed_nothing_produces_no_handoff() {
         &root,
     );
     assert!(!ok, "{text}");
-    assert!(text.contains("変更されたファイルがありません"), "{text}");
+    assert!(text.contains("No changed files"), "{text}");
 }
 
 #[test]
@@ -142,15 +142,15 @@ fn spare_quota_is_refused_for_the_reason_that_actually_applies() {
     // until it is given.
     let (ok, text) = run(&["spare"], dir.path());
     assert!(ok, "{text}");
-    assert!(text.contains("許可されていません"), "{text}");
+    assert!(text.contains("not authorized"), "{text}");
 
     // With permission, the missing quota reading stops it — and that is the
     // intended state until a real account provides one.
     let (ok, text) = run(&["spare", "--allow", "--candidates", "3"], dir.path());
     assert!(ok, "{text}");
     assert!(
-        text.contains("利用枠の読み取りがありません"),
+        text.contains("No usage limit observation"),
         "a missing reading must never be read as spare quota: {text}"
     );
-    assert!(!text.contains("始められます"), "{text}");
+    assert!(!text.contains("permits cleanup"), "{text}");
 }

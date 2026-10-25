@@ -18,13 +18,15 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
         return if p.state.inherited_turn_count.get() == 0 {
             Ok(())
         } else {
-            Err(StoreError::Corrupt("継承原文の記憶owner不在"))
+            Err(StoreError::Corrupt(
+                "No memory owner for inherited source text",
+            ))
         };
     };
     if m.ancestors.len() > 1_024
         || (p.state.inherited_turn_count.get() > 0 && m.ancestors.is_empty())
     {
-        return Err(StoreError::Corrupt("祖先記憶の範囲"));
+        return Err(StoreError::Corrupt("Ancestor memory range"));
     }
     let mut seen = BTreeSet::new();
     for ancestor in &m.ancestors {
@@ -44,7 +46,9 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
             || !valid_ids(&ancestor.summary_ids, "strict10-")
             || !valid_ids(&ancestor.structured_ids, "structured10-")
         {
-            return Err(StoreError::Corrupt("固定祖先の識別子・公開範囲"));
+            return Err(StoreError::Corrupt(
+                "Pinned ancestor identity or publication range",
+            ));
         }
     }
     capacity(p, None, None)
@@ -54,7 +58,7 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
 /// reuse their existing reservation and therefore do not call this function.
 pub(super) fn reserve(p: &Published, turn: u64, raw_hash: &str) -> StoreResult<()> {
     if !hash(raw_hash) || turn == 0 {
-        return Err(StoreError::Corrupt("記憶の新規許可範囲"));
+        return Err(StoreError::Corrupt("Newly authorized memory range"));
     }
     let summary = format!("strict10-{turn}-{}", &raw_hash[..16]);
     let structured = (p.state.configuration.history_mode == HistoryMode::Structured10)
@@ -146,7 +150,9 @@ pub(in crate::desktop_store) fn validate_transition(
     if before.inherited_turn_count != after.inherited_turn_count
         || ancestors(before) != ancestors(after)
     {
-        return Err(StoreError::Corrupt("継承原文・固定祖先の変更"));
+        return Err(StoreError::Corrupt(
+            "Inherited source text or pinned ancestor changed",
+        ));
     }
     Ok(())
 }

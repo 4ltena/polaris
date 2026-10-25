@@ -11,39 +11,39 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("保存I/O: {0}")]
+    #[error("Storage I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("保存形式: {0}")]
+    #[error("Storage format: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("不正な公開状態: {0}")]
+    #[error("Invalid published state: {0}")]
     Corrupt(&'static str),
-    #[error("関連要約の処理上限: {0}")]
+    #[error("Related summarization processing limit: {0}")]
     RelatedSummaryBudget(polaris_memory::conversation::RelatedSummaryBudget),
-    #[error("未対応の保存版: {0}")]
+    #[error("Unsupported storage version: {0}")]
     UnsupportedVersion(u32),
-    #[error("このOSの原子的置換・directory sync・私用領域は未対応")]
+    #[error("Atomic replacement, directory sync, or private storage unsupported on this OS")]
     UnsupportedPlatform,
-    #[error("別writerが所有しています")]
+    #[error("Owned by another writer")]
     Busy,
-    #[error("公開状態の再照合が必要です")]
+    #[error("Published state requires reconciliation")]
     RecoveryRequired,
-    #[error("削除済みsessionです")]
+    #[error("The session was deleted")]
     Deleted,
-    #[error("対象session/projectが一致しません")]
+    #[error("Target session or project mismatch")]
     TargetMismatch,
-    #[error("未対応の変更methodです")]
+    #[error("Unsupported mutation method")]
     UnsupportedMethod,
-    #[error("期待版が一致しません: {0}")]
+    #[error("Expected revision mismatch: {0}")]
     CasConflict(&'static str),
-    #[error("要求IDが異なる内容に再利用されました")]
+    #[error("Request ID reused for different content")]
     RequestConflict,
-    #[error("run/attempt/operation/結果が競合しています")]
+    #[error("Conflicting run, attempt, operation, or outcome")]
     RunConflict,
-    #[error("対象が存在しません")]
+    #[error("Target does not exist")]
     NotFound,
-    #[error("値の範囲超過")]
+    #[error("Value out of range")]
     Overflow,
-    #[error("SessionManager容量不足: {0}")]
+    #[error("Insufficient SessionManager capacity: {0}")]
     Capacity(&'static str),
 }
 

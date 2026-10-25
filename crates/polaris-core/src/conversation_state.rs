@@ -203,7 +203,7 @@ impl SavedWorkflowConfigV1 {
 
     fn validate(&self) -> io::Result<()> {
         if self.schema_version != SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION {
-            return Err(invalid("未対応のworkflow設定保存形式です"));
+            return Err(invalid("Unsupported workflow configuration storage format"));
         }
         Ok(())
     }
@@ -302,15 +302,15 @@ impl ConversationStateV2 {
                 .as_ref()
                 .is_some_and(|config| config.validate().is_err())
         {
-            return Err(invalid("未対応のセッション保存形式です"));
+            return Err(invalid("Unsupported session storage format"));
         }
         self.workflow_artifacts
             .validate()
-            .map_err(|_| invalid("workflow artifact graphが不正です"))?;
+            .map_err(|_| invalid("Invalid workflow artifact graph"))?;
         if let Some(checkpoint) = &self.verification_checkpoint {
             checkpoint
                 .validate()
-                .map_err(|_| invalid("verification checkpointが不正です"))?;
+                .map_err(|_| invalid("Invalid verification checkpoint"))?;
         }
         if self.admission_receipts.len() > MAX_ADMISSION_RECEIPTS
             || self.admission_receipts.iter().any(|(id, receipt)| {
@@ -320,12 +320,12 @@ impl ConversationStateV2 {
                     || receipt.turn_id == 0
             })
         {
-            return Err(invalid("admission receiptが不正です"));
+            return Err(invalid("Invalid admission receipt"));
         }
         if let Some(reference) = &self.workflow.active_change_contract {
             self.workflow_artifacts
                 .approved_routine_contract(reference)
-                .map_err(|_| invalid("active change contractが不正です"))?;
+                .map_err(|_| invalid("Invalid active change contract"))?;
         }
         if self.project_id.is_empty()
             || !valid_session_id(&self.session_id)
@@ -376,7 +376,7 @@ impl ConversationStateV2 {
                         != ancestor.visible_structured_publication_ids.len()
             })
         {
-            return Err(invalid("セッション状態の識別子・範囲が不正です"));
+            return Err(invalid("Invalid session state identifiers or range"));
         }
         Ok(())
     }
@@ -448,9 +448,9 @@ impl ConversationSnapshot {
                 .events
                 .iter()
                 .find(|event| event.sequence == receipt.sequence)
-                .ok_or_else(|| invalid("admission receiptの原文がありません"))?;
+                .ok_or_else(|| invalid("Missing admission receipt source text"))?;
             if !event.starts_turn || event.turn_id != receipt.turn_id {
-                return Err(invalid("admission receiptの原文境界が不正です"));
+                return Err(invalid("Invalid admission receipt source boundary"));
             }
         }
         Ok(())
@@ -462,7 +462,7 @@ pub(crate) fn validate_complete_turn_events<'a>(
 ) -> io::Result<()> {
     let mut events = events.peekable();
     if !events.peek().is_some_and(|event| event.starts_turn) {
-        return Err(invalid("原文ターンがありません"));
+        return Err(invalid("Missing original turn"));
     }
     validate_complete_messages(events.map(|event| &event.message))
 }
@@ -476,11 +476,11 @@ pub(crate) fn validate_complete_messages<'a>(
     let mut seen = BTreeSet::new();
     for msg in messages {
         if !pending.is_empty() && msg.role != Role::Tool {
-            return Err(invalid("tool結果が未完了です"));
+            return Err(invalid("Tool result is incomplete"));
         }
         for call in &msg.tool_calls {
             if msg.role != Role::Assistant || call.id.is_empty() || !seen.insert(call.id.clone()) {
-                return Err(invalid("tool呼出しIDが不正です"));
+                return Err(invalid("Invalid tool call ID"));
             }
             pending.insert(call.id.clone());
         }
@@ -490,14 +490,14 @@ pub(crate) fn validate_complete_messages<'a>(
                 .as_ref()
                 .is_some_and(|id| pending.remove(id))
             {
-                return Err(invalid("対応しないtool結果です"));
+                return Err(invalid("Unmatched tool result"));
             }
         } else if msg.tool_call_id.is_some() {
-            return Err(invalid("tool以外に結果IDがあります"));
+            return Err(invalid("Result ID on a non-tool message"));
         }
     }
     if !pending.is_empty() {
-        return Err(invalid("tool結果が未完了です"));
+        return Err(invalid("Tool result is incomplete"));
     }
     Ok(())
 }
@@ -524,7 +524,7 @@ impl ConversationStore {
             || !state.visible_structured_publication_ids.is_empty()
             || state.structured_coverage.is_some()
         {
-            return Err(invalid("新規セッションの状態が不正です"));
+            return Err(invalid("Invalid new session state"));
         }
         let windows = WindowsConversationStore::create(data_root, &state.session_id)?;
         windows.atomic_write("state.json", &serde_json::to_vec(&state)?)?;
@@ -545,7 +545,7 @@ impl ConversationStore {
         read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
     ) -> io::Result<Self> {
         if !valid_session_id(session_id) {
-            return Err(invalid("セッションIDが不正です"));
+            return Err(invalid("Invalid session ID"));
         }
         let store = Self {
             directory: data_root.join("sessions-v2").join(session_id),
@@ -587,7 +587,7 @@ impl ConversationStore {
             || !state.visible_structured_publication_ids.is_empty()
             || state.structured_coverage.is_some()
         {
-            return Err(invalid("新規セッションの状態が不正です"));
+            return Err(invalid("Invalid new session state"));
         }
         let root = data_root.join("sessions-v2");
         fs::create_dir_all(&root)?;
@@ -612,7 +612,7 @@ impl ConversationStore {
     pub fn create(_data_root: &Path, _state: ConversationStateV2) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformでは会話保存の保護を確認できません",
+            "Cannot verify conversation storage protections on this platform",
         ))
     }
 
@@ -629,7 +629,7 @@ impl ConversationStore {
         read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
     ) -> io::Result<Self> {
         if !valid_session_id(session_id) {
-            return Err(invalid("セッションIDが不正です"));
+            return Err(invalid("Invalid session ID"));
         }
         let directory = data_root.join("sessions-v2").join(session_id);
         reject_symlink(&data_root.join("sessions-v2"))?;
@@ -652,7 +652,7 @@ impl ConversationStore {
     ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformでは会話保存の保護を確認できません",
+            "Cannot verify conversation storage protections on this platform",
         ))
     }
     pub fn directory(&self) -> &Path {
@@ -669,12 +669,10 @@ impl ConversationStore {
         let path = self.directory.join("rewind-branch-v1.json");
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(invalid("セッション内のsymlinkは使用できません"));
+                return Err(invalid("Symlinks within sessions are not allowed"));
             }
             Ok(metadata) if !metadata.file_type().is_file() => {
-                return Err(invalid(
-                    "rewind branch metadataが通常ファイルではありません",
-                ));
+                return Err(invalid("Rewind branch metadata is not a regular file"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -710,7 +708,9 @@ impl ConversationStore {
         let binding: WorkspaceHeadBindingV1 = serde_json::from_slice(&fs::read(path)?)?;
         validate_workspace_head_binding(&binding)?;
         if binding.project_id != self.project_id || binding.session_id != self.session_id {
-            return Err(invalid("作業ファイルの結び付け先が会話と一致しません"));
+            return Err(invalid(
+                "Workspace file binding does not match the conversation",
+            ));
         }
         Ok(Some(binding))
     }
@@ -735,7 +735,9 @@ impl ConversationStore {
         permit: crate::rewind_workspace::PendingLegacyBindingPermit<'_>,
     ) -> io::Result<()> {
         if permit.session_id() != self.session_id {
-            return Err(invalid("旧会話の結び付け予約と会話IDが一致しません"));
+            return Err(invalid(
+                "Legacy conversation binding reservation does not match the conversation ID",
+            ));
         }
         self.write_workspace_head_binding(expected, manifest_id, true)
     }
@@ -758,7 +760,7 @@ impl ConversationStore {
             || current.raw_hash != current.state.raw_commit_hash
         {
             return Err(invalid(
-                "会話が変更されたため作業ファイルへ結び付けられません",
+                "Cannot bind workspace files because the conversation changed",
             ));
         }
         if let Some(turn) = current.active_turns().last() {
@@ -784,7 +786,9 @@ impl ConversationStore {
                 || existing.raw_commit_offset != binding.raw_commit_offset
                 || existing.raw_commit_hash != binding.raw_commit_hash
             {
-                return Err(invalid("会話には既に別の作業ファイルが結び付いています"));
+                return Err(invalid(
+                    "The conversation is already bound to different workspace files",
+                ));
             }
         }
         atomic_write(
@@ -801,7 +805,7 @@ impl ConversationStore {
         raw_hash: &str,
     ) -> io::Result<ConversationSnapshot> {
         if !valid_hash(raw_hash) {
-            return Err(invalid("原文snapshot hashが不正です"));
+            return Err(invalid("Invalid source snapshot hash"));
         }
         let path = self
             .directory
@@ -829,7 +833,7 @@ impl ConversationStore {
         self.directory
             .parent()
             .and_then(Path::parent)
-            .ok_or_else(|| invalid("セッション保存先が不正です"))
+            .ok_or_else(|| invalid("Invalid session storage location"))
     }
     #[cfg(unix)]
     pub fn lock(&self) -> io::Result<LockedConversation<'_>> {
@@ -846,7 +850,7 @@ impl ConversationStore {
     pub fn lock(&self) -> io::Result<LockedConversation<'_>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformでは会話保存の保護を確認できません",
+            "Cannot verify conversation storage protections on this platform",
         ))
     }
 }
@@ -882,7 +886,9 @@ impl LockedConversation<'_> {
         if snapshot.raw_offset != snapshot.state.raw_commit_offset
             || snapshot.raw_hash != snapshot.state.raw_commit_hash
         {
-            return Err(invalid("rewind境界の原文markerが未確定です"));
+            return Err(invalid(
+                "The rewind boundary source marker is not finalized",
+            ));
         }
         if let Some(turn) = snapshot.active_turns().last() {
             snapshot.validate_complete_turn(*turn)?;
@@ -892,13 +898,13 @@ impl LockedConversation<'_> {
             .iter()
             .any(|boundary| boundary.completion.is_none() && boundary.abandoned_reason.is_none())
         {
-            return Err(invalid("未完了のrewind境界があります"));
+            return Err(invalid("An incomplete rewind boundary exists"));
         }
         let target_turn_id = snapshot.events.last().map_or(Ok(1), |event| {
             event
                 .turn_id
                 .checked_add(1)
-                .ok_or_else(|| invalid("ターン番号が上限です"))
+                .ok_or_else(|| invalid("Turn number limit reached"))
         })?;
         let boundary = RewindBoundaryV1 {
             schema_version: REWIND_BOUNDARY_SCHEMA_VERSION,
@@ -940,26 +946,28 @@ impl LockedConversation<'_> {
         if snapshot.raw_offset != snapshot.state.raw_commit_offset
             || snapshot.raw_hash != snapshot.state.raw_commit_hash
         {
-            return Err(invalid("rewind境界のpost原文markerが未確定です"));
+            return Err(invalid(
+                "The rewind boundary post-source marker is not finalized",
+            ));
         }
         let mut boundaries = self.load_rewind_boundaries()?;
         let boundary = boundaries
             .iter_mut()
             .find(|boundary| boundary.boundary_id == boundary_id)
-            .ok_or_else(|| invalid("rewind境界がありません"))?;
+            .ok_or_else(|| invalid("No rewind boundary"))?;
         validate_rewind_boundary(boundary)?;
         if boundary.completion.is_some() {
-            return Err(invalid("rewind境界は既に完了しています"));
+            return Err(invalid("The rewind boundary is already complete"));
         }
         if boundary.abandoned_reason.is_some() {
-            return Err(invalid("rewind境界は破棄されています"));
+            return Err(invalid("The rewind boundary was discarded"));
         }
         if boundary.project_id != snapshot.state.project_id
             || boundary.session_id != snapshot.state.session_id
             || boundary.epoch != snapshot.state.epoch
             || snapshot.active_turns().last() != Some(&boundary.target_turn_id)
         {
-            return Err(invalid("rewind境界のターンが現在の終端ではありません"));
+            return Err(invalid("The rewind boundary turn is not the current end"));
         }
         snapshot.validate_complete_turn(boundary.target_turn_id)?;
         let user = snapshot
@@ -970,9 +978,9 @@ impl LockedConversation<'_> {
                     && event.turn_id == boundary.target_turn_id
                     && event.starts_turn
             })
-            .ok_or_else(|| invalid("rewind境界のuser入力がありません"))?;
+            .ok_or_else(|| invalid("Missing rewind boundary user input"))?;
         if user.message.role != Role::User {
-            return Err(invalid("rewind境界のuser入力が不正です"));
+            return Err(invalid("Invalid rewind boundary user input"));
         }
         boundary.user_message_preview = Some(rewind_message_preview(&user.message.content));
         boundary.completion = Some(RewindBoundaryCompletionV1 {
@@ -1002,10 +1010,10 @@ impl LockedConversation<'_> {
         let boundary = boundaries
             .iter_mut()
             .find(|boundary| boundary.boundary_id == boundary_id)
-            .ok_or_else(|| invalid("rewind境界がありません"))?;
+            .ok_or_else(|| invalid("No rewind boundary"))?;
         validate_rewind_boundary(boundary)?;
         if boundary.completion.is_some() || boundary.abandoned_reason.is_some() {
-            return Err(invalid("rewind境界は既に確定しています"));
+            return Err(invalid("The rewind boundary is already finalized"));
         }
         boundary.abandoned_reason = Some(reason);
         validate_rewind_boundary(boundary)?;
@@ -1082,7 +1090,7 @@ impl LockedConversation<'_> {
         new_id: &str,
     ) -> io::Result<ConversationStore> {
         if !valid_session_id(new_id) {
-            return Err(invalid("分岐セッションIDが不正です"));
+            return Err(invalid("Invalid fork session ID"));
         }
         let plan = self.plan_rewind_branch(boundary_id, new_id)?;
         self.create_rewind_branch_from_plan(data_root, plan)
@@ -1094,20 +1102,20 @@ impl LockedConversation<'_> {
         new_id: &str,
     ) -> io::Result<RewindCandidatePlan> {
         if !valid_session_id(new_id) {
-            return Err(invalid("分岐セッションIDが不正です"));
+            return Err(invalid("Invalid fork session ID"));
         }
         let current = self.snapshot()?;
         let boundary = self
             .list_rewind_boundaries()?
             .into_iter()
             .find(|boundary| boundary.boundary_id == boundary_id)
-            .ok_or_else(|| invalid("選択可能なrewind境界がありません"))?;
+            .ok_or_else(|| invalid("No selectable rewind boundaries"))?;
         validate_rewind_boundary_for_branch(&boundary, &current)?;
         let (expected, metadata) = rewind_branch_candidate_plan(&current, &boundary, new_id)?;
         let state_bytes = u64::try_from(serde_json::to_vec(&expected.state)?.len())
-            .map_err(|_| invalid("rewind候補stateが上限です"))?;
+            .map_err(|_| invalid("Rewind candidate state limit reached"))?;
         let metadata_bytes = u64::try_from(serde_json::to_vec(&metadata)?.len())
-            .map_err(|_| invalid("rewind候補metadataが上限です"))?;
+            .map_err(|_| invalid("Rewind candidate metadata limit reached"))?;
         Ok(RewindCandidatePlan {
             source_session_id: current.state.session_id.clone(),
             source_generation: current.state.generation,
@@ -1131,7 +1139,9 @@ impl LockedConversation<'_> {
             || current.raw_offset != plan.source_raw_offset
             || current.raw_hash != plan.source_raw_hash
         {
-            return Err(invalid("rewind候補の分岐元が計画後に変化しました"));
+            return Err(invalid(
+                "The rewind candidate source changed after planning",
+            ));
         }
         ConversationStore::create_rewind_candidate(data_root, plan.expected, &plan.metadata)
     }
@@ -1158,9 +1168,9 @@ impl ConversationStore {
         let source_snapshot = source_lock.snapshot_with_reader(read)?;
         let metadata = child
             .rewind_branch_metadata_with_reader(read)?
-            .ok_or_else(|| invalid("rewind候補にmetadataがありません"))?;
+            .ok_or_else(|| invalid("Missing rewind candidate metadata"))?;
         if metadata.origin_session_id != source_snapshot.state.session_id {
-            return Err(invalid("rewind候補の分岐元が一致しません"));
+            return Err(invalid("Rewind candidate source mismatch"));
         }
         let boundaries = source_lock.load_rewind_boundaries_with_reader(read)?;
         let matches: Vec<_> = boundaries
@@ -1168,13 +1178,17 @@ impl ConversationStore {
             .filter(|boundary| boundary.boundary_id == metadata.boundary_id)
             .collect();
         let [boundary] = matches.as_slice() else {
-            return Err(invalid("rewind候補の分岐元境界が一意ではありません"));
+            return Err(invalid(
+                "The rewind candidate source boundary is not unique",
+            ));
         };
         validate_rewind_boundary_for_candidate(boundary, &source_snapshot)?;
         let (expected, expected_metadata) =
             rewind_branch_candidate_plan(&source_snapshot, boundary, &child.session_id)?;
         if metadata != expected_metadata {
-            return Err(invalid("rewind候補のmetadataが分岐元証拠と一致しません"));
+            return Err(invalid(
+                "Rewind candidate metadata does not match source evidence",
+            ));
         }
 
         let child_lock = child.lock()?;
@@ -1185,18 +1199,20 @@ impl ConversationStore {
             || child_snapshot.state.history_mode != expected.state.history_mode
             || child_snapshot.state.ancestors != expected.state.ancestors
         {
-            return Err(invalid("rewind候補の会話状態が分岐証拠と一致しません"));
+            return Err(invalid(
+                "Rewind candidate conversation state does not match fork evidence",
+            ));
         }
         let raw_path = child.directory.join("raw.jsonl");
         reject_symlink(&raw_path)?;
         let raw = read(&raw_path)?;
         let initial_len = usize::try_from(expected.raw_offset)
-            .map_err(|_| invalid("rewind候補の原文範囲が不正です"))?;
+            .map_err(|_| invalid("Invalid rewind candidate source range"))?;
         if raw.len() < initial_len
             || content_hash(&raw[..initial_len]) != expected.raw_hash
             || child_snapshot.raw_offset < expected.raw_offset
         {
-            return Err(invalid("rewind候補の初期原文prefixが一致しません"));
+            return Err(invalid("Rewind candidate initial source prefix mismatch"));
         }
         Ok(metadata)
     }
@@ -1215,7 +1231,7 @@ impl ConversationStore {
             || metadata.branch_initial_raw_offset != expected.raw_offset
             || metadata.branch_initial_raw_hash != expected.raw_hash
         {
-            return Err(invalid("rewind候補の初期状態が不正です"));
+            return Err(invalid("Invalid rewind candidate initial state"));
         }
         let root = data_root.join("sessions-v2");
         fs::create_dir_all(&root)?;
@@ -1258,7 +1274,7 @@ impl ConversationStore {
     ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformでは会話保存の保護を確認できません",
+            "Cannot verify conversation storage protections on this platform",
         ))
     }
 }
@@ -1346,7 +1362,7 @@ impl LockedConversation<'_> {
         #[cfg(all(test, windows))]
         windows_state_admission(&state)?;
         if state.project_id != self.store.project_id || state.session_id != self.store.session_id {
-            return Err(invalid("セッションの所属が一致しません"));
+            return Err(invalid("Session ownership mismatch"));
         }
         let raw_path = self.store.directory.join("raw.jsonl");
         #[cfg(not(all(test, windows)))]
@@ -1372,19 +1388,19 @@ impl LockedConversation<'_> {
             event
                 .sequence
                 .checked_add(1)
-                .ok_or_else(|| invalid("イベント番号が上限です"))
+                .ok_or_else(|| invalid("Event number limit reached"))
         })?;
         let turn_id = if starts_turn {
             prior.map_or(Ok(1), |event| {
                 event
                     .turn_id
                     .checked_add(1)
-                    .ok_or_else(|| invalid("ターン番号が上限です"))
+                    .ok_or_else(|| invalid("Turn number limit reached"))
             })?
         } else {
             prior
                 .filter(|event| event.epoch == snapshot.state.epoch)
-                .ok_or_else(|| invalid("ユーザー入力より前の応答です"))?
+                .ok_or_else(|| invalid("Response precedes user input"))?
                 .turn_id
         };
         let event = RawEventV2 {
@@ -1437,7 +1453,7 @@ impl LockedConversation<'_> {
         if path.exists() {
             reject_symlink(&path)?;
             if fs::read(&path)? != body {
-                return Err(invalid("同じsnapshot IDの内容が異なります"));
+                return Err(invalid("Different content for the same snapshot ID"));
             }
         } else {
             atomic_write(&path, &body)?;
@@ -1451,7 +1467,7 @@ impl LockedConversation<'_> {
             || actual.raw_offset != expected.raw_offset
             || serde_json::to_vec(&actual.events)? != serde_json::to_vec(&expected.events)?
         {
-            return Err(invalid("要約処理中にセッションが変更されました"));
+            return Err(invalid("The session changed during summarization"));
         }
         Ok(())
     }
@@ -1470,7 +1486,7 @@ impl LockedConversation<'_> {
             || next.generation != expected.state.generation
             || next.history_mode != expected.state.history_mode
         {
-            return Err(invalid("公開対象の世代・所属が一致しません"));
+            return Err(invalid("Publication generation or ownership mismatch"));
         }
         self.publish_state_marker(expected, next)
     }
@@ -1485,7 +1501,7 @@ impl LockedConversation<'_> {
         next.generation = next
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("保存世代が上限です"))?;
+            .ok_or_else(|| invalid("Storage generation limit reached"))?;
         next.raw_commit_offset = expected.raw_offset;
         next.raw_commit_hash = expected.raw_hash.clone();
         let turns = expected.active_turns();
@@ -1532,7 +1548,9 @@ impl LockedConversation<'_> {
                 &serde_json::to_vec(&binding)?,
             )?;
             if self.store.workspace_head_binding()?.as_ref() != Some(&binding) {
-                return Err(invalid("公開後の作業ファイル対応を確認できません"));
+                return Err(invalid(
+                    "Cannot verify workspace file association after publication",
+                ));
             }
         }
         Ok(())
@@ -1550,7 +1568,7 @@ impl LockedConversation<'_> {
         let mut same_mode = next.clone();
         same_mode.history_mode = expected.state.history_mode;
         if !crate::session_settings::session_only_change(&expected.state, &same_mode) {
-            return Err(invalid("履歴モード初期化の保存候補が不正です"));
+            return Err(invalid("Invalid history mode initialization candidate"));
         }
         self.publish_state_marker(expected, next)
     }
@@ -1563,7 +1581,7 @@ impl LockedConversation<'_> {
         crate::session_settings::validate_empty_history(expected)?;
         if !self.load_rewind_boundaries()?.is_empty() {
             return Err(invalid(
-                "巻き戻し境界のある会話の履歴モードは変更できません",
+                "Cannot change the history mode of a conversation with rewind boundaries",
             ));
         }
         Ok(())
@@ -1575,11 +1593,11 @@ impl LockedConversation<'_> {
         next.epoch = next
             .epoch
             .checked_add(1)
-            .ok_or_else(|| invalid("epochが上限です"))?;
+            .ok_or_else(|| invalid("Epoch limit reached"))?;
         next.generation = next
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("保存世代が上限です"))?;
+            .ok_or_else(|| invalid("Storage generation limit reached"))?;
         next.raw_commit_hash = snapshot.raw_hash;
         next.raw_commit_offset = snapshot.raw_offset;
         next.recent_turn_ids.clear();
@@ -1614,22 +1632,22 @@ pub(crate) fn validate_coverage_boundary(
         || coverage.raw_offset > committed_offset
     {
         return Err(invalid(
-            "構造化記憶のcoverageが保存済み原文境界と一致しません",
+            "Structured memory coverage does not match the saved source boundary",
         ));
     }
     if bytes.len() as u64 != expected.raw_offset || content_hash(bytes) != expected.raw_hash {
-        return Err(invalid("構造化記憶のcoverage原文が一致しません"));
+        return Err(invalid("Structured memory coverage source mismatch"));
     }
     let covered = usize::try_from(coverage.raw_offset)
-        .map_err(|_| invalid("構造化記憶のcoverage範囲が不正です"))?;
+        .map_err(|_| invalid("Invalid structured memory coverage range"))?;
     if content_hash(&bytes[..covered]) != coverage.prefix_hash {
-        return Err(invalid("構造化記憶のcoverage hashが一致しません"));
+        return Err(invalid("Structured memory coverage hash mismatch"));
     }
     let mut offset = 0usize;
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         offset = offset
             .checked_add(line.len())
-            .ok_or_else(|| invalid("原文offsetが上限です"))?;
+            .ok_or_else(|| invalid("Source offset limit reached"))?;
         let event: RawEventV2 = serde_json::from_slice(line)?;
         if event.epoch == coverage.epoch
             && event.sequence == coverage.last_source_sequence
@@ -1638,7 +1656,7 @@ pub(crate) fn validate_coverage_boundary(
             return Ok(());
         }
     }
-    Err(invalid("構造化記憶のcoverage sourceが一致しません"))
+    Err(invalid("Structured memory coverage source mismatch"))
 }
 
 pub(crate) fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) -> io::Result<()> {
@@ -1648,7 +1666,7 @@ pub(crate) fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) 
         || (event.starts_turn && event.message.role != Role::User)
         || previous.is_none() && !event.starts_turn
     {
-        return Err(invalid("原文イベントの形式・順序が不正です"));
+        return Err(invalid("Invalid source event format or order"));
     }
     if let Some(previous) = previous
         && (event.epoch < previous.epoch
@@ -1656,7 +1674,7 @@ pub(crate) fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) 
             || (event.starts_turn && event.turn_id != previous.turn_id.saturating_add(1))
             || (!event.starts_turn && event.turn_id != previous.turn_id))
     {
-        return Err(invalid("原文のターン境界が不正です"));
+        return Err(invalid("Invalid original turn boundary"));
     }
     Ok(())
 }
@@ -1672,7 +1690,7 @@ pub(crate) fn valid_session_id(id: &str) -> bool {
 }
 fn validate_opaque_id(id: &str, name: &str) -> io::Result<()> {
     if id.is_empty() || id.len() > 256 || id.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(invalid(&format!("{name}が不正です")));
+        return Err(invalid(&format!("Invalid {name}")));
     }
     Ok(())
 }
@@ -1680,7 +1698,7 @@ fn validate_memory_raw_object_ids(ids: &[String]) -> io::Result<()> {
     if ids.iter().any(|id| !valid_hash(id))
         || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
     {
-        return Err(invalid("tool-memory raw object allowlistが不正です"));
+        return Err(invalid("Invalid tool-memory raw object allowlist"));
     }
     Ok(())
 }
@@ -1697,7 +1715,9 @@ fn validate_rewind_completion_input(
         || matches!(eligibility, RewindEligibilityV1::Ineligible { reason } if reason.is_empty() || reason.len() > 1024)
         || (matches!(eligibility, RewindEligibilityV1::Eligible) && detail.is_some())
     {
-        return Err(invalid("rewind境界のeligible/effect状態が不正です"));
+        return Err(invalid(
+            "Invalid rewind boundary eligibility or effect state",
+        ));
     }
     Ok(())
 }
@@ -1706,7 +1726,7 @@ fn validate_rewind_reason(reason: &str) -> io::Result<()> {
         || reason.len() > 1024
         || reason.bytes().any(|byte| byte.is_ascii_control())
     {
-        return Err(invalid("rewind境界の理由が不正です"));
+        return Err(invalid("Invalid rewind boundary reason"));
     }
     Ok(())
 }
@@ -1730,7 +1750,7 @@ fn validate_rewind_boundary(boundary: &RewindBoundaryV1) -> io::Result<()> {
         || (boundary.completion.is_some() && boundary.user_message_preview.is_none())
         || (boundary.completion.is_some() && boundary.abandoned_reason.is_some())
     {
-        return Err(invalid("rewind境界の保存内容が不正です"));
+        return Err(invalid("Invalid saved rewind boundary content"));
     }
     validate_opaque_id(&boundary.boundary_id, "rewind boundary ID")?;
     validate_opaque_id(
@@ -1749,7 +1769,7 @@ fn validate_rewind_boundary(boundary: &RewindBoundaryV1) -> io::Result<()> {
             || completion.completed_raw_offset < boundary.raw_offset
             || !valid_hash(&completion.completed_raw_hash)
         {
-            return Err(invalid("rewind境界の完了markerが不正です"));
+            return Err(invalid("Invalid rewind boundary completion marker"));
         }
     }
     if let Some(reason) = &boundary.abandoned_reason {
@@ -1765,14 +1785,16 @@ fn validate_rewind_boundary_for_branch(
     let completion = boundary
         .completion
         .as_ref()
-        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+        .ok_or_else(|| invalid("The rewind boundary is incomplete"))?;
     if !matches!(completion.eligibility, RewindEligibilityV1::Eligible)
         || boundary.project_id != current.state.project_id
         || boundary.session_id != current.state.session_id
         || boundary.epoch != current.state.epoch
         || boundary.raw_offset > current.raw_offset
     {
-        return Err(invalid("rewind境界が現在のセッションに適用できません"));
+        return Err(invalid(
+            "The rewind boundary does not apply to the current session",
+        ));
     }
     Ok(())
 }
@@ -1786,7 +1808,7 @@ pub(crate) fn decode_saved_snapshot(
     raw_hash: &str,
 ) -> io::Result<ConversationSnapshot> {
     if !valid_hash(raw_hash) {
-        return Err(invalid("原文snapshot hashが不正です"));
+        return Err(invalid("Invalid source snapshot hash"));
     }
     let snapshot: ConversationSnapshot = serde_json::from_slice(bytes)?;
     if snapshot.state.project_id != project_id
@@ -1795,7 +1817,9 @@ pub(crate) fn decode_saved_snapshot(
         || snapshot.raw_hash != raw_hash
         || snapshot.raw_offset > u64::try_from(usize::MAX).unwrap_or(u64::MAX)
     {
-        return Err(invalid("原文snapshotの所属・世代・hashが一致しません"));
+        return Err(invalid(
+            "Source snapshot ownership, generation, or hash mismatch",
+        ));
     }
     let mut raw = Vec::new();
     for event in &snapshot.events {
@@ -1803,7 +1827,7 @@ pub(crate) fn decode_saved_snapshot(
         raw.push(b'\n');
     }
     if raw.len() as u64 != snapshot.raw_offset || content_hash(&raw) != snapshot.raw_hash {
-        return Err(invalid("原文snapshot本文のhash・長さが一致しません"));
+        return Err(invalid("Source snapshot body hash or length mismatch"));
     }
     snapshot.state.validate()?;
     for (index, event) in snapshot.events.iter().enumerate() {
@@ -1812,7 +1836,7 @@ pub(crate) fn decode_saved_snapshot(
             index.checked_sub(1).and_then(|i| snapshot.events.get(i)),
         )?;
         if event.epoch > snapshot.state.epoch {
-            return Err(invalid("原文snapshotのepochが不正です"));
+            return Err(invalid("Invalid source snapshot epoch"));
         }
     }
     if let Some(coverage) = &snapshot.state.structured_coverage {
@@ -1826,16 +1850,16 @@ pub(crate) fn decode_raw_snapshot(
 ) -> io::Result<ConversationSnapshot> {
     state.validate()?;
     let committed =
-        usize::try_from(state.raw_commit_offset).map_err(|_| invalid("原文範囲が不正です"))?;
+        usize::try_from(state.raw_commit_offset).map_err(|_| invalid("Invalid source range"))?;
     if committed > bytes.len()
         || content_hash(&bytes[..committed]) != state.raw_commit_hash
         || (committed > 0 && bytes[committed - 1] != b'\n')
     {
-        return Err(invalid("保存済み原文のhashが一致しません"));
+        return Err(invalid("Saved source hash mismatch"));
     }
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         return Err(invalid(
-            "原文の末尾が未完了です。原文を保持して停止しました",
+            "The source tail is incomplete. Stopped with the original text retained",
         ));
     }
     let mut events = Vec::<RawEventV2>::new();
@@ -1846,7 +1870,7 @@ pub(crate) fn decode_raw_snapshot(
         let event: RawEventV2 = serde_json::from_slice(line)?;
         validate_event(&event, events.last())?;
         if event.epoch > state.epoch {
-            return Err(invalid("未公開epochの原文があります"));
+            return Err(invalid("Source text exists for an unpublished epoch"));
         }
         events.push(event);
     }
@@ -1877,12 +1901,12 @@ pub(crate) fn validate_migration_snapshot(snapshot: &ConversationSnapshot) -> io
         raw.push(b'\n');
     }
     let committed = usize::try_from(snapshot.state.raw_commit_offset)
-        .map_err(|_| invalid("原文範囲が不正です"))?;
+        .map_err(|_| invalid("Invalid source range"))?;
     if committed > raw.len()
         || content_hash(&raw[..committed]) != snapshot.state.raw_commit_hash
         || (committed > 0 && raw[committed - 1] != b"\n"[0])
     {
-        return Err(invalid("保存済み原文のhashが一致しません"));
+        return Err(invalid("Saved source hash mismatch"));
     }
     Ok(())
 }
@@ -1894,14 +1918,14 @@ pub(crate) fn decode_rewind_boundaries(bytes: &[u8]) -> io::Result<Vec<RewindBou
     for boundary in &boundaries {
         validate_rewind_boundary(boundary)?;
         if !ids.insert(&boundary.boundary_id) {
-            return Err(invalid("rewind境界IDが重複しています"));
+            return Err(invalid("Duplicate rewind boundary IDs"));
         }
         if let Some(previous) = previous
             && previous.project_id == boundary.project_id
             && previous.session_id == boundary.session_id
             && previous.source_generation > boundary.source_generation
         {
-            return Err(invalid("rewind境界の順序が不正です"));
+            return Err(invalid("Invalid rewind boundary order"));
         }
         previous = Some(boundary);
     }
@@ -1915,7 +1939,7 @@ pub(crate) fn validate_rewind_branch_metadata(metadata: &RewindBranchMetadataV1)
         || (metadata.branch_initial_raw_offset == 0
             && metadata.branch_initial_raw_hash != content_hash(&[]))
     {
-        return Err(invalid("rewind branch metadataが不正です"));
+        return Err(invalid("Invalid rewind branch metadata"));
     }
     validate_opaque_id(&metadata.boundary_id, "rewind boundary ID")?;
     validate_opaque_id(
@@ -1935,7 +1959,7 @@ pub(crate) fn validate_workspace_head_binding(binding: &WorkspaceHeadBindingV1) 
         || !valid_hash(&binding.raw_commit_hash)
         || (binding.raw_commit_offset == 0 && binding.raw_commit_hash != content_hash(&[]))
     {
-        return Err(invalid("作業ファイルの結び付け記録が不正です"));
+        return Err(invalid("Invalid workspace file binding record"));
     }
     validate_opaque_id(&binding.workspace_manifest_id, "workspace manifest ID")
 }
@@ -1961,7 +1985,7 @@ fn rewind_branch_candidate_plan(
     let completion = boundary
         .completion
         .as_ref()
-        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+        .ok_or_else(|| invalid("The rewind boundary is incomplete"))?;
     let mut state = ConversationStateV2::new(boundary.project_id.clone(), child_id.into())?;
     state.history_mode = boundary.source_state.history_mode;
     state.session_settings = boundary.source_state.session_settings.clone();
@@ -2010,7 +2034,7 @@ fn validate_rewind_boundary_for_candidate(
     let completion = boundary
         .completion
         .as_ref()
-        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+        .ok_or_else(|| invalid("The rewind boundary is incomplete"))?;
     if !matches!(completion.eligibility, RewindEligibilityV1::Eligible)
         || !matches!(completion.effect, RewindEffectStatusV1::NoExternalMutation)
         || boundary.project_id != source.state.project_id
@@ -2018,7 +2042,7 @@ fn validate_rewind_boundary_for_candidate(
         || boundary.source_generation != boundary.source_state.generation
         || boundary.raw_offset > source.raw_offset
     {
-        return Err(invalid("rewind候補の分岐元境界が不正です"));
+        return Err(invalid("Invalid rewind candidate source boundary"));
     }
     Ok(())
 }
@@ -2034,12 +2058,12 @@ fn expected_rewind_snapshot(
         if source_event.starts_turn {
             turn_id = turn_id
                 .checked_add(1)
-                .ok_or_else(|| invalid("分岐先のターン番号が上限です"))?;
+                .ok_or_else(|| invalid("Fork turn number limit reached"))?;
         }
         let event = RawEventV2 {
             schema_version: SCHEMA_VERSION,
             sequence: u64::try_from(index + 1)
-                .map_err(|_| invalid("分岐先のイベント番号が上限です"))?,
+                .map_err(|_| invalid("Fork event number limit reached"))?,
             epoch: 0,
             turn_id,
             starts_turn: source_event.starts_turn,
@@ -2052,7 +2076,7 @@ fn expected_rewind_snapshot(
     }
     state.generation = 1;
     state.raw_commit_offset =
-        u64::try_from(raw.len()).map_err(|_| invalid("分岐先の原文長が上限です"))?;
+        u64::try_from(raw.len()).map_err(|_| invalid("Fork source length limit reached"))?;
     state.raw_commit_hash = content_hash(&raw);
     state.recent_turn_ids = events
         .iter()
@@ -2079,7 +2103,7 @@ fn raw_prefix_events(
         if expected_hash == content_hash(&[]) {
             return Ok(Vec::new());
         }
-        return Err(invalid("rewind原文prefixのhashが一致しません"));
+        return Err(invalid("Rewind source prefix hash mismatch"));
     }
     let mut raw = Vec::new();
     let mut prefix = Vec::new();
@@ -2087,7 +2111,9 @@ fn raw_prefix_events(
         serde_json::to_writer(&mut raw, event)?;
         raw.push(b'\n');
         if raw.len() as u64 > expected_offset {
-            return Err(invalid("rewind原文prefixがイベント境界にありません"));
+            return Err(invalid(
+                "The rewind source prefix is not on an event boundary",
+            ));
         }
         prefix.push(event.clone());
         if raw.len() as u64 == expected_offset {
@@ -2095,7 +2121,7 @@ fn raw_prefix_events(
         }
     }
     if raw.len() as u64 != expected_offset || content_hash(&raw) != expected_hash {
-        return Err(invalid("rewind原文prefixのhashが一致しません"));
+        return Err(invalid("Rewind source prefix hash mismatch"));
     }
     Ok(prefix)
 }
@@ -2113,9 +2139,10 @@ fn new_rewind_boundary_id() -> io::Result<String> {
 fn rewind_boundary_timestamp() -> io::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| invalid("rewind境界の時刻を取得できません"))
+        .map_err(|_| invalid("Cannot retrieve the rewind boundary timestamp"))
         .and_then(|duration| {
-            u64::try_from(duration.as_millis()).map_err(|_| invalid("rewind境界の時刻が上限です"))
+            u64::try_from(duration.as_millis())
+                .map_err(|_| invalid("Rewind boundary timestamp limit reached"))
         })
 }
 fn rewind_message_preview(content: &str) -> String {
@@ -2137,7 +2164,7 @@ fn fork_plan(
     if source.raw_hash != source.state.raw_commit_hash
         || source.raw_offset != source.state.raw_commit_offset
     {
-        return Err(invalid("分岐元の原文markerが未確定です"));
+        return Err(invalid("The fork source marker is not finalized"));
     }
     let turns = source.active_turns();
     let first = turns.get(turns.len().saturating_sub(REAL_TURN_WINDOW));
@@ -2185,12 +2212,12 @@ pub(crate) fn expected_fork_snapshot(
         if starts_turn {
             turn_id = turn_id
                 .checked_add(1)
-                .ok_or_else(|| invalid("分岐先のターン番号が上限です"))?;
+                .ok_or_else(|| invalid("Fork turn number limit reached"))?;
         }
         let event = RawEventV2 {
             schema_version: SCHEMA_VERSION,
             sequence: u64::try_from(index + 1)
-                .map_err(|_| invalid("分岐先のイベント番号が上限です"))?,
+                .map_err(|_| invalid("Fork event number limit reached"))?,
             epoch: 0,
             turn_id,
             starts_turn,
@@ -2204,7 +2231,7 @@ pub(crate) fn expected_fork_snapshot(
     let raw_hash = content_hash(&raw);
     state.generation = 1;
     state.raw_commit_offset =
-        u64::try_from(raw.len()).map_err(|_| invalid("分岐先の原文長が上限です"))?;
+        u64::try_from(raw.len()).map_err(|_| invalid("Fork source length limit reached"))?;
     state.raw_commit_hash = raw_hash.clone();
     state.recent_turn_ids = events
         .iter()
@@ -2237,7 +2264,7 @@ fn fail_point(_point: &str) -> io::Result<()> {
 }
 fn reject_symlink(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(invalid("セッション内のsymlinkは使用できません"));
+        return Err(invalid("Symlinks within sessions are not allowed"));
     }
     Ok(())
 }
@@ -2256,7 +2283,7 @@ fn private_directory(path: &Path) -> io::Result<()> {
 fn private_directory(_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "このplatformでは会話保存の保護を確認できません",
+        "Cannot verify conversation storage protections on this platform",
     ))
 }
 #[cfg(not(all(test, windows)))]
@@ -2277,7 +2304,9 @@ fn private_file(_path: &Path, _create: bool) -> io::Result<File> {
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().ok_or_else(|| invalid("保存先が不正です"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("Invalid storage location"))?;
     let temporary = parent.join(format!(
         ".pending-{}-{}",
         std::process::id(),
@@ -2298,7 +2327,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn windows_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "このWindows保存経路の保護は未対応です",
+        "This Windows storage path lacks protection support",
     )
 }
 #[cfg(all(test, windows))]
@@ -2457,7 +2486,7 @@ impl WindowsConversationStore {
     fn save_snapshot(&self, name: &std::ffi::OsStr, body: &[u8]) -> io::Result<()> {
         match Self::read_at(&self.snapshots, name) {
             Ok(existing) if existing == body => return Ok(()),
-            Ok(_) => return Err(invalid("同じsnapshot IDの内容が異なります")),
+            Ok(_) => return Err(invalid("Different content for the same snapshot ID")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -2478,7 +2507,7 @@ impl WindowsConversationStore {
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "snapshot公開先が既にあります",
+                "The snapshot publication destination already exists",
             ));
         }
         self.snapshots
@@ -2487,7 +2516,7 @@ impl WindowsConversationStore {
         fail_point("atomic_directory_sync")?;
         self.snapshots.sync_all().map_err(windows_error)?;
         if Self::read_at(&self.snapshots, name)? != body {
-            return Err(invalid("snapshot公開後の内容が異なります"));
+            return Err(invalid("Snapshot content differs after publication"));
         }
         Ok(())
     }

@@ -25,7 +25,7 @@ impl CliAdmission {
         let persistence = session
             .persistence
             .as_ref()
-            .ok_or("CLI入力にはv2セッションが必要です")?;
+            .ok_or("CLI input requires a v2 session")?;
         let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
         let current =
             SessionId::new(snapshot.state.session_id.clone()).map_err(|error| error.to_string())?;
@@ -45,7 +45,7 @@ impl CliAdmission {
         )?;
         if let Some(blocked) = state.outcome_unknown_blocker(&current) {
             return Err(format!(
-                "入力 {} の結果が不明です。この会話では新しい入力を開始できません",
+                "The outcome of input {} is unknown. New input cannot start in this conversation",
                 blocked.id.as_str()
             ));
         }
@@ -80,7 +80,7 @@ impl CliAdmission {
             .submit(request, state.revision)
             .map_err(|error| match error {
                 polaris_core::session_manager::AdmissionError::Capacity(_) => {
-                    "この会話の保存容量が不足しています。処理が静止したら --fork で継続してください"
+                    "This conversation has insufficient storage capacity. Continue with --fork once processing is idle"
                         .to_owned()
                 }
                 _ => error.to_string(),
@@ -113,7 +113,7 @@ impl CliAdmission {
             .check_receipt_capacity(&receipt_counts)
             .map_err(|error| match error {
                 polaris_core::session_manager::AdmissionError::Capacity(_) => {
-                    "この会話の保存容量が不足しています。処理が静止したら --fork で継続してください"
+                    "This conversation has insufficient storage capacity. Continue with --fork once processing is idle"
                         .to_owned()
                 }
                 _ => error.to_string(),
@@ -129,7 +129,7 @@ impl CliAdmission {
             )
             .map_err(|error| match error {
                 polaris_core::desktop_store::StoreError::Capacity(_) => {
-                    "この会話の保存容量が不足しています。処理が静止したら --fork で継続してください"
+                    "This conversation has insufficient storage capacity. Continue with --fork once processing is idle"
                         .to_owned()
                 }
                 _ => error.to_string(),
@@ -216,7 +216,7 @@ impl CliAdmission {
         };
         match admitted {
             Ok(true) => {}
-            Ok(false) => return Err("admission入力は既に保存されています".into()),
+            Ok(false) => return Err("The admitted input has already been saved".into()),
             Err(error) => {
                 self.mark_append_unknown()?;
                 return Err(error.to_string());
@@ -228,7 +228,7 @@ impl CliAdmission {
             .map_err(|error| error.to_string())?
             .clone();
         if !matches!(admission.state, AdmissionState::DestinationReady { .. }) {
-            return Err("CLI admission destinationが不正です".into());
+            return Err("Invalid CLI admission destination".into());
         }
         let before = self.state.revision;
         let appended = self
@@ -255,7 +255,7 @@ impl CliAdmission {
                 .store
                 .persist(before, &self.state)
                 .map_err(|error| error.to_string()),
-            _ => Err("CLI admission runを開始できません".into()),
+            _ => Err("Cannot start the CLI admission run".into()),
         }
     }
 

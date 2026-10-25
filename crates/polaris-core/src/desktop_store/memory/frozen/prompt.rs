@@ -55,7 +55,7 @@ impl<'a, 'b> Raw<'a, 'b> {
             self.finish_turn()?;
             self.turns = self.turns.checked_add(1).ok_or(StoreError::Overflow)?;
             if self.turns != event.turn_id {
-                return Err(StoreError::Corrupt("固定原文のrun位置"));
+                return Err(StoreError::Corrupt("Pinned source run position"));
             }
             self.selected = self
                 .turns
@@ -125,7 +125,9 @@ impl<'a, 'b> Raw<'a, 'b> {
                 .is_some()
                 && !self.attachment
             {
-                return Err(StoreError::Corrupt("固定原文のprompt補助不在"));
+                return Err(StoreError::Corrupt(
+                    "Missing pinned source prompt supplement",
+                ));
             }
             writer::validate_turn_suffix(&self.suffix, Observation::Cancelled)?;
         }
@@ -141,7 +143,7 @@ impl<'a, 'b> Raw<'a, 'b> {
             != Some(self.turns)
             || self.selected_count != self.collector.prompts.len()
         {
-            return Err(StoreError::Corrupt("固定原文のrun対応不在"));
+            return Err(StoreError::Corrupt("Missing pinned source run association"));
         }
         Ok(self.attachments)
     }

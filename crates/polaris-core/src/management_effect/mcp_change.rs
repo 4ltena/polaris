@@ -44,12 +44,12 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
     ) -> Result<Self, String> {
         let root = project_root
             .canonicalize()
-            .map_err(|_| "MCP projectを確認できません")?;
+            .map_err(|_| "Cannot verify the MCP project")?;
         if host.project() != crate::project::project_id(&root)
             || effects.project_scope_hash()
                 != ManagementEffectHashV1::digest(root.as_os_str().as_encoded_bytes())
         {
-            return Err("MCP hostと管理ownerのprojectが一致しません".into());
+            return Err("MCP host and management owner project mismatch".into());
         }
         Ok(Self {
             host,
@@ -63,20 +63,20 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
         server_id: &str,
         enabled: bool,
     ) -> Result<PreparedMcpRegistryChangeV1, String> {
-        let store = self.host.store().ok_or("MCP registryが存在しません")?;
+        let store = self.host.store().ok_or("MCP registry does not exist")?;
         let before = store
             .load_snapshot()
-            .map_err(|_| "MCP registryを読めません")?
+            .map_err(|_| "Cannot read the MCP registry")?
             .registry
-            .ok_or("MCP registryが存在しません")?;
+            .ok_or("MCP registry does not exist")?;
         let mut next = before.clone();
         let server = next
             .servers
             .iter_mut()
             .find(|server| server.server_id == server_id)
-            .ok_or("MCP serverが登録されていません")?;
+            .ok_or("MCP server is not registered")?;
         if server.enabled_projects.contains(self.host.project()) == enabled {
-            return Err("MCP serverは既に指定されたproject状態です".into());
+            return Err("MCP server already has the requested project state".into());
         }
         if enabled {
             server
@@ -84,19 +84,18 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                 .insert(self.host.project().to_owned());
             self.host
                 .validate(server)
-                .map_err(|_| "MCP serverはhostの入場検査に失敗しました")?;
+                .map_err(|_| "MCP server failed host admission checks")?;
         } else {
             server.enabled_projects.remove(self.host.project());
         }
         let destination = server
             .destination_hash()
-            .map_err(|_| "MCP destinationが無効です")?;
+            .map_err(|_| "Invalid MCP destination")?;
         next.revision = before
             .revision
             .checked_add(1)
-            .ok_or("MCP revisionの上限に達しました")?;
-        next.validate()
-            .map_err(|_| "MCP registryの変更が無効です")?;
+            .ok_or("MCP revision limit reached")?;
+        next.validate().map_err(|_| "Invalid MCP registry change")?;
         // The journal stores identities and hashes only, never secret values or references.
         let request_hash = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&(
@@ -106,13 +105,13 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                 before.revision,
                 destination,
             ))
-            .map_err(|_| "MCP requestが無効です")?,
+            .map_err(|_| "Invalid MCP request")?,
         );
         let request = PrepareManagementEffectV1 {
             operation_id: ManagementOperationIdV1::random()
-                .map_err(|_| "管理操作IDを確保できません")?,
+                .map_err(|_| "Cannot reserve a management operation ID")?,
             inventory: ManagementInventoryIdV1::parse(if enabled { "C22" } else { "C23" })
-                .map_err(|_| "inventoryが無効です")?,
+                .map_err(|_| "Invalid inventory")?,
             scope: ManagementEffectScopeV1 {
                 project: self.effects.project_scope_hash(),
                 session: None,
@@ -133,7 +132,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
             )
             .map_err(|e| e.to_string())?;
         let PrepareManagementEffectOutcomeV1::Prepared(effect) = outcome else {
-            return Err("MCP管理操作が既に存在します".into());
+            return Err("MCP management operation already exists".into());
         };
         Ok(PreparedMcpRegistryChangeV1 {
             before,
@@ -159,7 +158,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                 .map_err(|e| e.to_string())?;
             return Ok(None);
         }
-        let store = self.host.store().ok_or("MCP registryが存在しません")?;
+        let store = self.host.store().ok_or("MCP registry does not exist")?;
         match store.load_registry() {
             Ok(Some(current)) if current == prepared.before => {}
             Ok(_) => {
@@ -170,7 +169,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                         ManagementDenialReasonV1::StaleRequest,
                     )
                     .map_err(|e| e.to_string())?;
-                return Err("確認中にMCP registryが変更されました".into());
+                return Err("MCP registry changed during confirmation".into());
             }
             Err(_) => {
                 self.effects
@@ -180,7 +179,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                         ManagementDenialReasonV1::ResourceUnavailable,
                     )
                     .map_err(|e| e.to_string())?;
-                return Err("MCP registryを再確認できません".into());
+                return Err("Cannot recheck the MCP registry".into());
             }
         }
         if prepared.enabled {
@@ -189,7 +188,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                 .servers
                 .iter()
                 .find(|server| server.server_id == prepared.server_id)
-                .ok_or("MCP対象が存在しません")?;
+                .ok_or("MCP target does not exist")?;
             if self.host.validate(server).is_err() {
                 self.effects
                     .deny(
@@ -198,7 +197,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                         ManagementDenialReasonV1::PermissionDenied,
                     )
                     .map_err(|e| e.to_string())?;
-                return Err("MCP serverがhostの入場検査を通過できなくなりました".into());
+                return Err("MCP server no longer passes host admission checks".into());
             }
         }
         let started = self
@@ -219,7 +218,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                     ManagementUnknownReasonV1::UnclassifiedEffect,
                 )
                 .map_err(|e| e.to_string())?;
-            return Err("MCP操作の結果が不明です。registryを確認するまで再実行しません".into());
+            return Err("MCP operation outcome is unknown. It will not be rerun until the registry is checked".into());
         }
         let receipt = ManagementEffectHashV1::digest(
             format!(
@@ -241,7 +240,7 @@ impl<'a> McpRegistryChangeOwnerV1<'a> {
                 &started,
                 ManagementUnknownReasonV1::ReceiptPersistenceFailed,
             );
-            return Err("MCP registryは保存済みですが管理receiptが不明です".into());
+            return Err("MCP registry saved, but the management receipt is unknown".into());
         }
         Ok(Some(prepared.next.revision))
     }

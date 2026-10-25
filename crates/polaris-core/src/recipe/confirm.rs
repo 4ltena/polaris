@@ -56,7 +56,7 @@ pub fn confirm(project_root: &Path, condition: &Postcondition, output: &str) -> 
             let answer = output.trim();
             if answer.is_empty() {
                 return Verdict::NotMet {
-                    missing: "パッケージ管理ツールが版を返しませんでした".into(),
+                    missing: "The package manager returned no version".into(),
                 };
             }
             Verdict::Met {
@@ -67,12 +67,12 @@ pub fn confirm(project_root: &Path, condition: &Postcondition, output: &str) -> 
             let path = project_root.join("package.json");
             let Ok(body) = std::fs::read_to_string(&path) else {
                 return Verdict::Unknown {
-                    reason: "package.json を読めませんでした".into(),
+                    reason: "Could not read package.json".into(),
                 };
             };
             let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) else {
                 return Verdict::Unknown {
-                    reason: "package.json を解釈できませんでした".into(),
+                    reason: "Could not parse package.json".into(),
                 };
             };
             // A package counts as present only where a version is recorded
@@ -91,7 +91,10 @@ pub fn confirm(project_root: &Path, condition: &Postcondition, output: &str) -> 
                 .collect();
             if !missing.is_empty() {
                 return Verdict::NotMet {
-                    missing: format!("package.json に無い依存: {}", missing.join(", ")),
+                    missing: format!(
+                        "Dependencies missing from package.json: {}",
+                        missing.join(", ")
+                    ),
                 };
             }
             Verdict::Met {
@@ -104,20 +107,20 @@ pub fn confirm(project_root: &Path, condition: &Postcondition, output: &str) -> 
             match std::fs::symlink_metadata(&path) {
                 Ok(held) if held.is_dir() == wanted_directory && !held.file_type().is_symlink() => {
                     Verdict::Met {
-                        evidence: format!("{name} がある"),
+                        evidence: format!("{name} exists"),
                     }
                 }
                 // Something is there but not what the step should have made.
                 Ok(_) => Verdict::NotMet {
-                    missing: format!("{name} が期待した種類ではありません"),
+                    missing: format!("{name} has an unexpected type"),
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Verdict::NotMet {
-                    missing: format!("{name} がありません"),
+                    missing: format!("{name} is missing"),
                 },
                 // Permission, a broken mount, anything else: not the same as
                 // the step having failed.
                 Err(_) => Verdict::Unknown {
-                    reason: format!("{name} を読めませんでした"),
+                    reason: format!("Could not read {name}"),
                 },
             }
         }

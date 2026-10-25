@@ -187,7 +187,7 @@ impl HomeBrowser {
             self.listings.clear();
             return Err(failure(
                 ErrorCode::RevisionConflict,
-                "ホームフォルダが変更されました。再接続してください。",
+                "The home folder changed. Reconnect.",
             ));
         }
         Ok(())
@@ -228,7 +228,7 @@ impl HomeBrowser {
                     let conflict = || {
                         failure(
                             ErrorCode::RevisionConflict,
-                            "一覧の続きが失効しました。読み込み直してください。",
+                            "The listing continuation expired. Reload.",
                         )
                     };
                     let index = self
@@ -291,7 +291,7 @@ impl HomeBrowser {
         .unwrap_or_else(|_| {
             Err(failure(
                 ErrorCode::PermissionDenied,
-                "認証保護を確認できませんでした。",
+                "Could not verify authentication protection.",
             ))
         })
     }
@@ -302,13 +302,13 @@ impl HomeBrowser {
         registry: &ProtectedPathsSnapshot,
     ) -> Result<Listing, ProtocolError> {
         let unavailable = |e: std::io::Error| match e.raw_os_error() {
-            Some(libc::ENOENT) => failure(ErrorCode::NotFound, "フォルダが見つかりません。"),
-            _ => failure(ErrorCode::PermissionDenied, "フォルダを開けません。"),
+            Some(libc::ENOENT) => failure(ErrorCode::NotFound, "Folder not found."),
+            _ => failure(ErrorCode::PermissionDenied, "Cannot open the folder."),
         };
         let directory = self.directory(relative, registry).map_err(unavailable)?;
         let before = Stamp::from(&directory.metadata().map_err(unavailable)?);
         let (names, truncated) = names(&directory, self.entry_limit)
-            .map_err(|()| failure(ErrorCode::PermissionDenied, "フォルダを読めません。"))?;
+            .map_err(|()| failure(ErrorCode::PermissionDenied, "Cannot read the folder."))?;
         let mut directories = Vec::new();
         let mut others = Vec::new();
         let mut omitted = 0;
@@ -369,7 +369,7 @@ impl HomeBrowser {
         if before != after {
             return Err(failure(
                 ErrorCode::RevisionConflict,
-                "一覧の取得中にフォルダが変更されました。読み込み直してください。",
+                "The folder changed while listing. Reload.",
             ));
         }
         directories.extend(others);
@@ -394,7 +394,7 @@ impl HomeBrowser {
         .map_err(|_| {
             failure(
                 ErrorCode::PermissionDenied,
-                "認証保護を確認できませんでした。",
+                "Could not verify authentication protection.",
             )
         })?;
         Ok(BrowseReadResult {
@@ -488,7 +488,7 @@ impl HomeBrowser {
             RequestBody::BrowseRead(params) => self.read(params).map(SuccessResult::BrowseRead),
             _ => Err(failure(
                 ErrorCode::CapabilityUnavailable,
-                "閲覧専用のhelperでは使えません。",
+                "Unavailable in a browsing-only helper.",
             )),
         }
     }
@@ -521,11 +521,11 @@ where
             }
             (_, Some(id)) if *id != request.client_id => Err(failure(
                 ErrorCode::PermissionDenied,
-                "接続したclientではありません。",
+                "Not the connected client.",
             )),
             (_, None) | (RequestBody::Hello, Some(_)) => Err(failure(
                 ErrorCode::InvalidRequest,
-                "最初にhelloが必要です。",
+                "hello is required first.",
             )),
             (RequestBody::ShutdownRequest(params), Some(_)) => {
                 if params.engine_epoch.as_str() == browser.epoch {
@@ -537,7 +537,7 @@ where
                 } else {
                     Err(failure(
                         ErrorCode::RevisionConflict,
-                        "helperが再起動されています。",
+                        "The helper has restarted.",
                     ))
                 }
             }

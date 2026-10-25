@@ -33,7 +33,7 @@ pub(super) fn read_saved_activation(
     };
     let snapshot = saved
         .snapshot()
-        .map_err(|error| format!("会話設定を復元できません: {error}"))?;
+        .map_err(|error| format!("Cannot restore conversation settings: {error}"))?;
     let settings = snapshot.state.session_settings.unwrap_or_else(|| {
         let mut initial = initial_settings.clone();
         initial.model = current_model.to_owned();
@@ -53,15 +53,17 @@ pub(super) fn apply_saved_binding(
 ) -> Result<(), String> {
     effective_settings.clone_from(&activation.settings);
     if effective_settings.provider != provider_name {
-        return Err("保存providerが起動時providerと異なります。指定して再起動してください".into());
+        return Err(
+            "The saved provider differs from the startup provider. Specify it and restart".into(),
+        );
     }
     if *model_name != effective_settings.model {
         if provider.model().is_none() {
-            return Err("保存modelをこのproviderへ適用できません".into());
+            return Err("Cannot apply the saved model to this provider".into());
         }
         provider.set_model(&effective_settings.model);
         if provider.model().as_deref() != Some(effective_settings.model.as_str()) {
-            return Err("保存modelの適用を確認できません".into());
+            return Err("Cannot verify application of the saved model".into());
         }
         model_name.clone_from(&effective_settings.model);
     }
@@ -190,7 +192,7 @@ pub(super) fn apply_tool_memory(
             settings.tool_mode,
             settings.embedding.clone(),
         )
-        .map_err(|error| format!("ツール記憶を準備できません: {error}"))?;
+        .map_err(|error| format!("Cannot prepare tool memory: {error}"))?;
         return Ok(true);
     }
     Ok(false)
@@ -206,7 +208,7 @@ pub(super) fn apply_compaction_and_memory(
     session.compaction_threshold = settings.compact_threshold;
     if settings.remember {
         memory::configure_saved_memory(session, project, state_dir, session_path)
-            .map_err(|error| format!("履歴保存を準備できません: {error}"))?;
+            .map_err(|error| format!("Cannot prepare history storage: {error}"))?;
     } else if session.persistence.is_some() {
         session.before_compact = None;
     } else if session.persistence.is_none()
@@ -216,7 +218,7 @@ pub(super) fn apply_compaction_and_memory(
         // Without this the legacy log is rewritten over the summary and
         // the compacted prefix is gone from memory and disk at once.
         memory::configure_archive(session, project, state_dir, id)
-            .map_err(|error| format!("圧縮前の履歴を退避できません: {error}"))?;
+            .map_err(|error| format!("Cannot archive history before compaction: {error}"))?;
     }
     Ok(())
 }
@@ -246,18 +248,20 @@ pub(super) fn saved_tool_memory_namespace(
     {
         if origins.len() >= MAX_TOOL_MEMORY_ORIGINS || !seen.insert(origin.clone()) {
             return Err(std::io::Error::other(
-                "記憶の系譜が循環しているか上限を超えています",
+                "Memory lineage contains a cycle or exceeds the limit",
             ));
         }
         let source = path.with_file_name(format!("{origin}.jsonl"));
-        let source_meta = persist::read_meta(&source.with_extension("meta.json"))
-            .ok_or_else(|| std::io::Error::other("記憶の元セッションの出自を確認できません"))?;
+        let source_meta =
+            persist::read_meta(&source.with_extension("meta.json")).ok_or_else(|| {
+                std::io::Error::other("Cannot verify memory source session provenance")
+            })?;
         if !source.is_file()
             || !Path::new(&source_meta.cwd).is_absolute()
             || polaris_core::project::resolve_root(Path::new(&source_meta.cwd)) != project
         {
             return Err(std::io::Error::other(
-                "記憶の元セッションが存在しないか同一プロジェクトではありません",
+                "The memory source session is missing or belongs to a different project",
             ));
         }
         origins.push(origin);
@@ -289,12 +293,12 @@ pub(super) fn configure_saved_tool_memory(
             origins.sort();
             origins.dedup();
             if origins.len() > MAX_TOOL_MEMORY_ORIGINS {
-                return Err(std::io::Error::other("記憶の系譜が上限を超えています"));
+                return Err(std::io::Error::other("Memory lineage exceeds the limit"));
             }
             if let Some(branch) = persistence.store.rewind_branch_metadata()? {
                 if !origins.contains(&branch.origin_session_id) {
                     return Err(std::io::Error::other(
-                        "rewind分岐の記憶出自が保存された系譜と一致しません",
+                        "Rewind fork memory provenance does not match saved lineage",
                     ));
                 }
                 tool_memory::configure_tool_memory_with_origin_allowlist(

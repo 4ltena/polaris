@@ -25,7 +25,7 @@ fn draw<B: Backend>(
             );
         })
         .map(|_| ())
-        .map_err(|_| "MCP秘密入力画面を表示できません".into())
+        .map_err(|_| "Cannot display the MCP secret input screen".into())
 }
 
 fn read_reference<B: Backend, R: KeyReader>(
@@ -36,20 +36,22 @@ fn read_reference<B: Backend, R: KeyReader>(
     loop {
         draw(
             terminal,
-            "MCP認証情報の参照名",
+            "MCP credential reference name",
             vec![
-                Line::from("値の入力は次の専用画面です。この画面には参照名だけ入力します。"),
-                Line::from("英数字・-・_、1〜64バイト。Enter: 次へ / Esc: 取消"),
+                Line::from(
+                    "Enter only the reference name here. The value is entered on the next dedicated screen.",
+                ),
+                Line::from("1–64 bytes: letters, digits, -, _. Enter: next / Esc: cancel"),
                 Line::from(reference.clone()),
             ],
         )?;
         match reader.read_secret_input() {
             Ok(SecretInputEvent::Key(KeyCode::Esc)) => return Ok(None),
-            Err(_) => return Err("MCP参照名の入力を取り消しました".into()),
+            Err(_) => return Err("MCP reference name input cancelled".into()),
             Ok(SecretInputEvent::Key(KeyCode::Enter)) if !reference.is_empty() => {
                 return McpSecretReferenceV1::parse(reference)
                     .map(Some)
-                    .map_err(|_| "MCP参照名が無効です".into());
+                    .map_err(|_| "Invalid MCP reference name".into());
             }
             Ok(SecretInputEvent::Key(KeyCode::Backspace)) => {
                 reference.pop();
@@ -66,7 +68,9 @@ fn read_reference<B: Backend, R: KeyReader>(
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
                 {
-                    return Err("貼り付けた参照名が無効です。英数字・-・_で指定してください".into());
+                    return Err(
+                        "Invalid pasted reference name. Use letters, digits, -, or _".into(),
+                    );
                 }
                 reference.push_str(&value);
             }
@@ -84,15 +88,19 @@ pub(super) fn read_value<B: Backend, R: KeyReader>(
         // The frame is identical for all values and lengths, including empty input.
         draw(
             terminal,
-            "MCP認証情報の秘密入力",
+            "MCP credential secret input",
             vec![
-                Line::from("値と文字数は表示しません。通常の入力履歴には保存しません。"),
-                Line::from("Enter: 入力完了 / Backspace: 末尾を削除 / Esc・Ctrl-C: 取消"),
+                Line::from(
+                    "The value and character count are hidden. Nothing is saved to normal input history.",
+                ),
+                Line::from(
+                    "Enter: finish / Backspace: delete last character / Esc or Ctrl-C: cancel",
+                ),
             ],
         )?;
         match reader.read_secret_input() {
             Ok(SecretInputEvent::Key(KeyCode::Esc)) => return Ok(None),
-            Err(_) => return Err("MCP秘密入力を取り消しました".into()),
+            Err(_) => return Err("MCP secret input cancelled".into()),
             Ok(SecretInputEvent::Key(KeyCode::Enter)) if !input.is_empty() => {
                 return Ok(Some(input));
             }
@@ -101,16 +109,16 @@ pub(super) fn read_value<B: Backend, R: KeyReader>(
             }
             Ok(SecretInputEvent::Key(KeyCode::Char(character))) if !character.is_control() => {
                 if input.push(character).is_err() {
-                    break "MCP秘密入力の上限を超えました";
+                    break "MCP secret input exceeds the limit";
                 }
             }
             Ok(SecretInputEvent::Paste(value)) => {
                 if value.chars().any(char::is_control) {
-                    break "MCP秘密入力に改行・制御文字は使用できません";
+                    break "MCP secret input cannot contain newlines or control characters";
                 }
                 for character in value.chars() {
                     if input.push(character).is_err() {
-                        break 'input "MCP秘密入力の上限を超えました";
+                        break 'input "MCP secret input exceeds the limit";
                     }
                 }
             }
@@ -123,10 +131,10 @@ pub(super) fn read_value<B: Backend, R: KeyReader>(
     loop {
         draw(
             terminal,
-            "MCP認証情報の秘密入力",
+            "MCP credential secret input",
             vec![
                 Line::from(rejection),
-                Line::from("入力を破棄しました。Enter・Esc・Ctrl-C: 閉じる"),
+                Line::from("Input discarded. Enter, Esc, or Ctrl-C: close"),
             ],
         )?;
         match reader.read_secret_input() {
@@ -142,10 +150,10 @@ fn revision(host: &LocalHost) -> Result<u64, String> {
     if !Store::exists(host.account_home()) {
         return Ok(0);
     }
-    let store = Store::open(host.account_home()).map_err(|_| "MCP保存先を確認できません")?;
+    let store = Store::open(host.account_home()).map_err(|_| "Cannot verify MCP storage")?;
     McpCredentialOwnerV1::new(&store)
         .current_secret_revision()
-        .map_err(|_| "MCP認証情報の版を確認できません".into())
+        .map_err(|_| "Cannot verify the MCP credential revision".into())
 }
 
 fn credential_error(
@@ -166,10 +174,12 @@ fn credential_error(
     }
     match error {
         McpCredentialErrorV1::RevisionConflict => {
-            "確認中にMCP認証情報が変更されました。保存していません"
+            "MCP credentials changed during confirmation. Nothing was saved"
         }
-        McpCredentialErrorV1::Auth => "MCP認証情報が参照されているか、保存条件を満たしていません",
-        _ => "MCP認証情報の変更が拒否されました",
+        McpCredentialErrorV1::Auth => {
+            "MCP credentials are referenced or do not meet storage requirements"
+        }
+        _ => "MCP credential change denied",
     }
     .into()
 }
@@ -183,16 +193,16 @@ pub(super) fn handle<B: Backend, R: KeyReader>(
     approval_policy: ApprovalPolicy,
 ) -> Result<Vec<Line<'static>>, String> {
     if approval_policy == ApprovalPolicy::Never {
-        return Err("現在の承認設定ではMCP認証情報を変更できません".into());
+        return Err("Current approval settings do not permit MCP credential changes".into());
     }
     match parts {
         ["set"] => {
             let expected = revision(host)?;
             let Some(reference) = read_reference(terminal, reader)? else {
-                return Ok(vec![Line::from("MCP秘密入力を取り消しました")]);
+                return Ok(vec![Line::from("MCP secret input cancelled")]);
             };
             let Some(input) = read_value(terminal, reader)? else {
-                return Ok(vec![Line::from("MCP秘密入力を取り消しました")]);
+                return Ok(vec![Line::from("MCP secret input cancelled")]);
             };
             let prepared = journal.prepare(
                 "C24",
@@ -202,12 +212,12 @@ pub(super) fn handle<B: Backend, R: KeyReader>(
             if !confirm(
                 terminal,
                 reader,
-                "MCP認証情報を保存",
+                "Save MCP credentials",
                 reference.as_str(),
-                &format!("認証情報の版 {expected}。値は表示しません。次の実行から反映します。巻き戻しでは取り消せません。"),
+                &format!("Credential revision {expected}. The value is hidden. Effective from the next run; rewind cannot undo this."),
             ) {
                 journal.deny(&prepared)?;
-                return Ok(vec![Line::from("MCP認証情報の保存を取り消しました")]);
+                return Ok(vec![Line::from("MCP credential save cancelled")]);
             }
             let started = journal.start(&prepared)?;
             let store = Store::open(host.account_home()).map_err(|_| journal.unknown(&started))?;
@@ -215,30 +225,30 @@ pub(super) fn handle<B: Backend, R: KeyReader>(
                 .set(McpSecretSetRequestV1::new(expected, reference, input))
                 .map_err(|error| credential_error(journal, &started, error))?;
             journal.complete(&started, format!("mcp-secret-set:{}", changed.secret_revision).as_bytes())?;
-            Ok(vec![Line::from(format!("MCP認証情報を保存しました（版 {}）。次の実行から反映します。", changed.secret_revision))])
+            Ok(vec![Line::from(format!("MCP credentials saved (revision {}). Effective from the next run.", changed.secret_revision))])
         }
         ["delete", reference] => {
             let reference = McpSecretReferenceV1::parse(*reference)
-                .map_err(|_| "MCP参照名が無効です")?;
-            let store = host.store().ok_or("保存されたMCP認証情報がありません")?;
+                .map_err(|_| "Invalid MCP reference name")?;
+            let store = host.store().ok_or("No saved MCP credentials")?;
             let owner = McpCredentialOwnerV1::new(store);
-            let expected = owner.current_secret_revision().map_err(|_| "MCP認証情報の版を確認できません")?;
-            let exists = store.load_secrets().map_err(|_| "MCP認証情報を確認できません")?
+            let expected = owner.current_secret_revision().map_err(|_| "Cannot verify the MCP credential revision")?;
+            let exists = store.load_secrets().map_err(|_| "Cannot verify MCP credentials")?
                 .is_some_and(|secrets| secrets.references().any(|name| name == reference.as_str()));
             if !exists {
-                return Err("そのMCP参照名は保存されていません".into());
+                return Err("That MCP reference name is not saved".into());
             }
             let prepared = journal.prepare("C25", expected, format!("mcp-secret-delete\0{}\0{expected}", reference.as_str()).as_bytes())?;
-            if !confirm(terminal, reader, "MCP認証情報を削除", reference.as_str(), &format!("認証情報の版 {expected}。参照中の値は削除できません。巻き戻しでは復元できません。")) {
+            if !confirm(terminal, reader, "Delete MCP credentials", reference.as_str(), &format!("Credential revision {expected}. Referenced values cannot be deleted. Rewind cannot restore this.")) {
                 journal.deny(&prepared)?;
-                return Ok(vec![Line::from("MCP認証情報の削除を取り消しました")]);
+                return Ok(vec![Line::from("MCP credential deletion cancelled")]);
             }
             let started = journal.start(&prepared)?;
             let changed = owner.delete(McpSecretDeleteRequestV1::new(expected, reference))
                 .map_err(|error| credential_error(journal, &started, error))?;
             journal.complete(&started, format!("mcp-secret-delete:{}", changed.secret_revision).as_bytes())?;
-            Ok(vec![Line::from(format!("MCP認証情報を削除しました（版 {}）。", changed.secret_revision))])
+            Ok(vec![Line::from(format!("MCP credentials deleted (revision {}).", changed.secret_revision))])
         }
-        _ => Err("/mcp secret set は引数なしで専用入力を開きます。削除は /mcp secret delete <参照名>。値を通常入力に書かないでください。".into()),
+        _ => Err("/mcp secret set opens dedicated input without arguments. Delete with /mcp secret delete <reference>. Do not type values into normal input.".into()),
     }
 }

@@ -12,17 +12,17 @@ fn identity(value: &DecisionIdentity) -> String {
             .model
             .as_deref()
             .map(text)
-            .unwrap_or_else(|| "未確認".into()),
+            .unwrap_or_else(|| "unverified".into()),
         value
             .revision
             .as_deref()
             .map(text)
-            .unwrap_or_else(|| "未確認".into()),
+            .unwrap_or_else(|| "unverified".into()),
         value
             .quantization
             .as_deref()
             .map(text)
-            .unwrap_or_else(|| "未確認".into())
+            .unwrap_or_else(|| "unverified".into())
     )
 }
 
@@ -30,9 +30,9 @@ pub fn display(
     config: &crate::config::DecisionConfig,
     decider: Option<&dyn Decider>,
 ) -> Vec<String> {
-    let mut lines = vec![String::new(), "型付き判断（観測）".into()];
+    let mut lines = vec![String::new(), "Typed decisions (observations)".into()];
     lines.push(format!(
-        "  設定: {} / enabled={}",
+        "  Configuration: {} / enabled={}",
         identity(&DecisionIdentity {
             backend: config.backend.as_str().into(),
             model: if config.backend == crate::config::DecisionBackend::SystemOne {
@@ -51,67 +51,69 @@ pub fn display(
     let Some(decider) = decider else {
         lines.push(
             if config.enabled {
-                "  判断器: 構築不可（実接続は未確認）"
+                "  Decider: cannot construct (connection unverified)"
             } else {
-                "  判断器: 無効"
+                "  Decider: disabled"
             }
             .into(),
         );
         return lines;
     };
     let Some(meter) = decider.telemetry() else {
-        lines.push("  記録: 計測器なし（実行・消費は未確認）".into());
+        lines.push("  Records: no meter (execution and usage unverified)".into());
         return lines;
     };
     let usage = meter.snapshot();
     lines.push(format!(
-        "  使用量: in {} / out {}（確認できた分のみ）",
+        "  Usage: in {} / out {} (verified observations only)",
         usage.input_tokens, usage.output_tokens
     ));
     lines.push(format!(
-        "  試行: 成功・使用量あり {} / 成功・欠測 {} / 失敗 {}",
+        "  Attempts: success with usage {} / success without usage {} / failed {}",
         usage.reported, usage.missing, usage.failed
     ));
     lines.push(format!(
-        "  未確定stage: {} / 監査書込失敗 {}（消費は不明）",
+        "  Unresolved stages: {} / audit write failures {} (usage unknown)",
         usage.abandoned, usage.observer_failures
     ));
     let traces = meter.recent();
     let Some(trace) = traces.last() else {
-        lines.push("  直近stage: 完了・破棄の観測なし（実接続は未確認）".into());
+        lines.push(
+            "  Latest stage: no completion or discard observed (connection unverified)".into(),
+        );
         return lines;
     };
     lines.push(format!(
-        "  直近stage: {} / {}ms",
+        "  Latest stage: {} / {} ms",
         text(&trace.request_id),
         trace.elapsed_ms
     ));
     if trace.abandoned {
-        lines.push("  回答元: 未確定（future破棄。実計算の停止・消費は未確認）".into());
+        lines.push("  Response source: unresolved (future dropped; actual computation stop and usage unverified)".into());
     } else {
         if let Some(effective) = &trace.effective {
-            lines.push(format!("  観測backend: {}", identity(effective)));
+            lines.push(format!("  Observed backend: {}", identity(effective)));
         }
         if let Some(capabilities) = trace.capabilities {
             lines.push(format!(
-                "  回答の校正: {:?} / 通信境界: {:?}",
+                "  Answer calibration: {:?} / network boundary: {:?}",
                 capabilities.band_calibration, capabilities.network
             ));
         }
         for (index, attempt) in trace.attempts.iter().enumerate() {
             if let Some(endpoint) = &attempt.endpoint_origin {
                 lines.push(format!(
-                    "  接続先origin（試行{}）: {}",
+                    "  Endpoint origin (attempt {}): {}",
                     index + 1,
                     text(endpoint)
                 ));
             }
             if let Some(capacity) = &attempt.capacity {
-                lines.push(format!("  容量（試行{}）: {} / 理由={} / budget={:?} / required={:?} / 同居予定={:?} bytes", index+1, capacity.status, capacity.reason.as_deref().map(text).unwrap_or_else(|| "なし".into()), capacity.budget_bytes, capacity.required_bytes, capacity.colocated_bytes));
+                lines.push(format!("  Capacity (attempt {}): {} / reason={} / budget={:?} / required={:?} / planned coexistence={:?} bytes", index+1, capacity.status, capacity.reason.as_deref().map(text).unwrap_or_else(|| "none".into()), capacity.budget_bytes, capacity.required_bytes, capacity.colocated_bytes));
             }
 
             lines.push(format!(
-                "  試行{}: {} / 呼出={} / {}ms / {:?} / 理由={}",
+                "  Attempt {}: {} / call={} / {} ms / {:?} / reason={}",
                 index + 1,
                 identity(&attempt.identity),
                 attempt.invoked,
@@ -121,7 +123,7 @@ pub fn display(
                     .reason
                     .as_deref()
                     .map(text)
-                    .unwrap_or_else(|| "なし".into())
+                    .unwrap_or_else(|| "none".into())
             ));
         }
     }
@@ -160,17 +162,17 @@ mod tests {
             ..Default::default()
         };
         let before = display(&config, Some(judge.as_ref())).join("\n");
-        assert!(before.contains("観測なし"));
+        assert!(before.contains("no completion or discard observed"));
         judge
             .decide(&serde_json::Value::Null, &BTreeMap::new())
             .await
             .unwrap();
         let after = display(&config, Some(judge.as_ref())).join("\n");
-        assert!(after.contains("観測backend"));
+        assert!(after.contains("Observed backend"));
         assert!(after.contains("out 3"));
-        assert!(after.contains("欠測 1"));
+        assert!(after.contains("without usage 1"));
         assert!(!after.contains('\x1b'));
-        assert!(after.contains("revision=未確認"));
+        assert!(after.contains("revision=unverified"));
     }
     #[test]
     fn unavailable_backend_keeps_the_explicit_configuration_visible() {
@@ -182,11 +184,11 @@ mod tests {
         };
         let shown = display(&config, None).join("\n");
         assert!(shown.contains("clef") && shown.contains("model=unavailable-fixture"));
-        assert!(shown.contains("構築不可"));
+        assert!(shown.contains("cannot construct"));
         assert!(
             display(&Default::default(), None)
                 .join("\n")
-                .contains("判断器: 無効")
+                .contains("Decider: disabled")
         );
     }
 }

@@ -243,31 +243,31 @@ impl McpOperation {
             .as_ref()
             .is_some_and(|v| v.class == super::apps::ToolClass::CodeExecution);
         let mut description = format!(
-            "サーバー {} のツール {} を対象 {} へ実行します。",
+            "Server {}: run tool {} on target {}.",
             metadata.server_id, metadata.item, metadata.target,
         );
         if let Some(view) = &view {
             description.push_str(&format!(
-                "\nアプリ: {}（アプリで現在開いている対象に作用します）",
+                "\nApp: {} (affects the target currently open in the app)",
                 view.app
             ));
             if let Some(inner) = &view.inner {
-                description.push_str(&format!("\n内側のツール: {inner}"));
+                description.push_str(&format!("\nInner tool: {inner}"));
             }
         }
         description.push_str(if code {
-            "\n影響: 任意のコードを実行します。呼び出すたびに確認します。"
+            "\nEffect: executes arbitrary code. Confirmation is required for every call."
         } else {
-            "\n影響: 未判定"
+            "\nEffect: unclassified"
         });
         if let Some((arguments, _)) = &self.call {
-            description.push_str(&format!("\n引数: {arguments}"));
+            description.push_str(&format!("\nArguments: {arguments}"));
         }
         McpApprovalDisplay {
             title: if code {
-                "MCP 任意コード実行"
+                "MCP arbitrary code execution"
             } else {
-                "MCP ツール実行"
+                "MCP tool execution"
             },
             description,
             metadata,
@@ -497,8 +497,8 @@ mod tests {
         let operation = plain.with_arguments(&arguments, Some(blender)).unwrap();
         assert_eq!(operation.payload_hash(), hash);
         let display = operation.approval_display();
-        assert_eq!(display.title, "MCP 任意コード実行");
-        assert!(display.description.contains("アプリ: Blender"));
+        assert_eq!(display.title, "MCP arbitrary code execution");
+        assert!(display.description.contains("App: Blender"));
         assert!(
             display
                 .description

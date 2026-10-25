@@ -67,19 +67,19 @@ fn criteria() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             Tier::Dwarf.name().to_owned(),
-            "一つの明確な手順で終わる。読み取り、単純な検索、決まった形への変換、既にある書き方の横展開など、判断の分岐がほとんど無い。".to_owned(),
+            "One clear step. Reading, simple searches, fixed-format transformations, or applying an existing pattern, with almost no branching judgment.".to_owned(),
         ),
         (
             Tier::Subgiant.name().to_owned(),
-            "複数の手順を組み立てる必要があるが、方針は依頼から読み取れる。既存の構造を追って複数のファイルを変更する作業がこれにあたる。".to_owned(),
+            "Requires several steps, but the direction is evident from the request. Includes following existing structure to change multiple files.".to_owned(),
         ),
         (
             Tier::Giant.name().to_owned(),
-            "同じ種類の作業のうち難しい個体。原因の分からない不具合、広い範囲にまたがる作り直し、途中で設計の判断が要るもの。手順は読み取れるが、そのとおりに進むとは限らない。".to_owned(),
+            "A difficult instance of a known task type. An unexplained bug, a broad rework, or work requiring design decisions along the way. The steps are inferable but may not proceed as expected.".to_owned(),
         ),
         (
             Tier::Supergiant.name().to_owned(),
-            "方針そのものを決める必要がある。設計の選択、互いに衝突する条件の調停など、正解が一つに定まらない。".to_owned(),
+            "The direction itself must be chosen. Design choices or conflicting constraints have no single correct answer.".to_owned(),
         ),
     ])
 }
@@ -121,7 +121,7 @@ impl<D: Decider> TierDecider for TypedTierDecider<D> {
                     key(index),
                     Question::Score {
                         instructions: format!(
-                            "次の依頼は、どの重さの作業か。\n\n担当する型: {}\n型の説明: {}\n依頼: {task}",
+                            "What is the weight of this request?\n\nAssigned type: {}\nType description: {}\nRequest: {task}",
                             agent.name, agent.description
                         ),
                         criteria: levels(),
@@ -130,7 +130,7 @@ impl<D: Decider> TierDecider for TypedTierDecider<D> {
             })
             .collect();
         let state = serde_json::json!({
-            "purpose": "委譲する作業の重さを決める",
+            "purpose": "Determine the weight of delegated work",
         });
         // Refused rather than truncated: dropping questions would leave
         // some tasks unanswered, and an answer list that does not line up

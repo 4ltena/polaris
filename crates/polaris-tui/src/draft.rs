@@ -14,7 +14,7 @@ pub(crate) fn save(
     text: &str,
 ) -> Result<(), String> {
     if crate::is_secret_command(text) {
-        return Err("秘密情報は下書きに保存できません".into());
+        return Err("Secrets cannot be saved in drafts".into());
     }
     // A local command is not an unsent model input. Preserve the previous
     // draft while the user operates a picker or types a management command.
@@ -25,7 +25,7 @@ pub(crate) fn save(
     let saved = session
         .persistence
         .as_ref()
-        .ok_or("下書き保存にはv2会話が必要です")?;
+        .ok_or("Draft storage requires a v2 conversation")?;
     let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
     let text = if text.trim().is_empty() { "" } else { text };
     if snapshot.state.draft.text == text {

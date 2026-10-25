@@ -543,9 +543,9 @@ impl Directory {
 #[cfg(unix)]
 fn component(name: &str) -> StoreResult<std::ffi::CString> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-        return Err(StoreError::Corrupt("保存component"));
+        return Err(StoreError::Corrupt("storage component"));
     }
-    std::ffi::CString::new(name).map_err(|_| StoreError::Corrupt("保存component"))
+    std::ffi::CString::new(name).map_err(|_| StoreError::Corrupt("storage component"))
 }
 #[cfg(unix)]
 fn canonical_directory_file(path: &Path) -> StoreResult<File> {
@@ -563,14 +563,14 @@ fn canonical_directory_file(path: &Path) -> StoreResult<File> {
         || fs::canonicalize(path)?.as_os_str() != path.as_os_str()
     {
         return Err(StoreError::Corrupt(
-            "保存rootは絶対canonical pathが必要です",
+            "The storage root must be an absolute canonical path",
         ));
     }
     let mut file = File::open("/")?;
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
             let name = std::ffi::CString::new(name.as_bytes())
-                .map_err(|_| StoreError::Corrupt("保存path"))?;
+                .map_err(|_| StoreError::Corrupt("storage path"))?;
             // SAFETY: valid live directory fd and NUL-terminated component; owned result.
             let fd = unsafe {
                 libc::openat(
@@ -597,7 +597,7 @@ fn owned_metadata(meta: &fs::Metadata, directory: bool) -> StoreResult<()> {
         || (!directory && (!meta.is_file() || meta.nlink() != 1))
     {
         return Err(StoreError::Corrupt(
-            "保存対象の所有者・権限・種類が不正です",
+            "Invalid storage owner, permissions, or type",
         ));
     }
     Ok(())
@@ -652,15 +652,15 @@ pub(super) fn prefix(
 ) -> StoreResult<Vec<u8>> {
     let file = dir.open(name, false, false)?;
     if file.metadata()?.len() < offset.get() {
-        return Err(StoreError::Corrupt("公開offsetより短いlog"));
+        return Err(StoreError::Corrupt("Log shorter than the published offset"));
     }
     let mut bytes = Vec::new();
     file.take(offset.get()).read_to_end(&mut bytes)?;
     if bytes.len() as u64 != offset.get() || content_hash(&bytes) != hash {
-        return Err(StoreError::Corrupt("公開prefixのhash不一致"));
+        return Err(StoreError::Corrupt("Published prefix hash mismatch"));
     }
     if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-        return Err(StoreError::Corrupt("公開prefixの途中行"));
+        return Err(StoreError::Corrupt("Partial line in the published prefix"));
     }
     Ok(bytes)
 }
@@ -725,7 +725,9 @@ fn decode_prefixes_m2a(
                 }
             })
         {
-            return Err(StoreError::Corrupt("原文イベントの版・順序・ターン境界"));
+            return Err(StoreError::Corrupt(
+                "Source event version, order, or turn boundary",
+            ));
         }
         raw.push(event);
     }
@@ -770,15 +772,17 @@ fn decode_prefixes_m2a(
             }
         }
         if state.session_revision.get() != revision as u64 {
-            return Err(StoreError::Corrupt("付随logの世代順序"));
+            return Err(StoreError::Corrupt("Sidecar log generation order"));
         }
         latest = Some(state);
     }
-    let state = latest.ok_or(StoreError::Corrupt("付随状態がありません"))?;
+    let state = latest.ok_or(StoreError::Corrupt("Missing sidecar state"))?;
     if marker.session_revision != state.session_revision
         || marker.content_revision > marker.session_revision
     {
-        return Err(StoreError::Corrupt("markerと付随状態の世代不一致"));
+        return Err(StoreError::Corrupt(
+            "Marker and sidecar state generation mismatch",
+        ));
     }
     Ok(Published { marker, state, raw })
 }
@@ -1637,7 +1641,9 @@ pub(super) fn publish_marker(dir: &Directory, marker: &Marker) -> StoreResult<()
 
 pub(super) fn commit(dir: &Directory, old: &Published, next: &Published) -> StoreResult<Marker> {
     if read_marker(dir)? != old.marker {
-        return Err(StoreError::Corrupt("公開markerがwriter外で変更されました"));
+        return Err(StoreError::Corrupt(
+            "The publication marker changed outside the writer",
+        ));
     }
     let mut raw = prefix(dir, RAW, old.marker.raw_offset, &old.marker.raw_hash)?;
     let mut sidecar = prefix(
@@ -1681,7 +1687,9 @@ thread_local! {
 pub(super) fn fail(_point: &str) -> StoreResult<()> {
     #[cfg(test)]
     if FAIL.with(|f| f.get() == Some(_point)) {
-        return Err(StoreError::Io(std::io::Error::other("注入した保存障害")));
+        return Err(StoreError::Io(std::io::Error::other(
+            "Injected storage failure",
+        )));
     }
     Ok(())
 }
@@ -1690,7 +1698,7 @@ pub(super) fn fail(_point: &str) -> StoreResult<()> {
 fn open_error() -> StoreError {
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ELOOP) {
-        StoreError::Corrupt("保存対象のsymlinkを拒否しました")
+        StoreError::Corrupt("Storage symlink refused")
     } else {
         StoreError::Io(error)
     }

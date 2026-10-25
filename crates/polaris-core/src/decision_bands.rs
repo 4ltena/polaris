@@ -41,7 +41,7 @@ pub const EXCLUDE: f64 = 0.4;
 pub fn question(query: &str, kind: &str, name: &str, description: &str) -> Question {
     Question::Noul {
         instructions: format!(
-            "この作業を進めるうえで、この{kind}は役に立つか。依頼: {query} / {kind}: {name} — {description}"
+            "Is this {kind} helpful for the task? Request: {query} / {kind}: {name} — {description}"
         ),
     }
 }
@@ -235,17 +235,17 @@ pub enum DecisionUse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionBuildError {
-    #[error("local-only: 判断器の外部通信禁止境界を確認できません")]
+    #[error("local-only: cannot verify the decider's external-network prohibition boundary")]
     LocalOnlyUnavailable,
-    #[error("System Oneの認証参照を解決できません")]
+    #[error("Cannot resolve the System One credential reference")]
     MissingSystemOneKey,
-    #[error("POLARIS_JEV_API_KEY がありません")]
+    #[error("POLARIS_JEV_API_KEY is missing")]
     MissingJevKey,
-    #[error("helperが実在する絶対pathではありません")]
+    #[error("The helper is not an existing absolute path")]
     MissingSemIfHelper,
-    #[error("判断器を構築できません ({0:?})")]
+    #[error("Cannot construct the decider ({0:?})")]
     InvalidSettings(DecisionError),
-    #[error("Clefでは固定model profile IDだけを指定できます")]
+    #[error("Clef accepts only pinned model profile IDs")]
     InvalidClefSettings,
     #[error("{0}")]
     Clef(#[from] crate::managed_decision::ManagedDecisionError),

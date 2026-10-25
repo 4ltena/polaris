@@ -243,7 +243,7 @@ fn frozen_prompt_rejects_receipt_input_run_and_approval_mismatches() {
         if mutation == 9 {
             assert!(matches!(
                 result,
-                Err(StoreError::Corrupt("MCP prompt操作の対応"))
+                Err(StoreError::Corrupt("MCP prompt operation association"))
             ));
             // Typed serialization puts approval_records after runs; Value puts
             // it before runs. Both must reach the same receipt check.
@@ -267,7 +267,7 @@ fn frozen_prompt_rejects_receipt_input_run_and_approval_mismatches() {
             let reordered = bytes(&path);
             assert!(matches!(
                 load(&child, marker),
-                Err(StoreError::Corrupt("MCP prompt操作の対応"))
+                Err(StoreError::Corrupt("MCP prompt operation association"))
             ));
             assert_eq!(bytes(&path), reordered);
             continue;

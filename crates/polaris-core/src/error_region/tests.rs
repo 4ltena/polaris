@@ -5,7 +5,7 @@ use super::*;
 /// The line counts a gap marker claims, and the lines actually printed.
 fn accounting(out: &str) -> (usize, usize) {
     let omitted = |line: &str| {
-        let count = line.strip_prefix("… ")?.strip_suffix(" 行省略 …")?;
+        let count = line.strip_prefix("… ")?.strip_suffix(" lines omitted …")?;
         count.replace(',', "").parse::<usize>().ok()
     };
     let claimed: usize = out.lines().filter_map(omitted).sum();
@@ -99,7 +99,10 @@ fn overlapping_windows_are_emitted_once() {
     let out = select(&text.join("\n"), 300);
     assert_eq!(out.matches("shared context").count(), 1, "{out}");
     assert_eq!(out.matches("error one").count(), 1, "{out}");
-    assert!(!out.contains("… 1 行省略 …"), "隣接領域が割れた: {out}");
+    assert!(
+        !out.contains("… 1 lines omitted …"),
+        "隣接領域が割れた: {out}"
+    );
 }
 
 #[test]
@@ -109,7 +112,7 @@ fn every_dropped_line_is_counted_in_a_gap_marker() {
     let out = select(&text.join("\n"), 400);
     let first = out.lines().next().unwrap();
     assert!(
-        first.starts_with("… ") && first.ends_with(" 行省略 …"),
+        first.starts_with("… ") && first.ends_with(" lines omitted …"),
         "冒頭の省略が示されていない: {first}"
     );
     assert!(first.contains(','), "四桁以上は桁区切り: {first}");
@@ -153,7 +156,7 @@ fn a_log_that_never_fails_still_shows_its_head_and_its_tail() {
     assert!(out.len() <= 300, "{} bytes", out.len());
     assert!(out.starts_with("line 0\n"), "{out}");
     assert!(out.ends_with("line 499"), "{out}");
-    assert!(out.contains("行省略"), "{out}");
+    assert!(out.contains("lines omitted"), "{out}");
     let (printed, claimed) = accounting(&out);
     assert_eq!(printed + claimed, 500, "{out}");
 }

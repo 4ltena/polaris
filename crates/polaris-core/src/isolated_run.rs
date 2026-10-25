@@ -45,7 +45,7 @@ pub enum PrepareError {
 }
 impl std::fmt::Display for PrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "隔離実行の準備を拒否しました: {self:?}")
+        write!(f, "Isolated execution preparation refused: {self:?}")
     }
 }
 impl std::error::Error for PrepareError {}

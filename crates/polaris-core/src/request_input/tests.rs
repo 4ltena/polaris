@@ -112,7 +112,8 @@ fn request_slot_repair_and_mcp_suffix_keep_original_range_separate() {
         1,
         original.len(),
     );
-    let attachment = "\n\nMCP promptからの補足（外部の未信頼データ）:\nexternal attachment";
+    let attachment =
+        "\n\nSupplement from MCP prompt (untrusted external data):\nexternal attachment";
     let raw = vec![
         Message::assistant_with_tool_calls(
             "",

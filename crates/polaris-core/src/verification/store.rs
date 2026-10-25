@@ -130,7 +130,7 @@ impl VerificationStore {
     #[cfg(unix)]
     pub fn open(data_root: &Path, project_id: &str) -> io::Result<Self> {
         if project_id.trim().is_empty() || project_id.contains('\0') {
-            return Err(invalid("verification project IDが不正です"));
+            return Err(invalid("Invalid verification project ID"));
         }
         let root = data_root.join(STORE_DIRECTORY);
         ensure_private_directory(&root)?;
@@ -143,7 +143,7 @@ impl VerificationStore {
     pub fn open(_data_root: &Path, _project_id: &str) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "このplatformではverification保存の保護を確認できません",
+            "Cannot verify verification storage protections on this platform",
         ))
     }
 
@@ -310,7 +310,7 @@ impl VerificationStore {
             .validate_against(candidates)
             .map_err(verification_error)?;
         if decision.diff_hash != binding.diff_hash {
-            return Err(invalid("plan decision bindingが一致しません"));
+            return Err(invalid("Plan decision binding mismatch"));
         }
         self.put(VerificationRecordKindV1::PlanDecision, binding, decision)
     }
@@ -327,7 +327,7 @@ impl VerificationStore {
             .validate_against(candidates)
             .map_err(verification_error)?;
         if value.diff_hash != expected.diff_hash {
-            return Err(invalid("plan decision bindingが一致しません"));
+            return Err(invalid("Plan decision binding mismatch"));
         }
         Ok(value)
     }
@@ -349,7 +349,7 @@ impl VerificationStore {
             || current.diff_hash != verification_binding.diff_hash
         {
             return Err(invalid(
-                "review record bindingがcurrent verificationと一致しません",
+                "Review record binding does not match current verification",
             ));
         }
         self.put(
@@ -378,7 +378,7 @@ impl VerificationStore {
             || current.diff_hash != verification_binding.diff_hash
         {
             return Err(invalid(
-                "review record bindingがcurrent verificationと一致しません",
+                "Review record binding does not match current verification",
             ));
         }
         Ok(review)
@@ -398,7 +398,7 @@ impl VerificationStore {
             || evidence.binding.diff_hash != verification_binding.diff_hash
         {
             return Err(invalid(
-                "final evidence bindingがverification bindingと一致しません",
+                "Final evidence binding does not match the verification binding",
             ));
         }
         self.put(
@@ -425,7 +425,7 @@ impl VerificationStore {
             || current.diff_hash != verification_binding.diff_hash
         {
             return Err(invalid(
-                "final evidence bindingがcurrent verificationと一致しません",
+                "Final evidence binding does not match current verification",
             ));
         }
         Ok(evidence)
@@ -492,7 +492,7 @@ impl VerificationStore {
         };
         let bytes = serde_json::to_vec(&envelope)?;
         if bytes.len() > MAX_RECORD_BYTES {
-            return Err(invalid("verification recordが上限を超えました"));
+            return Err(invalid("Verification record exceeds the limit"));
         }
         let content_hash = content_hash(&bytes);
         self.publish_exact(&content_hash, &bytes, &envelope)?;
@@ -512,11 +512,11 @@ impl VerificationStore {
         reference.validate()?;
         expected.validate()?;
         if reference.kind != kind || reference.binding != *expected {
-            return Err(invalid("verification record bindingが一致しません"));
+            return Err(invalid("Verification record binding mismatch"));
         }
         let bytes = read_private_regular_file(&self.object_path(&reference.content_hash)?)?;
         if content_hash(&bytes) != reference.content_hash {
-            return Err(invalid("verification record content hashが一致しません"));
+            return Err(invalid("Verification record content hash mismatch"));
         }
         let envelope: StoredRecordV1<T> = serde_json::from_slice(&bytes)?;
         validate_envelope(&envelope, kind, expected)?;
@@ -573,11 +573,11 @@ impl VerificationStore {
     ) -> io::Result<()> {
         let bytes = read_private_regular_file(path)?;
         if bytes != expected {
-            return Err(invalid("同じverification hashの本文が一致しません"));
+            return Err(invalid("Different bodies for the same verification hash"));
         }
         let existing: StoredRecordV1<T> = serde_json::from_slice(&bytes)?;
         if &existing != envelope {
-            return Err(invalid("保存済みverification recordが一致しません"));
+            return Err(invalid("Saved verification record mismatch"));
         }
         Ok(())
     }
@@ -613,7 +613,7 @@ fn validate_envelope<T: Serialize>(
         || envelope.binding != *expected
         || content_hash(&serde_json::to_vec(&envelope.payload)?) != envelope.payload_hash
     {
-        return Err(invalid("verification record envelopeが不正です"));
+        return Err(invalid("Invalid verification record envelope"));
     }
     Ok(())
 }
@@ -641,7 +641,7 @@ fn validate_static_binding(
             .as_ref()
             .is_some_and(|basis| basis.graph_hash != binding.project_graph_hash)
     {
-        return Err(invalid("static evidence bindingが一致しません"));
+        return Err(invalid("Static evidence binding mismatch"));
     }
     Ok(())
 }
@@ -668,7 +668,7 @@ fn validate_decision(
             .collect::<std::collections::BTreeSet<_>>()
             != candidates.ids.iter().collect()
     {
-        return Err(invalid("Jev decision bindingが一致しません"));
+        return Err(invalid("Jev decision binding mismatch"));
     }
     Ok(())
 }
@@ -688,7 +688,7 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
         Ok(()) => {
             sync_directory(
                 path.parent()
-                    .ok_or_else(|| invalid("verification保存先が不正です"))?,
+                    .ok_or_else(|| invalid("Invalid verification storage location"))?,
             )?;
             validate_private_directory(path)
         }
@@ -718,7 +718,7 @@ fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     validate_private_regular_file(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.len() > MAX_RECORD_BYTES as u64 {
-        return Err(invalid("verification recordが上限を超えました"));
+        return Err(invalid("Verification record exceeds the limit"));
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -730,7 +730,7 @@ fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = options.open(path)?;
     let len = file.metadata()?.len();
     if len > MAX_RECORD_BYTES as u64 {
-        return Err(invalid("verification recordが上限を超えました"));
+        return Err(invalid("Verification record exceeds the limit"));
     }
     let mut bytes = Vec::with_capacity(len as usize);
     file.read_to_end(&mut bytes)?;
@@ -741,13 +741,13 @@ fn read_private_regular_file(path: &Path) -> io::Result<Vec<u8>> {
 fn validate_private_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid("verification保存先directoryが不正です"));
+        return Err(invalid("Invalid verification storage directory"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-            return Err(invalid("verification保存先の所有者または権限が不正です"));
+            return Err(invalid("Invalid verification storage owner or permissions"));
         }
     }
     Ok(())
@@ -756,7 +756,7 @@ fn validate_private_directory(path: &Path) -> io::Result<()> {
 fn validate_private_regular_file(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(invalid("verification recordが通常fileではありません"));
+        return Err(invalid("Verification record is not a regular file"));
     }
     #[cfg(unix)]
     {
@@ -766,7 +766,7 @@ fn validate_private_regular_file(path: &Path) -> io::Result<()> {
             || metadata.nlink() != 1
         {
             return Err(invalid(
-                "verification recordの所有者、権限またはlink数が不正です",
+                "Invalid verification record owner, permissions, or link count",
             ));
         }
     }

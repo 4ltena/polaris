@@ -17,7 +17,7 @@ impl Mode {
         match std::env::var("POLARIS_CACHE_PACING") {
             Ok(v) => Self::parse(Some(&v)),
             Err(std::env::VarError::NotUnicode(_)) => Err(ProviderError::Decode(
-                "POLARIS_CACHE_PACING は off または on を指定してください".into(),
+                "Set POLARIS_CACHE_PACING to off or on".into(),
             )),
             Err(std::env::VarError::NotPresent) => Self::parse(None),
         }
@@ -27,7 +27,7 @@ impl Mode {
             Some("on") => Ok(Self::On),
             Some("off") | None => Ok(Self::Off),
             _ => Err(ProviderError::Decode(
-                "POLARIS_CACHE_PACING は off または on を指定してください".into(),
+                "Set POLARIS_CACHE_PACING to off or on".into(),
             )),
         }
     }

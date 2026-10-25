@@ -451,7 +451,7 @@ pub async fn run_registered(
 
 fn render_registered_wait(frame: &mut Frame) {
     frame.render_widget(
-        Paragraph::new("ブラウザで認可してください。Esc / Ctrl-Cで取消。").block(
+        Paragraph::new("Authorize in your browser. Esc / Ctrl-C: cancel.").block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("polaris login"),

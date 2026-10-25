@@ -119,7 +119,7 @@ impl<'a> Collector<'a> {
                 .source_id
                 .starts_with(&format!("source-{}-", source.source.turn.get()))
         {
-            return Err(StoreError::Corrupt("固定記憶の公開出典"));
+            return Err(StoreError::Corrupt("Pinned memory published source"));
         }
         self.stamp(&source.source)?;
         self.charge(&source)?;
@@ -128,7 +128,7 @@ impl<'a> Collector<'a> {
             .insert(source.source.turn.get(), source)
             .is_some()
         {
-            return Err(StoreError::Corrupt("固定記憶の出典重複"));
+            return Err(StoreError::Corrupt("Duplicate pinned memory source"));
         }
         Ok(())
     }
@@ -140,7 +140,7 @@ impl<'a> Collector<'a> {
             || source.raw_offset > self.marker.raw_offset
             || source.content_revision > self.marker.content_revision
         {
-            return Err(StoreError::Corrupt("固定記憶の原文参照"));
+            return Err(StoreError::Corrupt("Pinned memory source reference"));
         }
         Ok(())
     }
@@ -173,7 +173,7 @@ impl<'a> Collector<'a> {
             let complete = op.result_id.is_some();
             self.charge(&(&key, complete))?;
             if self.operations.insert(key, complete).is_some() {
-                return Err(StoreError::Corrupt("固定記憶の実行参照重複"));
+                return Err(StoreError::Corrupt("Duplicate pinned memory run reference"));
             }
         }
         Ok(())
@@ -212,7 +212,7 @@ impl<'a> Collector<'a> {
                             source.sequence
                         )
                 {
-                    return Err(StoreError::Corrupt("固定記憶の構造化source順序"));
+                    return Err(StoreError::Corrupt("Pinned memory structured source order"));
                 }
                 proof.last_source = Some(source.sequence);
                 let binding = RawBinding {
@@ -226,7 +226,9 @@ impl<'a> Collector<'a> {
                         || prior.source_id != binding.source_id
                         || prior.content_hash != binding.content_hash
                     {
-                        return Err(StoreError::Corrupt("固定記憶のsource対応重複"));
+                        return Err(StoreError::Corrupt(
+                            "Duplicate pinned memory source association",
+                        ));
                     }
                 } else {
                     self.charge(&(source.sequence, &binding))?;
@@ -241,7 +243,7 @@ impl<'a> Collector<'a> {
                 || (proof.source_count > 0
                     && proof.last_source != Some(coverage.last_source_sequence))
             {
-                return Err(StoreError::Corrupt("固定記憶のcoverage"));
+                return Err(StoreError::Corrupt("Pinned memory coverage"));
             }
             proof.coverage = Some(coverage.clone());
             if let Some(response) = structured.response {
@@ -255,11 +257,15 @@ impl<'a> Collector<'a> {
                         .sources
                         .iter()
                         .find(|source| source.source_id == id)
-                        .ok_or(StoreError::Corrupt("固定記憶の構造化出典が抽出範囲外"))?;
-                    let binding = self
-                        .bindings
-                        .get_mut(&source.sequence)
-                        .ok_or(StoreError::Corrupt("固定記憶の構造化出典不在"))?;
+                        .ok_or(StoreError::Corrupt(
+                            "Pinned memory structured source outside extraction range",
+                        ))?;
+                    let binding =
+                        self.bindings
+                            .get_mut(&source.sequence)
+                            .ok_or(StoreError::Corrupt(
+                                "Missing pinned memory structured source",
+                            ))?;
                     // false occupies more encoded bytes than true, so the
                     // original binding charge remains an upper bound.
                     binding.requires_user_input |= requires_user;
@@ -274,7 +280,9 @@ impl<'a> Collector<'a> {
                     || p.prompt_version
                         != crate::conversation_memory::structured::STRUCTURED_PROMPT_VERSION
                 {
-                    return Err(StoreError::Corrupt("固定記憶の構造化保存応答"));
+                    return Err(StoreError::Corrupt(
+                        "Pinned memory saved structured response",
+                    ));
                 }
                 if self.grants.contains(p.publication_id.as_str()) {
                     submit(&response.delta).map_err(std::io::Error::other)?;
@@ -288,7 +296,7 @@ impl<'a> Collector<'a> {
             .insert(proof.source.turn.get(), proof)
             .is_some()
         {
-            return Err(StoreError::Corrupt("固定記憶のattempt重複"));
+            return Err(StoreError::Corrupt("Duplicate pinned memory attempt"));
         }
         Ok(())
     }
@@ -299,7 +307,7 @@ impl<'a> Collector<'a> {
         structured_ids: &[String],
     ) -> StoreResult<()> {
         if !self.prompt_operations.is_disjoint(&self.approvals) {
-            return Err(StoreError::Corrupt("MCP prompt操作の対応"));
+            return Err(StoreError::Corrupt("MCP prompt operation association"));
         }
         if self.revision != Some(self.marker.session_revision)
             || self.memory_version != Some(1)
@@ -311,11 +319,11 @@ impl<'a> Collector<'a> {
                 Some(HistoryMode::Strict10 | HistoryMode::Structured10)
             )
         {
-            return Err(StoreError::Corrupt("固定記憶の版・世代"));
+            return Err(StoreError::Corrupt("Pinned memory version or generation"));
         }
         self.resources
             .as_ref()
-            .ok_or(StoreError::Corrupt("固定記憶の資源不在"))?
+            .ok_or(StoreError::Corrupt("Missing pinned memory resources"))?
             .validate()?;
         let summaries: BTreeSet<_> = self.sources.values().map(|s| &s.summary_id).collect();
         let structured: BTreeSet<_> = self
@@ -329,15 +337,15 @@ impl<'a> Collector<'a> {
             || structured.len() != structured_ids.len()
             || structured != structured_ids.iter().collect()
         {
-            return Err(StoreError::Corrupt("固定記憶のexact公開ID"));
+            return Err(StoreError::Corrupt("Pinned memory exact publication ID"));
         }
         for source in self.sources.values() {
             let attempt = self
                 .attempts
                 .get(&source.source.turn.get())
-                .ok_or(StoreError::Corrupt("固定記憶のattempt不在"))?;
+                .ok_or(StoreError::Corrupt("Missing pinned memory attempt"))?;
             if attempt.source != source.source || attempt.summary_hash.is_none() {
-                return Err(StoreError::Corrupt("固定記憶の出典対応"));
+                return Err(StoreError::Corrupt("Pinned memory source association"));
             }
             match (
                 &attempt.publication,
@@ -350,16 +358,20 @@ impl<'a> Collector<'a> {
                         && u64::try_from(p.scope.generation).ok()
                             == Some(source.generation.get()) => {}
                 (None, None, None) if attempt.coverage.is_none() => {}
-                _ => return Err(StoreError::Corrupt("固定記憶の公開応答対応")),
+                _ => {
+                    return Err(StoreError::Corrupt(
+                        "Pinned memory published response association",
+                    ));
+                }
             }
         }
         for attempt in self.attempts.values() {
             let complete = self
                 .operations
                 .get(&attempt.operation)
-                .ok_or(StoreError::Corrupt("固定記憶の実行参照不在"))?;
+                .ok_or(StoreError::Corrupt("Missing pinned memory run reference"))?;
             if attempt.summary_hash.is_some() && !complete {
-                return Err(StoreError::Corrupt("固定記憶の結果未確定"));
+                return Err(StoreError::Corrupt("Pinned memory outcome unknown"));
             }
             if attempt.source_count == 0
                 && let Some(coverage) = &attempt.coverage
@@ -373,7 +385,9 @@ impl<'a> Collector<'a> {
                             && s.source.raw_hash == attempt.source.raw_hash
                     }))
             {
-                return Err(StoreError::Corrupt("固定記憶の空抽出coverage"));
+                return Err(StoreError::Corrupt(
+                    "Pinned memory empty extraction coverage",
+                ));
             }
         }
         Ok(())
@@ -469,7 +483,7 @@ impl<'a> FrozenMemory<'a> {
             || !hash(&current.sidecar_hash)
             || (writer.coordinates().1 == &marker.session_id && current != *marker)
         {
-            return Err(StoreError::Corrupt("固定記憶の現在marker"));
+            return Err(StoreError::Corrupt("Pinned memory current marker"));
         }
         let (mut side, start, lines) = checked_prefix(
             &owner,
@@ -485,7 +499,7 @@ impl<'a> FrozenMemory<'a> {
                 .checked_add(1)
                 .ok_or(StoreError::Overflow)?
         {
-            return Err(StoreError::Corrupt("固定記憶の付随世代"));
+            return Err(StoreError::Corrupt("Pinned memory sidecar generation"));
         }
         // The decoder is restricted to this exact final-line length. Reserve
         // it before serde can repeatedly rearm per-record budgets.
@@ -530,14 +544,14 @@ impl<'a> FrozenMemory<'a> {
             let attempt = collector
                 .attempts
                 .remove(&source.source.turn.get())
-                .ok_or(StoreError::Corrupt("固定記憶のattempt不在"))?;
+                .ok_or(StoreError::Corrupt("Missing pinned memory attempt"))?;
             summaries.insert(
                 source.summary_id.clone(),
                 SummaryProof {
                     source,
                     summary_hash: attempt
                         .summary_hash
-                        .ok_or(StoreError::Corrupt("固定記憶の要約不在"))?,
+                        .ok_or(StoreError::Corrupt("Missing pinned memory summary"))?,
                     publication: attempt.publication,
                 },
             );
@@ -548,7 +562,7 @@ impl<'a> FrozenMemory<'a> {
                 scope,
                 resources: collector
                     .resources
-                    .ok_or(StoreError::Corrupt("固定記憶の資源不在"))?,
+                    .ok_or(StoreError::Corrupt("Missing pinned memory resources"))?,
                 summaries,
             },
             history,
@@ -597,7 +611,9 @@ impl<'a> FrozenMemory<'a> {
                 _ => true,
             }
         {
-            return Err(StoreError::Corrupt("固定記憶の保存要約・出典不一致"));
+            return Err(StoreError::Corrupt(
+                "Pinned memory saved summary or source mismatch",
+            ));
         }
         Ok(source)
     }
@@ -677,7 +693,9 @@ pub(super) fn with_published_receipts<'a, T>(
                 let mut retained = 0usize;
                 let mut retain = |owner: FrozenMemory<'a>| -> StoreResult<()> {
                     if owner.resources != saved.resources {
-                        return Err(StoreError::Corrupt("固定祖先の記憶資源不一致"));
+                        return Err(StoreError::Corrupt(
+                            "Pinned ancestor memory resource mismatch",
+                        ));
                     }
                     charge(
                         &mut retained,
@@ -787,7 +805,7 @@ fn checked_prefix(
     owner.verify()?;
     let mut file = owner.directory.open(name, false, false)?;
     if file.metadata()?.len() < offset || !hash(expected_hash) {
-        return Err(StoreError::Corrupt("固定記憶のprefix範囲"));
+        return Err(StoreError::Corrupt("Pinned memory prefix range"));
     }
     let mut digest = Sha256::new();
     let mut buffer = [0u8; bounded::BUFFER];
@@ -798,7 +816,7 @@ fn checked_prefix(
             .map_err(|_| StoreError::Overflow)?;
         let count = file.read(&mut buffer[..limit])?;
         if count == 0 {
-            return Err(StoreError::Corrupt("固定記憶の短いprefix"));
+            return Err(StoreError::Corrupt("Pinned memory short prefix"));
         }
         digest.update(&buffer[..count]);
         for (i, byte) in buffer[..count].iter().enumerate() {
@@ -812,7 +830,7 @@ fn checked_prefix(
         read += count as u64;
     }
     if (offset > 0 && !newline) || format!("{:x}", digest.finalize()) != expected_hash {
-        return Err(StoreError::Corrupt("固定記憶のprefix hash・改行"));
+        return Err(StoreError::Corrupt("Pinned memory prefix hash or newline"));
     }
     owner.verify()?;
     disk::same(&file, &owner.directory.open(name, false, false)?)?;

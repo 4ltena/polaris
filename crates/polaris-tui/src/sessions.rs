@@ -43,7 +43,7 @@ fn directory_entries(path: &Path, max: usize) -> std::io::Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path)? {
         if entries.len() >= max {
-            return Err(list_error("保存セッションのエントリ数が上限を超えました"));
+            return Err(list_error("Saved session entry count exceeds the limit"));
         }
         entries.push(entry?.path());
     }
@@ -54,7 +54,7 @@ fn directory_entries(path: &Path, max: usize) -> std::io::Result<Vec<PathBuf>> {
 fn directory_entries(_path: &Path, _max: usize) -> std::io::Result<Vec<PathBuf>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "このOSでは境界を検証したセッション一覧を利用できません",
+        "Boundary-verified session listing is unavailable on this OS",
     ))
 }
 
@@ -77,18 +77,18 @@ pub(crate) fn read_bounded_session_file(
     let max = max.min(total_max.saturating_sub(*total));
     let parent = polaris_core::project_mutation::open_directory_nofollow(
         path.parent()
-            .ok_or_else(|| list_error("保存ファイルの親がありません"))?,
+            .ok_or_else(|| list_error("The storage file has no parent"))?,
     )?;
     let name = CString::new(
         path.file_name()
-            .ok_or_else(|| list_error("保存ファイル名が不正です"))?
+            .ok_or_else(|| list_error("Invalid saved filename"))?
             .as_bytes(),
     )
     .map_err(std::io::Error::other)?;
     let protection = polaris_auth::protection::with_protected_paths(Clone::clone)
-        .map_err(|_| list_error("保護されたファイルの一覧を確認できません"))?;
+        .map_err(|_| list_error("Cannot verify the protected file inventory"))?;
     if protection.paths().contains(path) {
-        return Err(list_error("保護されたファイルはセッションとして読めません"));
+        return Err(list_error("Protected files cannot be read as sessions"));
     }
     let fd = unsafe {
         libc::openat(
@@ -112,21 +112,19 @@ pub(crate) fn read_bounded_session_file(
             })
     {
         return Err(list_error(
-            "保存セッションが保護対象またはサイズ上限を超えています",
+            "The saved session is protected or exceeds the size limit",
         ));
     }
     let mut bytes = Vec::new();
     file.take(max as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > max {
-        return Err(list_error(
-            "保存セッションの読み取りサイズが上限を超えました",
-        ));
+        return Err(list_error("Saved session read size exceeds the limit"));
     }
     *total = total
         .checked_add(bytes.len())
-        .ok_or_else(|| list_error("保存セッションの合計サイズが上限を超えました"))?;
+        .ok_or_else(|| list_error("Saved session total size exceeds the limit"))?;
     if *total > total_max {
-        return Err(list_error("保存セッションの合計サイズが上限を超えました"));
+        return Err(list_error("Saved session total size exceeds the limit"));
     }
     Ok(bytes)
 }
@@ -139,7 +137,7 @@ pub(crate) fn read_bounded_session_file(
 ) -> std::io::Result<Vec<u8>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "このOSでは境界を検証したセッション読み取りを利用できません",
+        "Boundary-verified session reading is unavailable on this OS",
     ))
 }
 
@@ -147,16 +145,16 @@ pub(crate) fn parse_legacy_messages(
     bytes: &[u8],
     max_messages: usize,
 ) -> std::io::Result<Vec<polaris_provider::Message>> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| list_error("保存セッションがUTF-8ではありません"))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| list_error("The saved session is not UTF-8"))?;
     let mut messages = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         if messages.len() >= max_messages {
-            return Err(list_error("保存セッションのメッセージ数が上限を超えました"));
+            return Err(list_error("Saved session message count exceeds the limit"));
         }
         messages.push(
             serde_json::from_str(line).map_err(|_| {
-                list_error("保存セッションのJSONLが不正です。原文は変更していません")
+                list_error("Invalid saved session JSONL. Original text is unchanged")
             })?,
         );
     }
@@ -195,9 +193,9 @@ pub fn try_list_sessions_bounded(
             limits.max_total_bytes,
         )?;
         let meta: persist::SessionMeta = serde_json::from_slice(&meta_bytes)
-            .map_err(|_| list_error("保存セッションのメタデータが不正です"))?;
+            .map_err(|_| list_error("Invalid saved session metadata"))?;
         if meta.cwd.is_empty() || meta.cwd.len() > 16_384 {
-            return Err(list_error("保存セッションのプロジェクト名が不正です"));
+            return Err(list_error("Invalid saved session project name"));
         }
         let session_path = sessions_dir.join(format!("{id}.jsonl"));
         let bytes = match read_bounded_session_file(
@@ -215,7 +213,9 @@ pub fn try_list_sessions_bounded(
             continue;
         }
         if out.len() >= limits.max_sessions {
-            return Err(list_error("表示可能な保存セッション数が上限を超えました"));
+            return Err(list_error(
+                "Displayable saved session count exceeds the limit",
+            ));
         }
         let preview = messages
             .iter()
@@ -318,10 +318,10 @@ pub fn try_list_v2_sessions_filtered_bounded(
         let id = path
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| list_error("保存セッションIDがUTF-8ではありません"))?;
+            .ok_or_else(|| list_error("Saved session ID is not UTF-8"))?;
         if !std::fs::symlink_metadata(&path)?.is_dir() {
             return Err(list_error(
-                "v2保存セッションが通常のディレクトリではありません",
+                "The saved v2 session is not a regular directory",
             ));
         }
         let state_bytes = read_bounded_session_file(
@@ -331,10 +331,10 @@ pub fn try_list_v2_sessions_filtered_bounded(
             limits.max_total_bytes,
         )?;
         let state: ConversationStateV2 = serde_json::from_slice(&state_bytes)
-            .map_err(|_| list_error("v2セッションの保存状態が不正です"))?;
+            .map_err(|_| list_error("Invalid v2 session storage state"))?;
         state.validate()?;
         if state.session_id != id {
-            return Err(list_error("v2セッションのIDと保存先が一致しません"));
+            return Err(list_error("V2 session ID and storage location mismatch"));
         }
         if state.project_id != project_id {
             continue;
@@ -346,23 +346,23 @@ pub fn try_list_v2_sessions_filtered_bounded(
             limits.max_total_bytes,
         )?;
         let committed = usize::try_from(state.raw_commit_offset)
-            .map_err(|_| list_error("v2原文の保存範囲が不正です"))?;
+            .map_err(|_| list_error("Invalid v2 source storage range"))?;
         if committed > raw.len()
             || content_hash(&raw[..committed]) != state.raw_commit_hash
             || (!raw.is_empty() && !raw.ends_with(b"\n"))
         {
-            return Err(list_error("v2原文の長さまたはhashが一致しません"));
+            return Err(list_error("V2 source length or hash mismatch"));
         }
         let mut count = 0;
         let mut preview = String::new();
         for line in raw.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
             if count >= limits.max_messages {
-                return Err(list_error("v2原文のメッセージ数が上限を超えました"));
+                return Err(list_error("V2 source message count exceeds the limit"));
             }
-            let event: RawEventV2 = serde_json::from_slice(line)
-                .map_err(|_| list_error("v2原文のイベントが不正です"))?;
+            let event: RawEventV2 =
+                serde_json::from_slice(line).map_err(|_| list_error("Invalid v2 source event"))?;
             if event.sequence != count as u64 + 1 || event.epoch > state.epoch {
-                return Err(list_error("v2原文の順序またはepochが不正です"));
+                return Err(list_error("Invalid v2 source order or epoch"));
             }
             if preview.is_empty() && event.message.role == polaris_provider::Role::User {
                 preview = preview_of(&event.message.content);
@@ -390,7 +390,7 @@ pub fn try_list_v2_sessions_filtered_bounded(
             continue;
         }
         if out.len() >= limits.max_sessions {
-            return Err(list_error("表示可能なv2セッション数が上限を超えました"));
+            return Err(list_error("Displayable v2 session count exceeds the limit"));
         }
         out.push(summary);
     }

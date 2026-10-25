@@ -67,7 +67,7 @@ impl<R: Read> Read for Limited<'_, R> {
             .get()
             .saturating_sub(self.budget.bytes.get());
         if remaining == 0 {
-            return Err(io::Error::other("固定記憶のparser入力上限"));
+            return Err(io::Error::other("Pinned memory parser input limit"));
         }
         let limit = out
             .len()
@@ -78,7 +78,7 @@ impl<R: Read> Read for Limited<'_, R> {
                 .bytes
                 .get()
                 .checked_add(count as u64)
-                .ok_or_else(|| io::Error::other("固定記憶の入力位置上限"))?,
+                .ok_or_else(|| io::Error::other("Pinned memory input position limit"))?,
         );
         Ok(count)
     }
@@ -94,7 +94,7 @@ impl Write for Counter {
             .bytes
             .checked_add(bytes.len())
             .filter(|n| *n <= self.limit)
-            .ok_or_else(|| io::Error::other("固定記憶の保持上限"))?;
+            .ok_or_else(|| io::Error::other("Pinned memory retention limit"))?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -165,7 +165,7 @@ struct RejectExtra;
 impl<'de> DeserializeSeed<'de> for RejectExtra {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
-        Err(serde::de::Error::custom("固定記憶の配列件数上限"))
+        Err(serde::de::Error::custom("Pinned memory array count limit"))
     }
 }
 impl<'de, T: DeserializeOwned + Serialize, F: FnMut(T) -> StoreResult<()>> Visitor<'de>
@@ -270,7 +270,7 @@ mod tests {
             let huge =
                 serde_json::to_vec(&serde_json::json!({"items":["x".repeat(SOURCE*4)]})).unwrap();
             let error = parse(&huge, SOURCE, 1, buffer).unwrap_err();
-            assert!(error.to_string().contains("parser入力上限"), "{error}");
+            assert!(error.to_string().contains("parser input limit"), "{error}");
         }
     }
     #[test]
@@ -286,21 +286,21 @@ mod tests {
             parse(huge_extra.as_bytes(), SOURCE, 1, BUFFER)
                 .unwrap_err()
                 .to_string()
-                .contains("配列件数上限")
+                .contains("array count limit")
         );
         let whitespace = format!("{{\"items\":[{}\"x\"]}}", " ".repeat(SOURCE * 4));
         assert!(
             parse(whitespace.as_bytes(), SOURCE, 1, BUFFER)
                 .unwrap_err()
                 .to_string()
-                .contains("parser入力上限")
+                .contains("parser input limit")
         );
         let key = format!("{{\"{}\":[]}}", "x".repeat(SOURCE));
         assert!(
             parse(key.as_bytes(), SOURCE, 1, BUFFER)
                 .unwrap_err()
                 .to_string()
-                .contains("parser入力上限")
+                .contains("parser input limit")
         );
     }
     #[test]

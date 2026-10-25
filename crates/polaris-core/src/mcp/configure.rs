@@ -99,29 +99,29 @@ impl PublishedUnityRuntime {
         let bound = self
             .runtime
             .try_clone_directory()
-            .map_err(|_| "配置済みUnity runtime descriptorを保持できません")?;
+            .map_err(|_| "Cannot retain the deployed Unity runtime descriptor")?;
         self.installed
             .verify(&bound)
-            .map_err(|_| "配置済みUnity runtimeの内容が変更されました")?;
+            .map_err(|_| "Deployed Unity runtime content changed")?;
         let named = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.runtime.path())
-            .map_err(|_| "配置済みUnity runtime pathを再確認できません")?;
+            .map_err(|_| "Cannot reverify the deployed Unity runtime path")?;
         let bound_metadata = bound
             .metadata()
-            .map_err(|_| "配置済みUnity runtime descriptorを確認できません")?;
+            .map_err(|_| "Cannot verify the deployed Unity runtime descriptor")?;
         let named_metadata = named
             .metadata()
-            .map_err(|_| "配置済みUnity runtime pathを確認できません")?;
+            .map_err(|_| "Cannot verify the deployed Unity runtime path")?;
         if (bound_metadata.dev(), bound_metadata.ino())
             != (named_metadata.dev(), named_metadata.ino())
         {
-            return Err("配置済みUnity runtimeのnamespaceが変更されました".into());
+            return Err("Deployed Unity runtime namespace changed".into());
         }
         self.installed
             .verify(&named)
-            .map_err(|_| "配置済みUnity runtimeの内容が変更されました".into())
+            .map_err(|_| "Deployed Unity runtime content changed".into())
     }
 }
 
@@ -129,41 +129,40 @@ impl UnityLocalV2Preparation {
     /// Bind the current single stdio registration and selected physical source.
     /// This function must run before asking for approval and performs no writes.
     pub fn prepare(host: &LocalHost, server_id: &str, source: &Path) -> Result<Self, String> {
-        let store = host.store().ok_or("MCP storeが存在しません")?;
+        let store = host.store().ok_or("MCP store does not exist")?;
         let snapshot = store
             .load_snapshot_noncreating()
-            .map_err(|_| "MCP registryを非作成で確認できません")?;
-        let before = snapshot.registry.ok_or("MCP registryが存在しません")?;
+            .map_err(|_| "Cannot inspect the MCP registry without creating it")?;
+        let before = snapshot.registry.ok_or("MCP registry does not exist")?;
         let current = before
             .servers
             .iter()
             .find(|server| server.server_id == server_id)
-            .ok_or("指定されたMCP serverが存在しません")?;
+            .ok_or("The specified MCP server does not exist")?;
         if !current.enabled_projects.contains(host.project()) {
-            return Err("Unity MCPはこのprojectで有効ではありません".into());
+            return Err("Unity MCP is not enabled for this project".into());
         }
 
         let c28_operation_id = crate::management_effect::ManagementOperationIdV1::random()
-            .map_err(|_| "runtime配置IDを作成できません")?;
+            .map_err(|_| "Cannot create a runtime deployment ID")?;
         let c27_operation_id = crate::management_effect::ManagementOperationIdV1::random()
-            .map_err(|_| "registry変更IDを作成できません")?;
+            .map_err(|_| "Cannot create a registry change ID")?;
         let destination = store
             .plan_runtime_version(server_id, &c28_operation_id.as_hex())
-            .map_err(|_| "Unity runtimeの配置先を確認できません")?;
+            .map_err(|_| "Cannot verify the Unity runtime destination")?;
         let binding = UnitySourceBinding::inspect(source, current)?;
         let mut next = before.clone();
         let target = next
             .servers
             .iter_mut()
             .find(|server| server.server_id == server_id)
-            .ok_or("指定されたMCP serverが存在しません")?;
+            .ok_or("The specified MCP server does not exist")?;
         binding.rewrite_server(target, destination.destination())?;
         next.revision = before
             .revision
             .checked_add(1)
-            .ok_or("MCP revisionの上限に達しました")?;
-        next.validate()
-            .map_err(|_| "Unity MCPの更新内容が無効です")?;
+            .ok_or("MCP revision limit reached")?;
+        next.validate().map_err(|_| "Invalid Unity MCP update")?;
 
         let (old_cwd, node, entry, mut secret_references) = match &current.transport {
             Destination::Stdio {
@@ -177,10 +176,14 @@ impl UnityLocalV2Preparation {
                 command.clone(),
                 args.first()
                     .map(PathBuf::from)
-                    .ok_or("既存Unity登録にentry引数がありません")?,
+                    .ok_or("Existing Unity registration has no entry argument")?,
                 secret_env.values().cloned().collect::<Vec<_>>(),
             ),
-            _ => return Err("Unity presetは既存stdio登録だけを更新できます".into()),
+            _ => {
+                return Err(
+                    "The Unity preset can update only an existing stdio registration".into(),
+                );
+            }
         };
         secret_references.sort();
         secret_references.dedup();
@@ -260,10 +263,10 @@ impl UnityLocalV2Preparation {
     pub(crate) fn publish_runtime(&self, store: &Store) -> Result<PublishedUnityRuntime, String> {
         let staging = store
             .create_runtime_version_staging(&self.destination)
-            .map_err(|_| "Unity runtimeのprivate partialを作成できません")?;
+            .map_err(|_| "Cannot create the Unity runtime private partial directory")?;
         let staging_directory = staging
             .try_clone_directory()
-            .map_err(|_| "Unity runtime partialのdescriptorを保持できません")?;
+            .map_err(|_| "Cannot retain the Unity runtime partial descriptor")?;
         let installed = install::populate(
             &self.source,
             &staging_directory,
@@ -273,9 +276,9 @@ impl UnityLocalV2Preparation {
         let receipt = installed.receipt_hash().to_owned();
         let published = staging
             .publish(|directory| installed.verify(directory))
-            .map_err(|_| "Unity runtime publishの結果が不明です")?;
+            .map_err(|_| "Unity runtime publication outcome is unknown")?;
         if published.path() != self.destination.destination() {
-            return Err("publishしたUnity runtimeのidentityが一致しません".into());
+            return Err("Published Unity runtime identity mismatch".into());
         }
         Ok(PublishedUnityRuntime {
             runtime: published,

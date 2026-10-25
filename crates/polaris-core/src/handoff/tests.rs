@@ -19,8 +19,8 @@ fn the_prompt_names_the_generation_and_never_claims_the_check_passed() {
     assert!(text.contains("/work/app"));
     assert!(text.contains("- src/main.rs"));
     assert!(text.contains("1. アプリを起動する"));
-    assert!(text.contains("実機での合格は含まない"));
-    assert!(!text.contains("合格した"));
+    assert!(text.contains("does not establish acceptance on a real device"));
+    assert!(!text.contains("passed acceptance"));
 }
 
 #[test]

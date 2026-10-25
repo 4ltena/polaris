@@ -413,12 +413,7 @@ pub(super) fn default_runtime(manager: Manager) -> Option<std::path::PathBuf> {
 /// here; the attribute is walked rather than imported so a dotted one works.
 fn python_entry_source(module: &str, attribute: &str) -> String {
     format!(
-        "# polarisが書いた。{module}:{attribute}を呼ぶだけで、ほかは何もしない。\n\
-         import importlib, sys\n\
-         _held = importlib.import_module(\"{module}\")\n\
-         for _part in \"{attribute}\".split(\".\"):\n\
-         \x20   _held = getattr(_held, _part)\n\
-         sys.exit(_held())\n"
+        "# Written by polaris. Calls {module}:{attribute} only.\nimport importlib, sys\n_held = importlib.import_module(\"{module}\")\nfor _part in \"{attribute}\".split(\".\"):\n    _held = getattr(_held, _part)\nsys.exit(_held())\n"
     )
 }
 

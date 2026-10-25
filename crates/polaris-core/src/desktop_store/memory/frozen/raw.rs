@@ -9,12 +9,12 @@ fn walk(
     mut accept: impl FnMut(&RawEventV2, u64, &Sha256, &[u8]) -> StoreResult<()>,
 ) -> StoreResult<()> {
     if offset > files.marker.raw_offset.get() || !hash(expected_hash) {
-        return Err(StoreError::Corrupt("固定原文の範囲"));
+        return Err(StoreError::Corrupt("Pinned source range"));
     }
     files.work.charge(offset)?;
     let file = files.raw()?;
     if file.metadata()?.len() < offset {
-        return Err(StoreError::Corrupt("固定原文の不足"));
+        return Err(StoreError::Corrupt("Insufficient pinned source text"));
     }
     let mut reader = BufReader::with_capacity(bounded::BUFFER, file.take(offset));
     let mut digest = Sha256::new();
@@ -28,7 +28,7 @@ fn walk(
             break;
         }
         if count > bounded::RAW_RECORD || !line.ends_with(b"\n") {
-            return Err(StoreError::Corrupt("固定原文の行上限・改行"));
+            return Err(StoreError::Corrupt("Pinned source line limit or newline"));
         }
         let event: RawEventV2 = serde_json::from_slice(&line[..line.len() - 1])?;
         let canonical = serde_json::to_vec(&event)?;
@@ -46,7 +46,7 @@ fn walk(
                     turn != event.turn_id
                 })
         {
-            return Err(StoreError::Corrupt("固定原文の順序・turn境界"));
+            return Err(StoreError::Corrupt("Pinned source order or turn boundary"));
         }
         bytes = bytes
             .checked_add(count as u64)
@@ -57,7 +57,7 @@ fn walk(
         turn = event.turn_id;
     }
     if bytes != offset || format!("{:x}", digest.finalize()) != expected_hash {
-        return Err(StoreError::Corrupt("固定原文のprefix hash"));
+        return Err(StoreError::Corrupt("Pinned source prefix hash"));
     }
     files.owner.verify()?;
     disk::same(
@@ -76,7 +76,7 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
         let s = &attempt.source;
         if let Some(prior) = offsets.insert(s.raw_offset.get(), s.raw_hash.as_str()) {
             if prior != s.raw_hash {
-                return Err(StoreError::Corrupt("固定原文の境界hash競合"));
+                return Err(StoreError::Corrupt("Pinned source boundary hash conflict"));
             }
         } else {
             charge(&mut used, &(s.raw_offset, &s.raw_hash))?;
@@ -86,7 +86,7 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
         if let Some(boundary) = &attempt.coverage {
             if let Some(prior) = coverage.insert(boundary.last_source_sequence, boundary) {
                 if prior != boundary {
-                    return Err(StoreError::Corrupt("固定原文のcoverage競合"));
+                    return Err(StoreError::Corrupt("Pinned source coverage conflict"));
                 }
             } else {
                 charge(&mut used, boundary)?;
@@ -104,7 +104,7 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
                 let mut done = digest.clone();
                 done.update(b"]");
                 if end > *before || format!("{:x}", done.finalize()) != **expected {
-                    return Err(StoreError::Corrupt("固定原文のturn hash"));
+                    return Err(StoreError::Corrupt("Pinned source turn hash"));
                 }
                 *count += 1;
             }
@@ -130,7 +130,7 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
             turn_end = offset;
             if let Some(expected) = offsets.get(&offset) {
                 if format!("{:x}", digest.clone().finalize()) != *expected {
-                    return Err(StoreError::Corrupt("固定原文のsource prefix"));
+                    return Err(StoreError::Corrupt("Pinned source prefix"));
                 }
                 seen_offsets += 1;
             }
@@ -138,7 +138,7 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
                 if expected.raw_offset != offset
                     || expected.prefix_hash != format!("{:x}", digest.clone().finalize())
                 {
-                    return Err(StoreError::Corrupt("固定原文のcoverage境界"));
+                    return Err(StoreError::Corrupt("Pinned source coverage boundary"));
                 }
                 seen_coverage += 1;
             }
@@ -146,12 +146,12 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
                 if event.message.role != expected.role
                     || content_hash(event.message.content.as_bytes()) != expected.content_hash
                 {
-                    return Err(StoreError::Corrupt("固定原文のsource内容"));
+                    return Err(StoreError::Corrupt("Pinned source content"));
                 }
                 if expected.requires_user_input
                     && (!event.starts_turn || event.message.role != Role::User)
                 {
-                    return Err(StoreError::Corrupt("固定原文の利用者入力根拠"));
+                    return Err(StoreError::Corrupt("Pinned source user input evidence"));
                 }
                 seen_bindings += 1;
             }
@@ -167,7 +167,9 @@ pub(super) fn validate(files: &Files<'_>, c: &Collector<'_>) -> StoreResult<BTre
         || seen_bindings != c.bindings.len()
         || seen_turns != turns.len()
     {
-        return Err(StoreError::Corrupt("固定原文の出典境界不在"));
+        return Err(StoreError::Corrupt(
+            "Missing pinned source citation boundary",
+        ));
     }
     Ok(attachments)
 }
@@ -244,7 +246,7 @@ pub(super) fn turn(files: &Files<'_>, source: &SourceStamp) -> StoreResult<Vec<R
         },
     )?;
     if events.is_empty() || content_hash(&serde_json::to_vec(&events)?) != source.turn_hash {
-        return Err(StoreError::Corrupt("固定原文の選択turn"));
+        return Err(StoreError::Corrupt("Pinned source selected turn"));
     }
     Ok(events)
 }

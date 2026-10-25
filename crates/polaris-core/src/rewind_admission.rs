@@ -79,22 +79,22 @@ impl PublicationReadBudgetV1 {
         };
         let parent = crate::project_mutation::open_directory_nofollow(
             path.parent()
-                .ok_or_else(|| invalid("保存ファイルの親がありません"))?,
+                .ok_or_else(|| invalid("The storage file has no parent"))?,
         )?;
         let parent_info = parent.metadata()?;
         if parent_info.uid() != unsafe { libc::geteuid() } || parent_info.mode() & 0o7077 != 0 {
-            return Err(invalid("保存ディレクトリが非公開ではありません"));
+            return Err(invalid("The storage directory is not private"));
         }
         let name = CString::new(
             path.file_name()
-                .ok_or_else(|| invalid("保存ファイル名がありません"))?
+                .ok_or_else(|| invalid("The storage file has no name"))?
                 .as_bytes(),
         )
         .map_err(io::Error::other)?;
         let protection = polaris_auth::protection::with_protected_paths(Clone::clone)
-            .map_err(|_| invalid("保護対象を確認できません"))?;
+            .map_err(|_| invalid("Cannot verify protected resources"))?;
         if protection.paths().contains(path) {
-            return Err(invalid("保護対象を読めません"));
+            return Err(invalid("Cannot read protected resources"));
         }
         let fd = unsafe {
             libc::openat(
@@ -124,18 +124,18 @@ impl PublicationReadBudgetV1 {
                 })
         {
             return Err(invalid(
-                "公開証拠が保護対象、不正なファイル、または読取上限を超えています",
+                "Publication evidence is protected, invalid, or exceeds read limits",
             ));
         }
         let mut body = Vec::new();
         file.take(max as u64 + 1).read_to_end(&mut body)?;
         if body.len() > max {
-            return Err(invalid("公開証拠の読取上限を超えました"));
+            return Err(invalid("Publication evidence exceeds the read limit"));
         }
         self.bytes_read = self
             .bytes_read
             .checked_add(body.len())
-            .ok_or_else(|| invalid("公開証拠の合計上限を超えました"))?;
+            .ok_or_else(|| invalid("Publication evidence exceeds the total limit"))?;
         Ok(body)
     }
 }
@@ -175,7 +175,7 @@ fn published_branch_with_reads(
         child.rewind_branch_metadata_with_reader(&mut |path| publication_read(reads, path))?
     else {
         return if referenced {
-            Err(invalid("候補会話の分岐metadataがありません"))
+            Err(invalid("Missing candidate conversation branch metadata"))
         } else {
             Ok(None)
         };
@@ -199,7 +199,9 @@ fn published_branch_with_reads(
         .committed_branch_transaction_for_candidate_bounded(candidate_id, reads)
         .map_err(io::Error::other)?;
     if transaction.target_pre != pre {
-        return Err(invalid("候補会話のworkspace transactionが一致しません"));
+        return Err(invalid(
+            "Candidate conversation workspace transaction mismatch",
+        ));
     }
     let activity = owner.try_activity_quiescent().map_err(io::Error::other)?;
     match owner
@@ -212,7 +214,9 @@ fn published_branch_with_reads(
     {
         crate::management_effect::ManagementRewindCrossingV1::Clear => {}
         crate::management_effect::ManagementRewindCrossingV1::Blocked { .. } => {
-            return Err(invalid("候補会話は管理effectを越えて巻き戻せません"));
+            return Err(invalid(
+                "The candidate conversation cannot rewind across a management effect",
+            ));
         }
     }
     Ok(Some(verified))
@@ -287,7 +291,7 @@ fn candidate_diagnostics_inner(
         Ok(info) if info.file_type().is_symlink() || !info.is_dir() => {
             diagnostics.push(CandidateDiagnostic {
                 id: "<sessions-v2>".into(),
-                reason: "セッション保存先が安全なディレクトリではありません".into(),
+                reason: "Session storage is not a safe directory".into(),
             });
             return diagnostics;
         }
@@ -340,7 +344,7 @@ fn candidate_diagnostics_inner(
         if file_type.is_symlink() || !file_type.is_dir() {
             diagnostics.push(CandidateDiagnostic {
                 id,
-                reason: "セッション項目が安全なディレクトリではありません".into(),
+                reason: "The session entry is not a safe directory".into(),
             });
             continue;
         }
@@ -360,17 +364,17 @@ fn candidate_diagnostics_inner(
         let state = (|| -> io::Result<ConversationStateV2> {
             let info = match fs::symlink_metadata(&state_path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Err(invalid("state.jsonがありません"));
+                    return Err(invalid("state.json is missing"));
                 }
                 other => other?,
             };
             if info.file_type().is_symlink() || !info.is_file() {
-                return Err(invalid("セッションstateが安全な通常ファイルではありません"));
+                return Err(invalid("Session state is not a safe regular file"));
             }
             let state: ConversationStateV2 = serde_json::from_slice(&fs::read(&state_path)?)?;
             state.validate()?;
             if state.session_id != id {
-                return Err(invalid("セッションstateのIDがディレクトリと一致しません"));
+                return Err(invalid("Session state ID does not match its directory"));
             }
             Ok(state)
         })();
@@ -388,7 +392,7 @@ fn candidate_diagnostics_inner(
             if referenced {
                 diagnostics.push(CandidateDiagnostic {
                     id,
-                    reason: "候補transactionのprojectが一致しません".into(),
+                    reason: "Candidate transaction project mismatch".into(),
                 });
             }
             continue;
@@ -398,11 +402,12 @@ fn candidate_diagnostics_inner(
         }
         let published = match owner {
             Some(owner) => ConversationStore::open(data_root, project_id, &id).and_then(|child| {
-                let branch = published_branch(owner, &child)?
-                    .ok_or_else(|| invalid("候補会話の公開証拠がありません"))?;
+                let branch = published_branch(owner, &child)?.ok_or_else(|| {
+                    invalid("Missing candidate conversation publication evidence")
+                })?;
                 validate_published_branch_head_read_only(owner, &child, &branch)
             }),
-            None => Err(invalid("巻き戻しworkspace証拠がありません")),
+            None => Err(invalid("Missing rewind workspace evidence")),
         };
         if let Err(error) = published {
             diagnostics.push(CandidateDiagnostic {
@@ -414,7 +419,7 @@ fn candidate_diagnostics_inner(
     for id in transaction_ids {
         diagnostics.push(CandidateDiagnostic {
             id,
-            reason: "候補transactionの子会話がありません".into(),
+            reason: "Missing candidate transaction child conversation".into(),
         });
     }
     diagnostics.sort_by(|left, right| left.id.cmp(&right.id));
@@ -453,7 +458,9 @@ fn validate_published_branch_head_read_only(
                 .map(|completion| completion.workspace_post_manifest_id.clone())
         }
     }
-    .ok_or_else(|| invalid("候補会話の現在headを作業ファイルへ結び付けられません"))?;
+    .ok_or_else(|| {
+        invalid("Cannot bind the candidate conversation's current head to workspace files")
+    })?;
     let manifest: ManifestId = expected.parse().map_err(io::Error::other)?;
     if owner
         .matches_manifest(&manifest)
@@ -461,7 +468,9 @@ fn validate_published_branch_head_read_only(
     {
         Ok(())
     } else {
-        Err(invalid("候補会話と現在の作業ファイルが一致しません"))
+        Err(invalid(
+            "Candidate conversation does not match current workspace files",
+        ))
     }
 }
 
@@ -513,12 +522,12 @@ pub fn validate_execution(
         Some(expected) => expected,
         None if branch.is_some() => {
             return Err(invalid(
-                "この会話の保存境界と現在のファイル状態を照合できません",
+                "Cannot reconcile this conversation's saved boundary with current file state",
             ));
         }
         None if binding_is_stale && !pending => {
             return Err(invalid(
-                "会話の保存境界と作業ファイルの結び付けが一致しません",
+                "Conversation save boundary and workspace file binding mismatch",
             ));
         }
         None => {
@@ -545,7 +554,7 @@ pub fn validate_execution(
         Ok(())
     } else {
         Err(invalid(
-            "保存済み会話と現在の作業ファイルが一致しません。別の会話を選んでください",
+            "The saved conversation does not match current workspace files. Select another conversation",
         ))
     }
 }
@@ -616,7 +625,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|item| { item.id == child_id && item.reason.contains("workspace証拠") })
+                .any(|item| { item.id == child_id && item.reason.contains("workspace evidence") })
         );
         assert!(
             diagnostics

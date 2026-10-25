@@ -155,7 +155,7 @@ pub(crate) fn read_tool_memory_origin(path: &Path) -> io::Result<Option<String>>
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     if !value.is_object() {
-        return Err(io::Error::other("記憶のセッションメタデータが不正です"));
+        return Err(io::Error::other("Invalid memory session metadata"));
     }
     match value.get("tool_memory_origin") {
         None => Ok(None),
@@ -167,7 +167,7 @@ pub(crate) fn read_tool_memory_origin(path: &Path) -> io::Result<Option<String>>
         {
             Ok(Some(origin.clone()))
         }
-        _ => Err(io::Error::other("記憶の元セッションIDが不正です")),
+        _ => Err(io::Error::other("Invalid memory source session ID")),
     }
 }
 

@@ -65,7 +65,7 @@ impl Provider for FakeProvider {
             let marker = &request.messages[request.messages.len() - 2];
             assert_eq!(marker.role, Role::Tool);
             assert_eq!(marker.tool_call_id.as_deref(), Some("fixture-call"));
-            assert!(marker.content.contains("結果は不明"));
+            assert!(marker.content.contains("outcome is unknown"));
             return Ok(CompletionResponse {
                 text: "continued without replay".into(),
                 ..Default::default()
@@ -1070,7 +1070,7 @@ fn real_engine_strict10_oversized_provenance_stops_before_embedding_and_main_wit
     let memory = run.memory.as_ref().unwrap();
     assert_eq!(
         memory.detail,
-        "出典情報を含む記憶が256トークンを超えたため主要求を開始していません。要約は自動再送していません"
+        "The main request was not started because memory including source information exceeds 256 tokens. Summarization was not resent automatically"
     );
     assert_eq!(
         memory

@@ -28,7 +28,7 @@ impl ResolvedStructuredSource {
         bytes: &[u8],
     ) -> io::Result<Self> {
         polaris_memory::structured::validate_publication(&publication).map_err(io::Error::other)?;
-        let fail = || io::Error::other("構造化出典の原文・範囲が一致しません");
+        let fail = || io::Error::other("Structured source text or range mismatch");
         if !bytes.ends_with(b"\n")
             || crate::conversation_state::content_hash(bytes) != publication.raw_hash
         {
@@ -83,7 +83,9 @@ impl ResolvedStructuredSource {
             || i64::try_from(event.epoch).ok() != Some(publication.scope.epoch)
             || source_id != expected
         {
-            return Err(io::Error::other("構造化出典の原文識別子が一致しません"));
+            return Err(io::Error::other(
+                "Structured source text identifier mismatch",
+            ));
         }
         Ok(Self {
             publication,
@@ -113,10 +115,12 @@ pub(crate) fn owner_publication_view(
     state: &ConversationStateV2,
 ) -> io::Result<StructuredPublicationView> {
     if state.history_mode != HistoryMode::Structured10 {
-        return Err(io::Error::other("構造化記憶が有効ではありません"));
+        return Err(io::Error::other("Structured memory is disabled"));
     }
-    let number =
-        |n: u64| i64::try_from(n).map_err(|_| io::Error::other("構造化記憶の保存世代が上限です"));
+    let number = |n: u64| {
+        i64::try_from(n)
+            .map_err(|_| io::Error::other("Structured memory storage generation limit reached"))
+    };
     Ok(StructuredPublicationView {
         scope: PublicationScope {
             project_id: state.project_id.clone(),
@@ -235,7 +239,7 @@ pub fn source_uri(publication_id: &str, source_id: &str) -> io::Result<String> {
 
 fn valid_component(value: &str) -> io::Result<()> {
     if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
-        return Err(io::Error::other("構造化出典URIの識別子が不正です"));
+        return Err(io::Error::other("Invalid structured source URI identifier"));
     }
     Ok(())
 }
@@ -252,7 +256,7 @@ fn encode_component(value: &str) -> String {
     encoded
 }
 fn decode_component(value: &str) -> io::Result<String> {
-    let invalid = || io::Error::other("構造化出典URIが不正です");
+    let invalid = || io::Error::other("Invalid structured source URI");
     let bytes = value.as_bytes();
     let mut decoded = Vec::new();
     let mut at = 0;
@@ -287,7 +291,7 @@ fn uri_at(publication: &str, source: &str, offset: usize) -> String {
 }
 
 pub(crate) fn parse_source_uri(uri: &str) -> io::Result<(String, String, usize)> {
-    let invalid = || io::Error::other("構造化出典URIが不正です");
+    let invalid = || io::Error::other("Invalid structured source URI");
     if uri.len() > 8192 {
         return Err(invalid());
     }

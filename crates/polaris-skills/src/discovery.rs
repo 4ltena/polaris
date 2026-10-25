@@ -123,6 +123,11 @@ pub fn discover(project_root: &Path, extra_paths: &[PathBuf]) -> Discovered {
     }
     dirs.extend_from_slice(extra_paths);
     let mut discovered = discover_in(&dirs);
+    // This explicit namespace always resolves to shipped source. A project
+    // skill named envkit remains optional user content and grants no authority.
+    discovered
+        .skills
+        .retain(|skill| skill.name != "builtin:envkit");
     for skill in crate::builtin::skills() {
         if !discovered.skills.iter().any(|held| held.name == skill.name) {
             discovered.skills.push(skill);

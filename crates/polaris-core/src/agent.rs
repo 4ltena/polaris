@@ -31,7 +31,9 @@ mod workflow_control;
 pub enum AgentError {
     #[error("MCP execution stopped: {0}")]
     Mcp(#[from] crate::mcp::runtime::Error),
-    #[error("MCP操作の結果を確認できません。外部の状態を確認してください。自動では再実行しません")]
+    #[error(
+        "Cannot verify the MCP operation outcome. Check external state. It will not be retried automatically"
+    )]
     McpUnconfirmed,
     #[error("desktop event delivery stopped: {0}")]
     Desktop(crate::desktop_events::EventFailure),
@@ -324,7 +326,7 @@ async fn classify_opening(
     }
     let decider = session.decider.clone();
     let state = serde_json::json!({
-        "purpose": "この利用者のturnが何であり、どう進めるべきかを決める",
+        "purpose": "Determine the nature of this user turn and how to proceed",
         "request": opening,
     });
     let turn = session.messages.len() as u64;
@@ -362,7 +364,7 @@ async fn classify_opening(
     // the same terminal as stderr, so direct diagnostics were painted over
     // its composer and looked like editable input.
     let axes = format!(
-        "route={} 発話={:?} 作業={:?} 明確さ={:?} 文脈={:?} 進め方={:?} effort={:?} effective_effort={:?} analysis_stage={}",
+        "route={} utterance={:?} task={:?} clarity={:?} context={:?} approach={:?} effort={:?} effective_effort={:?} analysis_stage={}",
         route.map_or("-".to_owned(), |route| format!("{route:?}")),
         intent.utterance,
         intent.work,
@@ -1044,7 +1046,7 @@ pub(crate) async fn run_loop(
     // so checking once covers the run.
     if session.examples.len() > MAX_EXAMPLES {
         return Err(std::io::Error::other(format!(
-            "examplesが{MAX_EXAMPLES}件を超えました（{}件）",
+            "examples exceeds {MAX_EXAMPLES} entries ({} entries)",
             session.examples.len()
         ))
         .into());
@@ -1052,7 +1054,7 @@ pub(crate) async fn run_loop(
     let example_tokens = crate::compaction::session_tokens(&session.examples);
     if example_tokens > MAX_EXAMPLE_TOKENS {
         return Err(std::io::Error::other(format!(
-            "examplesが{MAX_EXAMPLE_TOKENS}tokensを超えました（{example_tokens}tokens）"
+            "examples exceeds {MAX_EXAMPLE_TOKENS} tokens ({example_tokens} tokens)"
         ))
         .into());
     }
@@ -1078,6 +1080,12 @@ pub(crate) async fn run_loop(
     let mcp_setup = session.mcp_setup.clone().filter(|_| caller == "root");
     if mcp_setup.is_some() {
         request_tools.push(polaris_tools::mcp_setup_spec());
+    }
+    #[cfg(target_os = "macos")]
+    let environment = session.environment.clone().filter(|_| caller == "root");
+    #[cfg(target_os = "macos")]
+    if environment.is_some() {
+        request_tools.push(polaris_tools::environment_spec());
     }
     // The bundled setting commands, on the same root-only footing: a child
     // run never gets to change the project's configuration.
@@ -1510,7 +1518,7 @@ pub(crate) async fn run_loop(
         );
         if floor > crate::budget::BUDGET_LIMIT {
             return Err(std::io::Error::other(format!(
-                "常時contextが{}tokensを超えました（{floor}tokens）",
+                "Always-on context exceeds {} tokens ({floor} tokens)",
                 crate::budget::BUDGET_LIMIT
             ))
             .into());
@@ -1559,7 +1567,7 @@ pub(crate) async fn run_loop(
             && prepared.slice().is_some()
         {
             let source = session.input_source.as_ref().ok_or_else(|| {
-                std::io::Error::other("active workflow contextを実ユーザー入力へ結び付けられません")
+                std::io::Error::other("Cannot bind active workflow context to actual user input")
             })?;
             let projection = prepared
                 .insert_once(&mut sending_messages, source)
@@ -1606,7 +1614,7 @@ pub(crate) async fn run_loop(
                     {
                         let source = compacted_workflow_input.as_ref().ok_or_else(|| {
                             std::io::Error::other(
-                                "compaction後のactive workflow contextを実入力へ再結合できません",
+                                "Cannot rebind active workflow context to actual input after compaction",
                             )
                         })?;
                         workflow_context_projected = prepared
@@ -1844,6 +1852,36 @@ pub(crate) async fn run_loop(
                 }
                 continue;
             }
+            #[cfg(target_os = "macos")]
+            if let Some(tool) = environment.as_ref()
+                && call.name == "environment"
+            {
+                check_event_delivery(events.as_ref())?;
+                mcp_dispatch::event(events.as_ref(), call, None);
+                let outcome = tool
+                    .call(&call.arguments, ctx.sandbox, ctx.gate, &mut *ctx.approver)
+                    .await;
+                let ok = outcome.is_ok();
+                let body = outcome.unwrap_or_else(|reason| reason);
+                session.push_tool_result(&call.id, &body);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &body,
+                    caller,
+                })?;
+                mcp_dispatch::event(events.as_ref(), call, Some((&body, ok)));
+                siblings_ok &= ok;
+                if ok {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&body) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
             if let Some(tool) = setting.as_ref()
                 && call.name == "setting"
             {
@@ -1967,9 +2005,11 @@ pub(crate) async fn run_loop(
                         let contract = session
                             .routine_change_authorization
                             .as_ref()
-                            .and_then(|authority| authority.contract_input_for(&previous_user_prompt))
+                            .and_then(|authority| {
+                                authority.contract_input_for(&previous_user_prompt)
+                            })
                             .ok_or_else(|| {
-                                "このuser turnに対するhostのroutine change authorizationがありません"
+                                "No host routine change authorization for this user turn"
                                     .to_string()
                             })
                             .and_then(|(eligibility, trusted_verification)| {
@@ -2003,9 +2043,10 @@ pub(crate) async fn run_loop(
                             {
                                 Ok(reference) => {
                                     session.routine_change_authorization = None;
-                                    let workflow = session.workflow.as_ref().ok_or_else(|| {
-                                        std::io::Error::other("workflowがありません")
-                                    })?;
+                                    let workflow = session
+                                        .workflow
+                                        .as_ref()
+                                        .ok_or_else(|| std::io::Error::other("No workflow"))?;
                                     workflow
                                         .request_phase(crate::workflow::Phase::Implement)
                                         .map_err(std::io::Error::other)?;
@@ -2084,9 +2125,10 @@ pub(crate) async fn run_loop(
                 check_event_delivery(events.as_ref())?;
                 let outcome = match verification::parse(call) {
                     Ok(crate::verification::VerificationCheckpointActionV1::Prepare) => {
-                        let owner = session.verification_owner.clone().ok_or_else(|| {
-                            std::io::Error::other("verification ownerがありません")
-                        })?;
+                        let owner = session
+                            .verification_owner
+                            .clone()
+                            .ok_or_else(|| std::io::Error::other("No verification owner"))?;
                         owner.prepare().map_err(std::io::Error::other).and_then(|checkpoint| {
                             let checkpoint_id = checkpoint.checkpoint_id.clone();
                             session.persist_verification_checkpoint(checkpoint)?;
@@ -2096,9 +2138,10 @@ pub(crate) async fn run_loop(
                     Ok(crate::verification::VerificationCheckpointActionV1::Run {
                         preparation_id,
                     }) => {
-                        let owner = session.verification_owner.clone().ok_or_else(|| {
-                            std::io::Error::other("verification ownerがありません")
-                        })?;
+                        let owner = session
+                            .verification_owner
+                            .clone()
+                            .ok_or_else(|| std::io::Error::other("No verification owner"))?;
                         let checkpoint = owner
                             .begin_run(&preparation_id)
                             .map_err(std::io::Error::other)?;
@@ -2118,12 +2161,12 @@ pub(crate) async fn run_loop(
                                 .workflow
                                 .as_ref()
                                 .map(|workflow| workflow.state().revision)
-                                .ok_or_else(|| std::io::Error::other("published workflowがありません"))?;
+                                .ok_or_else(|| std::io::Error::other("No published workflow"))?;
                             Ok(serde_json::json!({"status":"published","checkpoint_id":checkpoint_id,"workflow_revision":revision}).to_string())
                         })
                     }
                     Ok(crate::verification::VerificationCheckpointActionV1::Publish { .. }) => Err(
-                        std::io::Error::other("verification publishはhost ownerだけが実行できます"),
+                        std::io::Error::other("Only the host owner can publish verification"),
                     ),
                     Err(error) => Err(std::io::Error::other(error)),
                 };
@@ -2157,7 +2200,7 @@ pub(crate) async fn run_loop(
                         | workflow_control::StateOperation::Transition { .. },
                     ) if !is_adaptive => Err(workflow_control::error(
                         "unavailable",
-                        "この実行では段階操作を使えません",
+                        "Phase operations are unavailable for this run",
                     )),
                     Ok(workflow_control::StateOperation::Get) => Ok(workflow_control::get(session)),
                     Ok(workflow_control::StateOperation::Window { since }) => {
@@ -2175,7 +2218,7 @@ pub(crate) async fn run_loop(
                     Ok(workflow_control::StateOperation::Transition { .. }) => {
                         Err(workflow_control::error(
                             "not_applied",
-                            "同一応答に複数の段階変更があります",
+                            "Multiple phase changes in the same response",
                         ))
                     }
                     Err(e) => Err(workflow_control::error("invalid_arguments", &e)),
@@ -2267,8 +2310,7 @@ pub(crate) async fn run_loop(
                     // the list from the state above.
                     request_tools.retain(|tool| tool.name != crate::turn_intent::CLARIFY);
                     Ok(format!(
-                        "{} 件の質問を記録した。この turn ではもう道具を使わず、\
-                         質問だけを利用者へ返すこと。回答は次の入力として届く。",
+                        "Recorded {} questions. Use no further tools this turn; return only the questions to the user. Answers will arrive as the next input.",
                         questions.len()
                     ))
                 }
@@ -2520,7 +2562,7 @@ pub(crate) async fn run_loop(
             } else {
                 Err(workflow_control::error(
                     "not_applied",
-                    "同じ応答のtoolが失敗したため段階を変更しません",
+                    "The phase was not changed because a tool in the same response failed",
                 ))
             };
             let ok = outcome.is_ok();
@@ -2834,13 +2876,13 @@ pub(crate) async fn dispatch_conversation_read(
                 .as_object()
                 .is_none_or(|args| args.keys().any(|key| key != "path")))
     {
-        Err("関連検索には予約URIだけを指定してください".into())
+        Err("Related search accepts only reserved URIs".into())
     } else if let Some(desktop) = desktop {
         desktop.read(path).await.map_err(|error| error.to_string())
     } else if search {
         async {
             let (Some(saved), Some(history)) = (saved, history) else {
-                return Err("この実行経路では関連検索が利用できません".into());
+                return Err("Related search is unavailable on this execution path".into());
             };
             saved.snapshot().map_err(|error| error.to_string())?;
             let result = history
@@ -2853,7 +2895,9 @@ pub(crate) async fn dispatch_conversation_read(
         .await
     } else {
         saved
-            .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
+            .ok_or_else(|| {
+                "Persistent storage of original conversation text is disabled".to_string()
+            })
             .and_then(|saved| {
                 saved.snapshot().map_err(|error| error.to_string())?;
                 crate::conversation_memory::read_source(&saved.store, &saved.database, path)
@@ -3289,7 +3333,7 @@ async fn dispatch_controlled(
                                 // that the one they read is the one that ran.
                                 let recorded = audit.lock().await.record(&Record {
                                     tool: "spawn-type",
-                                    detail: named.unwrap_or("(型の指定なし)"),
+                                    detail: named.unwrap_or("(no type specified)"),
                                     sandbox: None,
                                     target: None,
                                     result: &resolved,
@@ -3307,7 +3351,7 @@ async fn dispatch_controlled(
                                 // nobody asked for.
                                 None => {
                                     break 'spawn Err(
-                                        "tasks[].type がなく、判定器も型を選べませんでした"
+                                        "tasks[].type is missing and the decider could not select a type"
                                             .to_string(),
                                     );
                                 }
@@ -3322,7 +3366,7 @@ async fn dispatch_controlled(
                         Some(name) => name.to_string(),
                         None => {
                             break 'spawn Err(
-                                "tasks[].type がありません（判定器が無い場合は型名が要ります）"
+                                "tasks[].type is missing (a type name is required without a decider)"
                                     .to_string(),
                             );
                         }
@@ -3383,7 +3427,7 @@ async fn dispatch_controlled(
 fn lookup_skill(skills: &[polaris_skills::Skill], query: &str) -> String {
     let query = query.trim();
     if skills.iter().filter(|skill| skill.name == query).count() > 1 {
-        return "同名のskillが複数あるため、本文を開示できません。".into();
+        return "Cannot disclose the skill body because multiple skills share this name.".into();
     }
     polaris_tools::skill::lookup(skills, query)
 }
@@ -3519,7 +3563,7 @@ mod tests {
                     .await;
             assert_eq!(
                 result.unwrap_err(),
-                "関連検索には予約URIだけを指定してください"
+                "Related search accepts only reserved URIs"
             );
         }
         assert_eq!(
@@ -3533,7 +3577,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            "この実行経路では関連検索が利用できません"
+            "Related search is unavailable on this execution path"
         );
         assert!(crate::conversation_memory::parse_uri(SEARCH_URI).is_err());
     }
@@ -5647,8 +5691,8 @@ mod tests {
             .expect("the answer");
         let answer: serde_json::Value =
             serde_json::from_str(&result.content).expect("the tool answers with JSON");
-        assert_eq!(answer["nextjs"]["applicable"], true);
-        assert_eq!(answer["nextjs"]["install_requires_person"], true);
+        assert!(answer.get("nextjs").is_none());
+        assert_eq!(answer["git"]["applicable"], false);
         // Planning changed nothing in the project.
         assert!(!root.join("node_modules").exists());
         assert!(!root.join("next.config.mjs").exists());
@@ -6464,7 +6508,7 @@ mod tests {
             },
         ];
         let result = lookup_skill(&skills, "workflow-core");
-        assert!(result.contains("複数"));
+        assert!(result.contains("multiple skills share this name"));
         assert!(!result.contains("builtin body"));
         assert!(!result.contains("user body"));
     }
@@ -9580,7 +9624,7 @@ print("wrote")
         for (examples, reason) in [
             (
                 vec![polaris_provider::Message::user("ex"); MAX_EXAMPLES + 1],
-                "件",
+                "entries",
             ),
             (
                 vec![polaris_provider::Message::user("y".repeat(4_000))],

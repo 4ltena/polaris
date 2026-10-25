@@ -238,7 +238,7 @@ impl RunExecution {
                 ),
                 state: PendingApprovalState::Pending,
                 display: ApprovalDisplay {
-                    title: "コマンド実行".into(),
+                    title: "Run command".into(),
                     description: format!(
                         "{}\n{}",
                         excerpt(

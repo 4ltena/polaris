@@ -40,8 +40,9 @@ fn windows_sync_apply_refuses_before_creating_or_changing_project_state() {
             .expect("launch Windows product");
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("Windowsでは共有内容の反映は未対応です。変更していません。")
+            String::from_utf8_lossy(&output.stderr).contains(
+                "Applying shared content is unsupported on Windows. No changes were made."
+            )
         );
         assert_eq!(contents(root.path()), before);
     }

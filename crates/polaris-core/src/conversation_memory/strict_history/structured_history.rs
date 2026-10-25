@@ -14,7 +14,9 @@ impl StrictHistory {
             Some(response) => response,
             None => {
                 if !work.newly_started {
-                    return Err(io::Error::other("構造化抽出の再送は許可されていません"));
+                    return Err(io::Error::other(
+                        "Resending structured extraction is not authorized",
+                    ));
                 }
                 let view = structured::sources::publication_view(&work.source.state)?;
                 let response = self
@@ -49,7 +51,7 @@ impl StrictHistory {
                     || pending.embedding.dimension != metadata.dimension
                 {
                     return Err(io::Error::other(
-                        "保存済み埋め込みと現在の資源が一致しません",
+                        "Saved embeddings do not match current resources",
                     ));
                 }
                 pending
@@ -72,7 +74,9 @@ impl StrictHistory {
         loop {
             let snapshot = store.lock()?.snapshot()?;
             if snapshot.state.history_mode != HistoryMode::Structured10 {
-                return Err(io::Error::other("構造化記憶の復旧対象ではありません"));
+                return Err(io::Error::other(
+                    "Not eligible for structured memory recovery",
+                ));
             }
             let work = match unsummarized_expired_turn(&snapshot)? {
                 Some(turn) => {

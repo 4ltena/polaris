@@ -595,7 +595,9 @@ fn prompt_ledger_rejects_extra_provider_metadata_on_saved_supplement() {
     fs::write(directory.join(disk::MARKER), &marker_bytes).unwrap();
     assert!(matches!(
         root.open(&project(), &session()),
-        Err(StoreError::Corrupt("MCP prompt補助原文の対応"))
+        Err(StoreError::Corrupt(
+            "MCP prompt supplemental source association"
+        ))
     ));
     assert_eq!(fs::read(directory.join(disk::RAW)).unwrap(), raw_bytes);
     assert_eq!(

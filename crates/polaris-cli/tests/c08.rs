@@ -132,9 +132,9 @@ fn assert_runtime_refusal(arguments: &[&str], expected: &str) {
 #[cfg(unix)]
 fn non_tty_refusal() -> &'static str {
     if cfg!(target_os = "macos") {
-        "C08の確定にはTTY確認または--yesが必要です。"
+        "C08 confirmation requires a TTY or --yes."
     } else {
-        "共有参加とcredential rebindはmacOSのData Protection Keychainでのみ利用できます。"
+        "Joining shares and rebinding credentials require the macOS Data Protection Keychain."
     }
 }
 
@@ -204,12 +204,12 @@ fn c08_explicit_join_abandon_preserves_fields_until_confirmation() {
     // The complete request reaches confirmation. Omitting a reconstructed join
     // field must fail before that boundary, proving abandon did not discard it.
     for (flag, diagnostic) in [
-        ("--share-id", "--share-idが必要です"),
-        ("--invitation-id", "--invitation-idが必要です"),
-        ("--expires", "--expiresが必要です"),
+        ("--share-id", "--share-id is required"),
+        ("--invitation-id", "--invitation-id is required"),
+        ("--expires", "--expires is required"),
         (
             "--joined-at",
-            "join中止の再構成には確認時の--joined-atが必要です",
+            "Reconstructing a join abandonment requires the confirmed --joined-at timestamp",
         ),
     ] {
         let mut incomplete = arguments.clone();

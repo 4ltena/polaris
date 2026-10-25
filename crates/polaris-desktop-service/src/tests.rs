@@ -1526,7 +1526,7 @@ fn persisted_tool_results_keep_their_history_role() {
             ResultId::new("full-result").unwrap(),
             vec![
                 polaris_provider::Message::assistant_with_tool_calls(
-                    "確認",
+                    "Confirm",
                     vec![polaris_provider::ToolCall {
                         id: "call".into(),
                         name: "read".into(),

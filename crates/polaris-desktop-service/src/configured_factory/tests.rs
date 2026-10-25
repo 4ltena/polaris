@@ -1119,20 +1119,20 @@ async fn decision_status_preserves_unavailable_configuration_and_observed_capaci
     factory.resources.decision_config.model = Some("synthetic-uninstalled-profile".into());
     let unavailable = factory.decision_status().unwrap().join("\n");
     assert!(unavailable.contains("synthetic-uninstalled-profile"));
-    assert!(unavailable.contains("構築不可"));
+    assert!(unavailable.contains("cannot construct"));
     let meter = DecisionMeter::default();
     let judge = meter.wrap(Arc::new(CapacityJudge));
     factory.resources.decider = Some(judge.clone());
     let before = factory.decision_status().unwrap().join("\n");
-    assert!(before.contains("観測なし"));
+    assert!(before.contains("no completion or discard observed"));
     assert!(meter.recent().is_empty());
     judge
         .observe(&serde_json::Value::Null, &Default::default())
         .await;
     let after = factory.decision_status().unwrap().join("\n");
-    assert!(after.contains("会話別の使用量ではありません"));
+    assert!(after.contains("not per-conversation usage"));
     assert!(after.contains("ColocatedModels"));
-    assert!(after.contains("呼出=false"));
+    assert!(after.contains("call=false"));
     assert_eq!(meter.recent().len(), 1);
     assert_eq!(fixture.tokens.0.load(Ordering::SeqCst), 0);
 }

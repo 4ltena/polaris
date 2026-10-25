@@ -26,7 +26,9 @@ use std::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
-    #[error("本番サービスの認証・設定・実行資源を確認できませんでした")]
+    #[error(
+        "Could not verify production service authentication, configuration, or execution resources"
+    )]
     Generic,
     #[error("{0}")]
     Memory(crate::MemoryResourceError),

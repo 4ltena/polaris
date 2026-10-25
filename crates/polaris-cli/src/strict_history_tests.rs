@@ -267,7 +267,7 @@ fn linux_strict_history_refuses_before_provider_or_runtime_state() {
     .expect("Linux has no verified runtime image");
     assert_eq!(
         error,
-        "strict10の読取専用runtime imageはこの環境で利用できません"
+        "The strict10 read-only runtime image is unavailable in this environment"
     );
     assert!(!runtime_home.exists());
     assert!(!private_root.exists());

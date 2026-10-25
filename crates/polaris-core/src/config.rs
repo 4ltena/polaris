@@ -815,16 +815,16 @@ struct RawSpawn {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("[decision.system_one]は利用者のconfigにだけ設定できます")]
+    #[error("[decision.system_one] may only be set in user configuration")]
     UserOnlySystemOne,
     #[error(
-        "System Oneには専用設定のendpoint・model・credential_envが必要です。base_url/model/helperとの併用はできません"
+        "System One requires dedicated endpoint, model, and credential_env settings. It cannot be combined with base_url/model/helper"
     )]
     InvalidSystemOne,
-    #[error("[decision.fallback]は利用者のconfigにだけ設定できます")]
+    #[error("[decision.fallback] may only be set in user configuration")]
     UserOnlyDecisionFallback,
     #[error(
-        "[decision.fallback]にはpurposes=[\"routing\"]、1〜3件のtargets、1〜target数+1のmax_attempts、1〜300000ms内の時間上限が必要です"
+        "[decision.fallback] requires purposes=[\"routing\"], 1–3 targets, max_attempts from 1 to target count + 1, and time limits within 1–300000 ms"
     )]
     InvalidDecisionFallback,
     #[error("cannot read {path}: {source}")]
@@ -837,44 +837,46 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
-    #[error("[tier] のmodelとeffortに空の値は書けません")]
+    #[error("Model and effort values in [tier] cannot be empty")]
     EmptyTierValue,
-    #[error("[decision] backend は jev・semif・clef・system-one のいずれかです（{0} は不明）")]
+    #[error("[decision] backend must be jev, semif, clef, or system-one ({0} is unknown)")]
     UnknownDecisionBackend(String),
-    #[error("[decision] backend = \"semif\" には helper への絶対pathが必要です")]
+    #[error("[decision] backend = \"semif\" requires an absolute helper path")]
     MissingDecisionHelper,
-    #[error("[decision] helper は backend = \"semif\" のときだけ指定できます")]
+    #[error("[decision] helper is supported only with backend = \"semif\"")]
     UnusedDecisionHelper,
-    #[error("[decision] helper は絶対pathで書いてください（{0} は相対）")]
+    #[error("[decision] helper must be an absolute path ({0} is relative)")]
     RelativeDecisionHelper(PathBuf),
-    #[error("[decision] のbase_urlとmodelに空の値は書けません")]
+    #[error("base_url and model in [decision] cannot be empty")]
     EmptyDecisionValue,
-    #[error("[decision] backend = \"clef\" には model に固定profile IDが必要です")]
+    #[error("[decision] backend = \"clef\" requires a pinned profile ID in model")]
     MissingClefProfile,
-    #[error("[decision] Clef model はpathではなく固定profile IDで指定してください")]
+    #[error("Specify the [decision] Clef model as a pinned profile ID, not a path")]
     InvalidClefProfile,
-    #[error("[decision] Clefではbase_urlを指定できません")]
+    #[error("[decision] Clef does not accept base_url")]
     UnusedClefEndpoint,
-    #[error("[build_cache] のmax_bytesを読めません。80GiB・500MB・バイト数のいずれかで書きます")]
+    #[error(
+        "Cannot parse [build_cache] max_bytes. Use a size such as 80GiB, 500MB, or a byte count"
+    )]
     BuildCacheSize,
-    #[error("[build_cache] のmax_percentは1から100までです")]
+    #[error("[build_cache] max_percent must be from 1 to 100")]
     BuildCacheShare,
-    #[error("[llama_cpp] には server・models_dir・build の3つすべてが要ります")]
+    #[error("[llama_cpp] requires server, models_dir, and build")]
     IncompleteLlamaCpp,
     #[error(
-        "[presentation] と [answer_finalizer] はOSユーザーの ~/.polaris/config.toml にだけ保存できます"
+        "[presentation] and [answer_finalizer] may only be stored in the OS user's ~/.polaris/config.toml"
     )]
     UserOnlyFinalizerSetting,
-    #[error("answer_finalizer.mode = \"shadow\" または \"enforce\" には judge_profile が必要です")]
+    #[error("answer_finalizer.mode = \"shadow\" or \"enforce\" requires judge_profile")]
     MissingFinalizerJudgeProfile,
-    #[error("answer_finalizer.translation.enabled = true には固定profileが必要です")]
+    #[error("answer_finalizer.translation.enabled = true requires a pinned profile")]
     MissingTranslationProfile,
-    #[error("managed-preferences.toml の answer_finalizer.mode は off か shadow だけです")]
+    #[error("answer_finalizer.mode in managed-preferences.toml must be off or shadow")]
     ManagedFinalizerMode,
-    #[error("answer_finalizer.external_disclosure = true は shadow モードでのみ指定できます")]
+    #[error("answer_finalizer.external_disclosure = true is supported only in shadow mode")]
     ExternalFinalizerDisclosureMode,
     #[error(
-        "managed-preferences.toml の translation は enabled=true と固定CAT profileを同時に指定します"
+        "translation in managed-preferences.toml requires both enabled=true and a pinned CAT profile"
     )]
     ManagedTranslation,
 }

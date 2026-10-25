@@ -93,12 +93,15 @@ pub async fn select_judged(
     let Some(judge) = judge.filter(|_| !strong && lines.len() <= MAX_JUDGED_LINES) else {
         return select(text, budget_bytes);
     };
-    let named: Vec<(&str, &str)> = lines.iter().map(|line| ("行", clamp_line(line))).collect();
+    let named: Vec<(&str, &str)> = lines
+        .iter()
+        .map(|line| ("line", clamp_line(line)))
+        .collect();
     let Ok(bands) = crate::decision_bands::judge(
         judge,
         &serde_json::json!({ "task": query }),
         query,
-        "行",
+        "line",
         &named,
         std::future::pending(),
     )
@@ -281,7 +284,7 @@ fn fit_front(lines: &[&str], (start, end): (usize, usize), room: usize) -> (usiz
 /// in, and it states the count: an unqualified `...` would let a truncated log
 /// pass for a complete one.
 fn omission(lines: usize) -> String {
-    format!("… {} 行省略 …", grouped(lines))
+    format!("… {} lines omitted …", grouped(lines))
 }
 
 fn grouped(count: usize) -> String {

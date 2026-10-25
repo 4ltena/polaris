@@ -93,7 +93,7 @@ pub fn render_choice_screen(frame: &mut Frame, selected: Choice) {
     ));
     lines.push(Line::from(""));
     lines.push(Line::from(
-        "\u{2191}/\u{2193} or 1/2 to choose, Enter to continue",
+        "\u{2191}/\u{2193} or 1/2 to choose, Enter to continue, Esc/Ctrl-C to cancel",
     ));
 
     frame.render_widget(
@@ -108,7 +108,9 @@ pub fn render_api_key_prompt(frame: &mut Frame, typed_len: usize) {
     let [prompt_area, input_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Length(3)]).areas(area);
     frame.render_widget(
-        Paragraph::new("Paste or type your OpenAI API key, then press Enter."),
+        Paragraph::new(
+            "Paste or type your OpenAI API key, then press Enter.\nEsc/Ctrl-C to cancel.",
+        ),
         prompt_area,
     );
     let masked: String = "*".repeat(typed_len);
@@ -140,6 +142,7 @@ pub fn apply_choice_key(key: KeyEvent) -> ChoiceAction {
             ChoiceAction::Toggle
         }
         KeyCode::Enter => ChoiceAction::Submit,
+        KeyCode::Esc => ChoiceAction::Quit,
         _ => ChoiceAction::Continue,
     }
 }
@@ -163,6 +166,7 @@ pub fn apply_key_entry_key(buffer: &mut String, key: KeyEvent) -> KeyEntryAction
         return KeyEntryAction::Quit;
     }
     match key.code {
+        KeyCode::Esc => KeyEntryAction::Quit,
         KeyCode::Enter => {
             if buffer.trim().is_empty() {
                 KeyEntryAction::Continue
@@ -1114,9 +1118,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_the_choice_screen() {
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(apply_choice_key(ctrl_c), ChoiceAction::Quit));
+    fn escape_and_ctrl_c_quit_the_choice_screen() {
+        for key in [
+            press(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            assert!(matches!(apply_choice_key(key), ChoiceAction::Quit));
+        }
     }
 
     #[test]
@@ -1153,13 +1161,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_the_key_entry_screen() {
-        let mut buffer = "partial".to_string();
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(
-            apply_key_entry_key(&mut buffer, ctrl_c),
-            KeyEntryAction::Quit
-        ));
+    fn escape_and_ctrl_c_quit_the_key_entry_screen() {
+        for key in [
+            press(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut buffer = "partial".to_string();
+            assert!(matches!(
+                apply_key_entry_key(&mut buffer, key),
+                KeyEntryAction::Quit
+            ));
+        }
     }
 
     #[tokio::test]

@@ -154,8 +154,8 @@ processが動く。
 - `crates/polaris-cli/src/main.rs:2558`
 - `crates/polaris-cli/src/main.rs:2609`
 - `crates/polaris-cli/src/main.rs:2612`
-- `crates/polaris-cli/src/main.rs:3986`
-- `crates/polaris-cli/src/main.rs:3996`
+- `crates/polaris-cli/src/main.rs:3997`
+- `crates/polaris-cli/src/main.rs:4007`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/execution_owner.rs:442`
 - `crates/polaris-core/src/sandbox_command.rs:319`
@@ -205,8 +205,8 @@ processが動く。
 - `crates/polaris-auth/src/accounts/directory.rs:1416`
 - `crates/polaris-auth/src/git_credentials.rs:857`
 - `crates/polaris-auth/src/login.rs:207`
-- `crates/polaris-cli/src/account.rs:213`
-- `crates/polaris-cli/src/account.rs:404`
+- `crates/polaris-cli/src/account.rs:250`
+- `crates/polaris-cli/src/account.rs:477`
 - `crates/polaris-cli/src/decided.rs:111`
 - `crates/polaris-cli/src/main.rs:916`
 - `crates/polaris-core/src/computer/macos.rs:45`
@@ -235,7 +235,7 @@ processが動く。
 - `crates/polaris-sandbox/src/confine.rs:953`
 - `crates/polaris-sandbox/src/confine.rs:991`
 - `crates/polaris-sandbox/src/confine.rs:1027`
-- `crates/polaris-tui/src/account.rs:239`
+- `crates/polaris-tui/src/account.rs:242`
 - `crates/polaris-tui/src/clipboard.rs:67`
 
 ### gitの呼出し

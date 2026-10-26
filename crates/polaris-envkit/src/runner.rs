@@ -19,6 +19,13 @@ use std::{
     path::Path,
 };
 
+mod publication_checks;
+pub use publication_checks::validate_publishing_snapshot;
+#[cfg(unix)]
+mod filesystem;
+#[cfg(unix)]
+use filesystem::{create_file, merge_runtime, private_directory, relocate_venv};
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error(transparent)]
@@ -401,173 +408,6 @@ impl Runner {
         journal.advance(Stage::Verified, Some(inventory))?;
         Ok(receipt)
     }
-}
-
-pub fn validate_publishing_snapshot(
-    plan: &ResolvedPlan,
-    live: &Snapshot,
-    postimages: &BTreeMap<String, Inventory>,
-) -> Result<(), Error> {
-    let before = &plan.snapshot;
-    if live.target != before.target
-        || live.private_root != before.private_root
-        || live.runner_binary_sha256 != before.runner_binary_sha256
-        || live.host_os_revision != before.host_os_revision
-        || live.platform != before.platform
-        || live.host_prerequisites != before.host_prerequisites
-    {
-        return Err(Error::StalePlan);
-    }
-    for original in before.inputs.values() {
-        if !live.inputs.values().any(|current| current == original) {
-            return Err(Error::StalePlan);
-        }
-    }
-    for (path, hash) in &before.installations {
-        if live.installations.get(path) != Some(hash) {
-            return Err(Error::StalePlan);
-        }
-    }
-    for (path, hash) in &live.installations {
-        if before.installations.get(path) == Some(hash) {
-            continue;
-        }
-        if postimages
-            .get(path)
-            .and_then(|image| image.digest().ok())
-            .as_ref()
-            != Some(hash)
-        {
-            return Err(Error::StalePlan);
-        }
-    }
-    for current in live.inputs.values() {
-        if before.inputs.values().any(|original| current == original) {
-            continue;
-        }
-        let Some(image) = postimages.get(&current.relative) else {
-            return Err(Error::StalePlan);
-        };
-        if !matches!(image.entries.as_slice(), [publication::ImageEntry::File { sha256, .. }] if sha256 == &current.sha256)
-        {
-            return Err(Error::StalePlan);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn private_directory(path: &Path) -> Result<(), RunError> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(path)
-        .map_err(|_| RunError::State)?;
-    File::open(path.parent().ok_or(RunError::State)?)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| RunError::State)
-}
-
-#[cfg(unix)]
-fn create_file(path: &Path, bytes: &[u8]) -> Result<(), RunError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let parent = path.parent().ok_or(RunError::State)?;
-    // All parents are inside the owner-created private staging root. Source
-    // admission excludes symlinks and no child is running while materializing.
-    fs::create_dir_all(parent).map_err(|_| RunError::State)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(path)
-        .map_err(|_| RunError::State)?;
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| RunError::State)?;
-    File::open(parent)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| RunError::State)
-}
-
-#[cfg(unix)]
-fn merge_runtime(
-    source: &Path,
-    destination: &Path,
-    installer_metadata: bool,
-) -> Result<(), RunError> {
-    use std::os::unix::fs::{DirBuilderExt, symlink};
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(destination)
-                .map_err(|_| RunError::State)?;
-        }
-        _ => return Err(RunError::State),
-    }
-    for entry in fs::read_dir(source).map_err(|_| RunError::State)? {
-        let entry = entry.map_err(|_| RunError::State)?;
-        if installer_metadata && entry.file_name() == "manifest.in" {
-            continue;
-        }
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from).map_err(|_| RunError::State)?;
-        if metadata.is_dir() {
-            merge_runtime(&from, &to, false)?;
-        } else {
-            if fs::symlink_metadata(&to).is_ok() {
-                return Err(RunError::State);
-            }
-            if metadata.file_type().is_symlink() {
-                symlink(fs::read_link(&from).map_err(|_| RunError::State)?, &to)
-                    .map_err(|_| RunError::State)?;
-            } else if metadata.is_file() {
-                fs::rename(&from, &to).map_err(|_| RunError::State)?;
-            } else {
-                return Err(RunError::State);
-            }
-        }
-    }
-    File::open(destination)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| RunError::State)
-}
-
-#[cfg(unix)]
-fn relocate_venv(stage: &Path, target: &Path) -> Result<(), RunError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let old = stage.to_str().ok_or(RunError::State)?;
-    let new = target.to_str().ok_or(RunError::State)?;
-    let mut paths = vec![stage.join(".venv/pyvenv.cfg")];
-    for entry in fs::read_dir(stage.join(".venv/bin")).map_err(|_| RunError::State)? {
-        let entry = entry.map_err(|_| RunError::State)?;
-        if entry.metadata().map_err(|_| RunError::State)?.len() <= 1024 * 1024 {
-            paths.push(entry.path());
-        }
-    }
-    for path in paths {
-        let bytes = fs::read(&path).map_err(|_| RunError::State)?;
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        if !text.contains(old) {
-            continue;
-        }
-        let updated = text.replace(old, new);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|_| RunError::State)?;
-        file.write_all(updated.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|_| RunError::State)?;
-    }
-    Ok(())
 }
 
 #[cfg(all(test, target_os = "macos"))]

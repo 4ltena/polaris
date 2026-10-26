@@ -153,13 +153,10 @@ struct NativeProbe {
 impl NativeProbe {
     fn new() -> Result<Self, String> {
         use std::os::unix::fs::DirBuilderExt;
-        let selected = match fs::read_link("/private/var/db/xcode_select_link") {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                PathBuf::from("/Library/Developer/CommandLineTools")
-            }
-            Err(_) => return Err("Cannot inspect the selected Apple developer directory".into()),
-        };
+        let selection = std::env::var_os("POLARIS_ENVKIT_APPLE_TOOLCHAIN");
+        let selected = select_developer(selection.as_deref(), || {
+            fs::read_link("/private/var/db/xcode_select_link")
+        })?;
         let developer = selected
             .canonicalize()
             .map_err(|_| "The existing Apple toolchain is unavailable")?;
@@ -322,5 +319,59 @@ impl NativeProbe {
             return Err("Invalid Apple toolchain response".into());
         }
         Ok(text.to_owned())
+    }
+}
+
+/// Explicit finite selection; never retry a failed Xcode probe with another SDK.
+fn select_developer(
+    selection: Option<&std::ffi::OsStr>,
+    selected: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, String> {
+    match selection {
+        Some(value) if value == "command-line-tools" => {
+            Ok(PathBuf::from("/Library/Developer/CommandLineTools"))
+        }
+        Some(_) => {
+            Err("Invalid POLARIS_ENVKIT_APPLE_TOOLCHAIN; use command-line-tools or unset it".into())
+        }
+        None => match selected() {
+            Ok(path) => Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PathBuf::from("/Library/Developer/CommandLineTools"))
+            }
+            Err(_) => Err("Cannot inspect the selected Apple developer directory".into()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_clt_does_not_consult_or_modify_global_selection() {
+        assert_eq!(
+            select_developer(Some(std::ffi::OsStr::new("command-line-tools")), || {
+                panic!("explicit selection must not read the global selector")
+            })
+            .unwrap(),
+            PathBuf::from("/Library/Developer/CommandLineTools")
+        );
+        assert_eq!(
+            select_developer(None, || Ok(PathBuf::from(
+                "/Applications/Xcode.app/Contents/Developer"
+            )))
+            .unwrap(),
+            PathBuf::from("/Applications/Xcode.app/Contents/Developer")
+        );
+        assert!(
+            select_developer(Some(std::ffi::OsStr::new("/tmp/custom")), || {
+                panic!("invalid selection must stop")
+            })
+            .is_err()
+        );
+        assert!(
+            select_developer(None, || Err(std::io::ErrorKind::PermissionDenied.into())).is_err()
+        );
     }
 }

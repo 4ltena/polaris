@@ -45,6 +45,8 @@ polaris env set nextjs --path /absolute/path/to/project
 
 既存manifest/lock/sourceと既存の導入先は保持する。安全に対応できない依存や版は理由を表示して停止し、online modeや別package managerへ暗黙に切り替えない。globalなNode/Python/Rust/Goやshell設定は変更しない。版やruntimeの参照先は完了時のreceiptを参照する。
 
+Rustで既存のCommand Line Toolsを明示選択する場合は、`POLARIS_ENVKIT_APPLE_TOOLCHAIN=command-line-tools polaris env set rust`を使う。planを別に作る場合も同じ変数を指定する。未指定時は現在のApple developer選択を使い、Xcodeの失敗から自動で切り替えない。global設定やライセンス同意状態は変更しない。
+
 `polaris env plan`は取得前の計画を保存する。停止時は表示されたretained rootを保持し、`polaris env status --operation <retained-root>`で確認する。復旧は保存物の照合を行い、通信・script・publishを繰り返さない。[全構文と提供範囲](command-reference.md#環境構築)を参照。
 
 自然文の環境構築には任意の`builtin:envkit` skillとroot専用のtyped `environment` toolを用意している。skillを読むこと自体は実行権限を与えず、hostによる計画承認が必要である。旧`polaris setting nextjs`は提供しない。`setting git`はGit補助として保持する。

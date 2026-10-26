@@ -229,6 +229,8 @@ TUIの`/account`は廃止し、上記の3入口へ集約した。CLIの`polaris 
 
 ### 環境構築
 
+Rustの既存Command Line Toolsを使う場合は、起動時に`POLARIS_ENVKIT_APPLE_TOOLCHAIN=command-line-tools`を指定する。未指定時は現在のApple developer選択を維持する。詳細は[利用方法](usage.md)を参照。
+
 | コマンド | 役割 | 主な出力 |
 | --- | --- | --- |
 | `polaris env set <profile> [--path <directory>] [--version <constraint>]` | TUIと同じownerで環境構築する。モデル認証は不要。 | 計画、`Execute this exact plan? [y/N]`、検証結果とreceipt/private runtimeの場所。 |

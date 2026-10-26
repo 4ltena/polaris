@@ -69,9 +69,7 @@ mod source_apply;
 mod status_view;
 mod terminal;
 use model_menu::handle_model;
-#[cfg(test)]
-use status_view::status_row;
-use status_view::{StatusSnapshot, status_lines};
+use status_view::{StatusSnapshot, status_lines, status_row};
 mod time;
 pub mod tool_memory;
 

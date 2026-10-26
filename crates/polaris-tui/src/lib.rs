@@ -12779,8 +12779,9 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Logout => {
-            *status =
-                Status::Error("Unlinking requires confirmation for the target account".into());
+            *status = Status::Error(
+                "internal: /logout should have been handled by the account dispatcher".into(),
+            );
             SlashOutcome::Continue
         }
         slash::Action::Help => {

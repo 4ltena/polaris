@@ -198,7 +198,11 @@ where
         }
         AccountChangeV1::Label { .. } => "Change account display name",
     };
-    let accepted = confirm(
+    // Submitting /logout is the explicit user action for this exact target.
+    let accepted = matches!(
+        prepared.change(),
+        AccountChangeV1::Unlink { .. } | AccountChangeV1::LegacyLogout { .. }
+    ) || confirm(
         terminal,
         reader,
         operation,
@@ -508,7 +512,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[tokio::test]
     async fn m3a_tui_label_unlink_and_exact_logout() {
         if std::env::var_os("POLARIS_M3A_TUI_CHILD").is_none() {
@@ -520,7 +524,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("POLARIS_M3A_TUI_CHILD", "1")
-                .env("HOME", home.path())
+                .env("HOME", home.path().canonicalize().unwrap())
                 .output()
                 .unwrap();
             assert!(
@@ -535,7 +539,8 @@ mod tests {
         let project = home.join("project");
         std::fs::create_dir(&project).unwrap();
         let state = polaris_core::project::state_dir(&project).unwrap();
-        crate::source_apply::prepare_state(&project, &state).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let workspace = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -594,22 +599,6 @@ mod tests {
         assert!(!list.contains("synthetic-access-secret"));
         assert!(!list.contains("synthetic-refresh-secret"));
         let request = format!("unlink {}", reservation.registration_id);
-        let mut cancel = Keys(VecDeque::from([KeyCode::Esc]));
-        handle(
-            &request,
-            &terminal,
-            &mut cancel,
-            &workspace,
-            &effects,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            store.snapshot().unwrap().accounts[0].state,
-            polaris_auth::accounts::store::AccountState::Ready
-        );
         assert!(
             handle(
                 &request,
@@ -626,7 +615,7 @@ mod tests {
         handle(
             &request,
             &terminal,
-            &mut Keys(VecDeque::from([KeyCode::Char('y')])),
+            &mut Keys(VecDeque::new()),
             &workspace,
             &effects,
             None,
@@ -640,22 +629,11 @@ mod tests {
         );
         let path = polaris_auth::store::default_path().unwrap();
         polaris_auth::store::save_to(&path, &credentials).unwrap();
-        handle(
-            "logout",
-            &terminal,
-            &mut Keys(VecDeque::from([KeyCode::Esc])),
-            &workspace,
-            &effects,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
         assert!(path.exists());
         handle(
             "logout",
             &terminal,
-            &mut Keys(VecDeque::from([KeyCode::Char('y')])),
+            &mut Keys(VecDeque::new()),
             &workspace,
             &effects,
             None,

@@ -224,6 +224,8 @@ POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
 
 `polaris login`はブラウザを開き、`http://localhost:1455/auth/callback`で認可を受け取る。資格情報は`~/.polaris/auth.json`に0600で保管し、`~/.codex/`には読み書きしない。`polaris logout`はPolarisが保存した資格情報を削除する。`ls -l ~/.polaris/auth.json`で`-rw-------`であることを確認できる。
 
+Subscriptionの認証待ち画面には、クエリを含む認証URLを表示する。URLクリック・Enter・`o`で既定ブラウザへ開き、`c`でURL全文をコピーする。長いURLは↑↓でスクロールできる。自動起動に失敗しても認証待ちは続くため、手動で開いた後も画面を閉じずに認可を進める。ブラウザ認可待ちはEsc・Ctrl-Cで取り消せる。URLはこの画面だけに表示し、会話や監査ログには保存しない。CLIのログインでは端末へURLを表示する。
+
 期限切れの更新経路を手で確認する場合は、テスト用の資格情報に限り`expires_at`を過去のUnix秒または`null`へ変更し、再実行後に`expires_at`、`account_id`、0600が維持されることを確認する。JSONを壊さないこと。
 
 ## macOSデスクトップ
@@ -240,7 +242,7 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 
 ## TUIと会話
 
-`--prompt`を省略すると対話TUIを起動する。資格情報がなく、`POLARIS_PROVIDER`が未設定または`openai`なら、ChatGPTサインインまたはOpenAI APIキー入力を選ぶ画面を出す。入力したAPIキーは`~/.polaris/api_key.json`へ0600で保存する。`codex`を明示した場合とone-shot実行では、この選択画面は出ない。
+`--prompt`を省略すると対話TUIを起動する。資格情報がなく、`POLARIS_PROVIDER`が未設定または`openai`なら、ChatGPTサインインまたはOpenAI APIキー入力を選ぶ画面を出す。入力したAPIキーは`~/.polaris/api_key.json`へ0600で保存する。`codex`を明示した対話起動でも、未登録または全登録解除済みなら同じ選択画面を出す。one-shot実行では表示しない。
 
 通常のlegacy起動は空の会話から始まり、送信済み会話を`~/.polaris/sessions/<会話id>.jsonl`と`<会話id>.meta.json`へ保存する。workflowまたはstrict10を有効にした会話は`~/.polaris/sessions-v2/<UUID>/`を使う。v2はrawイベント、世代付きsnapshot、状態markerを保存するため、ツール呼び出しと中間結果も回復対象になる。起動だけで終了したlegacyの空会話は保存しない。待機中は`Ctrl-C`を2回押して終了する。
 

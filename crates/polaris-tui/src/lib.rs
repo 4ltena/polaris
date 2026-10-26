@@ -4,6 +4,7 @@
 #[cfg(unix)]
 pub mod account;
 pub mod approver;
+mod auth_browser;
 mod clipboard;
 #[cfg(unix)]
 mod command_dispatch;

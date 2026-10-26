@@ -196,15 +196,45 @@ pub async fn wait_for_callback(
     result
 }
 
-/// Opens the browser. Not opening isn't fatal. Prints the URL and continues.
+/// Request the default browser without exposing the authorization URL in errors.
+/// Failure is recoverable: callers keep the callback listener and show the URL.
 #[cfg(not(windows))]
-fn open_browser(url: &str) {
+pub async fn launch_browser(url: &str) -> Result<(), AuthError> {
     #[cfg(target_os = "macos")]
-    let program = "open";
+    let program = "/usr/bin/open";
     #[cfg(not(target_os = "macos"))]
     let program = "xdg-open";
+    let mut command = tokio::process::Command::new(program);
+    command.arg(url);
+    launch_browser_command(command).await
+}
 
-    let _ = std::process::Command::new(program).arg(url).spawn();
+#[cfg(not(windows))]
+async fn launch_browser_command(mut command: tokio::process::Command) -> Result<(), AuthError> {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| {
+            AuthError::Denied("browser_launcher_failed; open the displayed link manually".into())
+        })?;
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        _ => {
+            let _ = child.kill().await;
+            Err(AuthError::Denied(
+                "browser_launcher_failed; open the displayed link manually".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+pub async fn launch_browser(_url: &str) -> Result<(), AuthError> {
+    Err(AuthError::Protection)
 }
 
 /// The full login sequence. Binds before opening the browser. In the
@@ -212,18 +242,47 @@ fn open_browser(url: &str) {
 /// yet be listening, and miss the callback.
 #[cfg(not(windows))]
 pub async fn run(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
+    run_with_callback(issuer, store_path, |url, state| async move {
+        let listener = bind_callback().await?;
+        eprintln!("Authorize in your browser: {url}");
+        if launch_browser(&url).await.is_err() {
+            eprintln!("Could not open the browser. Open the link above manually; sign-in is still waiting.");
+        }
+        wait_for_callback(listener, &state, Duration::from_secs(300)).await
+    }).await
+}
+
+/// Use the caller's ephemeral browser UI with the same PKCE exchange/store.
+#[cfg(not(windows))]
+pub async fn run_with_callback<C, F>(
+    issuer: &str,
+    store_path: &Path,
+    callback: C,
+) -> Result<Credentials, AuthError>
+where
+    C: FnOnce(String, String) -> F,
+    F: std::future::Future<Output = Result<String, AuthError>>,
+{
     let p = pkce::generate()?;
     let state = pkce::random_urlsafe(16)?;
-
-    let listener = bind_callback().await?;
     let url = authorize_url(&p.challenge, &state);
-    eprintln!("Authorize in your browser: {url}");
-    open_browser(&url);
-
-    let code = wait_for_callback(listener, &state, Duration::from_secs(300)).await?;
+    let code = callback(url, state).await?;
     let creds = token::exchange_code(issuer, &code, &p.verifier).await?;
     store::save_to(store_path, &creds)?;
     Ok(creds)
+}
+
+#[cfg(windows)]
+pub async fn run_with_callback<C, F>(
+    _issuer: &str,
+    _store_path: &Path,
+    _callback: C,
+) -> Result<Credentials, AuthError>
+where
+    C: FnOnce(String, String) -> F,
+    F: std::future::Future<Output = Result<String, AuthError>>,
+{
+    Err(AuthError::Protection)
 }
 
 /// Windows credential storage is unavailable; refuse before login side effects.
@@ -235,6 +294,56 @@ pub async fn run(_issuer: &str, _store_path: &Path) -> Result<Credentials, AuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_ui_callback_receives_complete_authorization_and_cancel_does_not_exchange_or_save()
+     {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let error = run_with_callback("http://127.0.0.1:9", &path, |url, state| async move {
+            let parsed = url::Url::parse(&url).unwrap();
+            assert!(parsed.host_str() == Some("auth.openai.com"));
+            let pairs: std::collections::HashMap<_, _> =
+                parsed.query_pairs().into_owned().collect();
+            assert!(pairs.get("state") == Some(&state));
+            assert!(pairs.contains_key("code_challenge"));
+            assert!(
+                pairs
+                    .get("redirect_uri")
+                    .is_some_and(|value| value == REDIRECT_URI)
+            );
+            observed.store(true, Ordering::SeqCst);
+            Err(AuthError::Denied("cancelled".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(called.load(Ordering::SeqCst));
+        assert!(matches!(error, AuthError::Denied(reason) if reason == "cancelled"));
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_launch_checks_exit_status_without_returning_url_or_stderr() {
+        let mut success = tokio::process::Command::new("/bin/sh");
+        success.args(["-c", "exit 0"]);
+        assert!(launch_browser_command(success).await.is_ok());
+        let mut failure = tokio::process::Command::new("/bin/sh");
+        failure.args(["-c", "echo synthetic-private-query >&2; exit 7"]);
+        let error = launch_browser_command(failure)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("browser_launcher_failed"));
+        assert!(!error.contains("synthetic-private-query"));
+    }
 
     #[cfg(windows)]
     #[tokio::test]

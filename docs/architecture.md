@@ -164,7 +164,7 @@ processが動く。
 - `crates/polaris-cli/src/main.rs:4045`
 - `crates/polaris-cli/src/main.rs:4055`
 - `crates/polaris-core/src/desktop_execution.rs:5`
-- `crates/polaris-core/src/environment/native.rs:249`
+- `crates/polaris-core/src/environment/native.rs:246`
 - `crates/polaris-core/src/execution_owner.rs:442`
 - `crates/polaris-core/src/sandbox_command.rs:322`
 - `crates/polaris-core/src/verification/checkpoint.rs:786`
@@ -207,15 +207,14 @@ processが動く。
 
 残留・port占有・回収漏れ。
 
-呼び出し側 38件。
+呼び出し側 36件。
 
 - `crates/polaris-auth/src/accounts/directory.rs:1352`
 - `crates/polaris-auth/src/accounts/directory.rs:1405`
 - `crates/polaris-auth/src/accounts/directory.rs:1416`
 - `crates/polaris-auth/src/git_credentials.rs:857`
 - `crates/polaris-auth/src/login.rs:207`
-- `crates/polaris-cli/src/account.rs:255`
-- `crates/polaris-cli/src/account.rs:479`
+- `crates/polaris-cli/src/account.rs:477`
 - `crates/polaris-cli/src/decided.rs:112`
 - `crates/polaris-cli/src/main.rs:918`
 - `crates/polaris-core/src/computer/macos.rs:45`
@@ -244,7 +243,6 @@ processが動く。
 - `crates/polaris-sandbox/src/confine.rs:953`
 - `crates/polaris-sandbox/src/confine.rs:991`
 - `crates/polaris-sandbox/src/confine.rs:1027`
-- `crates/polaris-tui/src/account.rs:245`
 - `crates/polaris-tui/src/clipboard.rs:67`
 - `crates/polaris-tui/src/file_reveal.rs:226`
 
@@ -266,4 +264,4 @@ processが動く。
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/sync/repository/c10.rs:1551`
 - `crates/polaris-desktop-service/src/workspace_view.rs:470`
-- `crates/polaris-tui/src/lib.rs:12662`
+- `crates/polaris-tui/src/lib.rs:12663`

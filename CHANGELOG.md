@@ -19,6 +19,8 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 ### 修正
 
+- Subscription認証待ちにクエリ付きURLとクリック・コピー操作を追加した。ブラウザ起動に失敗しても手動URLから続行でき、認証待ちを終了しない。
+
 - Rust環境構築で、既存Command Line Toolsを環境変数から明示選択できるようにした。Appleのglobal設定とライセンス同意状態は変更しない。
 
 - 入力履歴の上下移動、working中の補完、session管理、directory読取、MCP catalog検索引数を修正した。

@@ -252,13 +252,11 @@ async fn reauth(registration_id: &str) -> Result<(), String> {
 async fn callback(url: String, state: String) -> Result<String, AuthError> {
     let listener = polaris_auth::login::bind_callback().await?;
     eprintln!("Authorize in your browser: {url}");
-    let _ = std::process::Command::new(if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    })
-    .arg(&url)
-    .spawn();
+    if polaris_auth::login::launch_browser(&url).await.is_err() {
+        eprintln!(
+            "Could not open the browser. Open the link above manually; sign-in is still waiting."
+        );
+    }
     polaris_auth::login::wait_for_callback(listener, &state, Duration::from_secs(300)).await
 }
 

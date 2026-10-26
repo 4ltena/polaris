@@ -158,13 +158,21 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         }
         _ => return Err("/login [new [label]|reauth <registration-id>|use <registration-id>|label <registration-id> <display-name>], /logout [registration-id], /status".into()),
     };
+    let (ready, after_callback) = tokio::sync::oneshot::channel();
     execute_change(
         &owner,
         change,
         terminal,
         reader,
-        browser_callback,
-        browser_cancel(),
+        |url, state| async move {
+            let result = crate::auth_browser::callback(url, state, false, |url, status, scroll| {
+                crate::auth_browser::draw_link(&mut *terminal.borrow_mut(), url, status, scroll)
+            })
+            .await;
+            let _ = ready.send(());
+            result
+        },
+        crate::auth_browser::cancel_after_callback(after_callback),
     )
     .await
 }
@@ -230,35 +238,6 @@ where
         Some(id) => format!("Completed {operation}: {id}"),
         None => "Authentication operation cancelled".into(),
     })])
-}
-
-pub(crate) async fn browser_callback(
-    url: String,
-    state: String,
-) -> Result<String, polaris_auth::AuthError> {
-    let listener = polaris_auth::login::bind_callback().await?;
-    let command = if cfg!(target_os = "macos") {
-        "/usr/bin/open"
-    } else {
-        "/usr/bin/xdg-open"
-    };
-    let mut child = tokio::process::Command::new(command)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(polaris_auth::AuthError::Io)?;
-    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-        Ok(Ok(status)) if status.success() => {}
-        _ => {
-            return Err(polaris_auth::AuthError::Denied(
-                "browser_launcher_failed".into(),
-            ));
-        }
-    }
-    polaris_auth::login::wait_for_callback(listener, &state, Duration::from_secs(300)).await
 }
 
 fn cancel_key(key: ratatui::crossterm::event::KeyEvent) -> bool {

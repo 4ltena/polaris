@@ -371,7 +371,7 @@ fn restore_acquired_terminal<B: Backend>(
 }
 
 /// Owns raw mode, the alternate screen and cursor visibility. Onboarding
-/// never enables mouse capture or changes the cursor shape.
+/// only enables scoped mouse capture while the subscription link is shown.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct OnboardingTerminal {
@@ -463,12 +463,22 @@ fn render_registered_wait(frame: &mut Frame) {
 #[cfg(unix)]
 async fn register(
     owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
+    terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<Outcome, OnboardingError> {
+    let (ready, after_callback) = tokio::sync::oneshot::channel();
     owner
         .register(
             None,
-            crate::account::browser_callback,
-            crate::account::browser_cancel(),
+            |url, state| async move {
+                let result =
+                    crate::auth_browser::callback(url, state, true, |url, status, scroll| {
+                        crate::auth_browser::draw_link(terminal, url, status, scroll)
+                    })
+                    .await;
+                let _ = ready.send(());
+                result
+            },
+            crate::auth_browser::cancel_after_callback(after_callback),
         )
         .await
         .map(|_| Outcome::CodexLoggedIn)
@@ -483,10 +493,28 @@ async fn register(
 #[cfg(not(unix))]
 async fn register(
     _owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
+    _terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<Outcome, OnboardingError> {
     Err(OnboardingError::Auth(
         "protected account storage is unavailable".into(),
     ))
+}
+
+async fn legacy_subscription(
+    auth_store_path: &Path,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<polaris_auth::Credentials, polaris_auth::AuthError> {
+    polaris_auth::login::run_with_callback(
+        polaris_auth::ISSUER,
+        auth_store_path,
+        |url, state| async move {
+            crate::auth_browser::callback(url, state, true, |url, status, scroll| {
+                crate::auth_browser::draw_link(terminal, url, status, scroll)
+            })
+            .await
+        },
+    )
+    .await
 }
 
 /// Shows the onboarding screen and drives it to completion. Owns the
@@ -550,20 +578,19 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             "failed to draw the terminal".into(),
                         ));
                     }
-                    break 'outer register(owner).await;
+                    break 'outer register(owner, terminal.terminal_mut()).await;
                 };
-                // Leave the alternate screen before calling into the
-                // existing OAuth flow: `login::run` prints the
-                // authorize-in-your-browser URL via `eprintln!` and opens
-                // a browser, neither of which should happen while the TUI
-                // owns the terminal.
-                if let Err(error) = terminal.restore() {
-                    break 'outer Err(error);
-                }
                 if shutdown_requested() {
                     break 'outer Err(OnboardingError::Cancelled);
                 }
-                let result = polaris_auth::login::run(polaris_auth::ISSUER, auth_store_path).await;
+                let result = legacy_subscription(auth_store_path, terminal.terminal_mut()).await;
+                if let Err(error) = terminal.restore() {
+                    break 'outer Err(error);
+                }
+                if matches!(&result, Err(polaris_auth::AuthError::Denied(reason)) if reason == "cancelled")
+                {
+                    break 'outer Err(OnboardingError::Cancelled);
+                }
                 match result {
                     Ok(_) => {
                         terminal = match reenter_after_oauth_success(
@@ -699,15 +726,14 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             "failed to draw the terminal".into(),
                         ));
                     }
-                    break 'outer register(owner).await;
+                    break 'outer register(owner, &mut terminal).await;
                 };
-                // Leave the alternate screen before calling into the
-                // existing OAuth flow: `login::run` prints the
-                // authorize-in-your-browser URL via `eprintln!` and opens
-                // a browser, neither of which should happen while the TUI
-                // owns the terminal.
+                let result = legacy_subscription(auth_store_path, &mut terminal).await;
                 ratatui::restore();
-                let result = polaris_auth::login::run(polaris_auth::ISSUER, auth_store_path).await;
+                if matches!(&result, Err(polaris_auth::AuthError::Denied(reason)) if reason == "cancelled")
+                {
+                    break 'outer Err(OnboardingError::Cancelled);
+                }
                 terminal = ratatui::init();
                 match result {
                     Ok(_) => break 'outer Ok(Outcome::CodexLoggedIn),

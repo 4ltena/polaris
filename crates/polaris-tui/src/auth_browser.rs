@@ -8,7 +8,7 @@ use ratatui::{
     },
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{io, time::Duration};
@@ -59,14 +59,14 @@ fn render(frame: &mut Frame, url: &str, status: &str, scroll: u16) -> Rect {
         inner.height.saturating_sub(5),
     );
     frame.render_widget(
-        Paragraph::new(url.to_owned())
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::UNDERLINED),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(Line::from(Span::styled(
+            url.to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        )))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0)),
         link,
     );
     link
@@ -81,7 +81,7 @@ enum Action {
     Down,
     None,
 }
-fn action(event: Event, link: Rect) -> Action {
+fn action(event: Event, link: Rect, url: &str, scroll: u16) -> Action {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
             KeyCode::Esc => Action::Cancel,
@@ -96,7 +96,11 @@ fn action(event: Event, link: Rect) -> Action {
         },
         Event::Mouse(mouse)
             if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && link.contains((mouse.column, mouse.row).into()) =>
+                && link.contains((mouse.column, mouse.row).into())
+                // authorize_url produces an ASCII, percent-encoded URL. Its
+                // wrapped cells map directly to byte offsets, including scroll.
+                && ((usize::from(mouse.row - link.y) + usize::from(scroll))
+                    * usize::from(link.width) + usize::from(mouse.column - link.x)) < url.len() =>
         {
             Action::Open
         }
@@ -164,7 +168,7 @@ pub(crate) async fn callback(
                     return Err(AuthError::Denied("cancelled".into()));
                 }
                 if !event::poll(Duration::ZERO)? { continue; }
-                match action(event::read()?, link) {
+                match action(event::read()?, link, &url, scroll) {
                     Action::Cancel => return Err(AuthError::Denied("cancelled".into())),
                     Action::Copy => {
                         status = copy_link(&url, crate::clipboard::copy_to_clipboard);
@@ -197,6 +201,44 @@ mod tests {
         backend::TestBackend,
         crossterm::event::{KeyEvent, MouseEvent},
     };
+
+    #[test]
+    fn only_visible_url_cells_are_underlined_and_clickable_after_wrap_scroll_and_resize() {
+        let url = "https://example.invalid/authorize?state=synthetic-only";
+        for (width, scroll) in [(24, 0), (24, 1), (80, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
+            let rect = draw_link(&mut terminal, url, "Waiting", scroll).unwrap();
+            let mut visible = 0;
+            for row in rect.y..rect.bottom() {
+                for column in rect.x..rect.right() {
+                    let index = (usize::from(row - rect.y) + usize::from(scroll))
+                        * usize::from(rect.width)
+                        + usize::from(column - rect.x);
+                    let is_url = index < url.len();
+                    let cell = &terminal.backend().buffer()[(column, row)];
+                    assert_eq!(
+                        cell.modifier.contains(Modifier::UNDERLINED),
+                        is_url,
+                        "underline at {column},{row}, width={width}, scroll={scroll}"
+                    );
+                    let click = Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    assert_eq!(
+                        action(click, rect, url, scroll),
+                        if is_url { Action::Open } else { Action::None }
+                    );
+                    if is_url {
+                        visible += 1;
+                    }
+                }
+            }
+            assert!(visible > 0);
+        }
+    }
 
     #[test]
     fn completing_authorization_clears_link_and_stale_controls_from_screen() {
@@ -256,14 +298,18 @@ mod tests {
         assert_eq!(
             action(
                 Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-                rect
+                rect,
+                url,
+                0
             ),
             Action::Copy
         );
         assert_eq!(
             action(
                 Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-                rect
+                rect,
+                url,
+                0
             ),
             Action::Cancel
         );
@@ -275,7 +321,9 @@ mod tests {
                     row: rect.y,
                     modifiers: KeyModifiers::NONE
                 }),
-                rect
+                rect,
+                url,
+                0
             ),
             Action::Open
         );
@@ -287,7 +335,9 @@ mod tests {
                     row: 0,
                     modifiers: KeyModifiers::NONE
                 }),
-                rect
+                rect,
+                url,
+                0
             ),
             Action::None
         );

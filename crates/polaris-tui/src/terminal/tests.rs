@@ -491,6 +491,7 @@ fn cursor_protocol_uses_save_and_restore_without_a_cursor_query() {
 fn production_runtime_factories_and_sync_async_readers_use_the_common_path() {
     for (name, source) in [
         ("main", include_str!("../lib.rs")),
+        ("model", include_str!("../model_menu.rs")),
         ("status", include_str!("../status_view.rs")),
         ("onboarding", include_str!("../onboarding.rs")),
         ("approver", include_str!("../approver.rs")),

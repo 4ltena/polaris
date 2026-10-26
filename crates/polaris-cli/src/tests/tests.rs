@@ -1,4 +1,4 @@
-
+//! CLI parsing, startup, admission and continuation regression tests.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn linux_process_signal_install_failure_exits_one_before_terminal_mutation() {

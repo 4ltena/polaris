@@ -1,3 +1,4 @@
+//! Visible-cell selection and shared terminal-input regression tests.
 use super::*;
 use event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
 use ratatui::{backend::TestBackend, widgets::Paragraph};

@@ -1,4 +1,4 @@
-
+//! Agent routing, tool ordering and conversation-history regression tests.
 #[tokio::test]
 async fn related_search_dispatch_rejects_options_and_unsupported_owner_without_fallback() {
     use crate::conversation_memory::related::SEARCH_URI;

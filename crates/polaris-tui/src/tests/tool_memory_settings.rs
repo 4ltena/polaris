@@ -1,4 +1,4 @@
-
+//! Saved tool-memory settings and lineage regression tests.
 use super::*;
 use polaris_core::{session::Session, tool_memory::RetentionMode};
 

@@ -1,4 +1,4 @@
-
+//! Memory observation rendering tests.
 use super::*;
 #[test]
 fn m17_live_memory_matches_common_terminal_projection_and_escapes_uri_controls() {

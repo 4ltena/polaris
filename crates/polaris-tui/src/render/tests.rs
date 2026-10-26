@@ -1,4 +1,4 @@
-
+//! Terminal rendering, wrapping and input-layout regression tests.
 use super::*;
 use polaris_core::session::Session;
 use ratatui::Terminal;

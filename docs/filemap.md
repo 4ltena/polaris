@@ -152,12 +152,20 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `provider_startup.rs` — Provider construction for the native CLI run after continuation preflight.
 - `setting.rs` — 同梱の定型コマンド。引数の受け取りと表示だけを行い、検出・計画・記録は
 - `spare.rs` — 頼まれていない整理へ余剰枠を使ってよいかを判定し、その理由を示す。
+- `startup_selection.rs` — Platform-independent startup defaults and explicit selection precedence.
 - `strict_history_tests.rs` — Exercises the CLI history constructor through persisted retrieval and a counting judge.
 - `sync.rs` — M7b-5: the `polaris sync` entry points. Every command works on this
 
 ## `crates/polaris-cli/src/bin`
 
 - `polaris-git-askpass.rs` — The only credential handoff executable used by C08/C10 Git children.
+
+## `crates/polaris-cli/src/tests`
+
+- `doctor_rewind_candidate_tests.rs` — Read-only doctor and rewind-candidate diagnostics regression tests.
+- `prompt_choice_tests.rs` — Stored MCP prompt and input choice regression tests.
+- `tests.rs` — CLI parsing, startup, admission and continuation regression tests.
+- `tool_memory_settings_tests.rs` — CLI tool-memory and answer-finalizer settings tests.
 
 ## `crates/polaris-cli/tests`
 
@@ -288,6 +296,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `mcp_dispatch.rs` — Borrow the run owner; model operations cannot construct settings or grants.
 - `request_context.rs` — Shared assembly for the sections appended to a request system prompt.
 - `skill_catalog.rs` — Request-local metadata-only optional skill catalog.
+- `tests.rs` — Agent routing, tool ordering and conversation-history regression tests.
 - `verification.rs` — Parser boundary for the root-only verification tool.
 - `workflow_artifact.rs` — Parsing boundary for root workflow-artifact calls.
 - `workflow_context.rs` — Request-only projection of exact active workflow artifacts.
@@ -560,6 +569,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `migration_root.rs` — Complete existing desktop-root observation; no create, repair, or activation.
 - `prompt.rs` — One host-selected prompt per accepted input; saved proof never grants a retry.
 - `recipe.rs` — M7c-3a: what a bundled setting command has already done. One saved step
+- `validation.rs` — In-memory ledger validation; publication and locking stay with Writer.
 
 ## `crates/polaris-core/src/desktop_store/writer/recipe`
 
@@ -1284,6 +1294,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `walk.rs` — Descriptor-anchored inventory. Child paths never follow an intermediate
 
+## `crates/polaris-envkit/src/runner`
+
+- `filesystem.rs` — Owner-local filesystem materialization; admission and cleanup stay in runner.
+- `publication_checks.rs` — Publication snapshot checks without changing the public runner entry point.
+
 ## `crates/polaris-http`
 
 - `Cargo.toml` — manifest for the polaris-http crate
@@ -1484,6 +1499,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-provider/src/codex`
 
 - `fold.rs` — Incrementally folds Codex Responses API SSE events into one completion.
+- `tests.rs` — Codex wire, usage, cache, retry and stream regression tests.
 
 ## `crates/polaris-provider/src/codex_ws`
 
@@ -1681,6 +1697,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `mcp_commands.rs` — MCP controls change next-run admission; they never replace a running runtime.
 - `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
 - `memory_commands.rs` — Explicit host memory commands. Confirmation and results stay in the TUI;
+- `model_menu.rs` — Model inventory and selection using the existing provider lifetime.
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
@@ -1698,6 +1715,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `signal.rs` — Linux process-signal capture for the interactive terminal lifetime.
 - `slash.rs` — Slash commands: local, client-side commands recognized when the input
 - `source_apply.rs` — Linux terminal adapter for the existing source-bound native owner.
+- `status_view.rs` — Status projection over the existing session and management owners.
 - `terminal.rs` — Shared visible-cell selection across TUI screens, with no history or disk sink.
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
 - `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
@@ -1712,6 +1730,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `operations.rs` — TUI MCP catalog and registration routes use the admitted domain owners.
 - `secret.rs` — Dedicated MCP credential editing never returns entered bytes to the composer.
 
+## `crates/polaris-tui/src/render`
+
+- `memory_observation_tests.rs` — Memory observation rendering tests.
+- `tests.rs` — Terminal rendering, wrapping and input-layout regression tests.
+
 ## `crates/polaris-tui/src/role_commands`
 
 - `tests.rs` — TUI role and tier controls with fixed-provider and permission checks.
@@ -1724,12 +1747,25 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — TUI session settings and history controls without provider requests.
 
+## `crates/polaris-tui/src/terminal`
+
+- `native_fixture.rs` — Explicit synthetic OS-PTY driver; no real clipboard or browser operations.
+- `tests.rs` — Visible-cell selection and shared terminal-input regression tests.
+
+## `crates/polaris-tui/src/tests`
+
+- `c10_tui_adapter.rs` — C10 TUI adapter regression tests.
+- `composer_paste.rs` — Atomic paste and file-link composer regression tests.
+- `main.rs` — Interactive command, session and admission regression tests.
+- `tool_memory_settings.rs` — Saved tool-memory settings and lineage regression tests.
+
 ## `crates/polaris-tui/src/windows_read_only`
 
 - `tests.rs` — Windows read-only TUI interaction, secret scrubbing and terminal restoration tests.
 
 ## `docs`
 
+- `README.md` — 文書一覧
 - `architecture.md` — アーキテクチャ
 - `codex-update-efficiency.md` — Codex更新と使用量削減策の適用
 - `command-reference.md` — コマンドの役割と出力

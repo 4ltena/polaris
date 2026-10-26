@@ -1,4 +1,4 @@
-
+//! Stored MCP prompt and input choice regression tests.
 use super::mcp_prompt_choice;
 
 #[test]

@@ -1,4 +1,4 @@
-
+//! CLI tool-memory and answer-finalizer settings tests.
 use super::*;
 
 /// The configured judge is the one that answers, and a judge that

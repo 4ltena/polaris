@@ -1,4 +1,4 @@
-
+//! Atomic paste and file-link composer regression tests.
 use super::*;
 
 #[test]

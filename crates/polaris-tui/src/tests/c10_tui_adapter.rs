@@ -1,4 +1,4 @@
-
+//! C10 TUI adapter regression tests.
 use super::*;
 use polaris_core::{
     management_effect::ManagementOperationIdV1 as Operation,

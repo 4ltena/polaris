@@ -1,4 +1,4 @@
-
+//! Explicit synthetic OS-PTY driver; no real clipboard or browser operations.
 use super::*;
 use ratatui::widgets::Paragraph;
 #[test]

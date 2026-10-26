@@ -1,4 +1,4 @@
-
+//! Interactive command, session and admission regression tests.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_signal_tui_pre_raw_injection_avoids_terminal_mutation() {

@@ -1,4 +1,4 @@
-
+//! Read-only doctor and rewind-candidate diagnostics regression tests.
 use super::doctor_rewind_candidate_lines;
 use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
 

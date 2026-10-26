@@ -39,6 +39,8 @@ mod memory;
 mod provider_startup;
 mod setting;
 mod spare;
+mod startup_selection;
+use startup_selection::{default_provider_name, selected_effort, selected_model};
 #[cfg(test)]
 mod strict_history_tests;
 mod sync;
@@ -1388,30 +1390,6 @@ fn to_provider_error(e: polaris_auth::AuthError) -> polaris_provider::ProviderEr
 fn effort_for(access_token: &str) -> Option<String> {
     let plan = polaris_auth::token::plan_type_from_access_token(access_token);
     polaris_auth::effort_for_plan_type(plan.as_deref()).map(|s| s.to_string())
-}
-
-/// Resolve both providers identically; an account plan cannot replace an
-/// explicit or default model.
-fn selected_model(
-    explicit: Option<String>,
-    environment: Option<String>,
-    interactive: bool,
-) -> String {
-    explicit.or(environment).unwrap_or_else(|| {
-        if interactive {
-            polaris_tui::render::RECOMMENDED_MODEL
-        } else {
-            polaris_provider::codex::DEFAULT_MODEL
-        }
-        .to_string()
-    })
-}
-
-/// Interactive turns let Jev choose effort. One-shot runs keep the historical
-/// xhigh default so benchmarks and automation remain fixed unless explicitly
-/// overridden.
-fn selected_effort(explicit: Option<&str>, has_prompt: bool) -> Option<&str> {
-    explicit.or(has_prompt.then_some("xhigh"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4553,22 +4531,6 @@ fn doctor_rewind_candidate_lines(
 #[cfg(all(test, unix))]
 #[path = "tests/doctor_rewind_candidate_tests.rs"]
 mod doctor_rewind_candidate_tests;
-
-/// When `POLARIS_PROVIDER` isn't set, decides which provider arm to try
-/// first. Prefers `openai` if a key is available (env var or the saved
-/// `api_key.json`), since that's the arm onboarding itself lives on. If no
-/// openai key exists but the user already signed in with ChatGPT (saved
-/// `~/.polaris/auth.json`, from `polaris login` or onboarding, or a registered
-/// account), prefer
-/// `codex` instead of re-triggering onboarding from scratch. With neither
-/// credential present, default to `openai` so onboarding fires.
-fn default_provider_name(has_openai_key: bool, has_saved_codex_credentials: bool) -> &'static str {
-    if !has_openai_key && has_saved_codex_credentials {
-        "codex"
-    } else {
-        "openai"
-    }
-}
 
 /// Formats each skipped skill as one line. Even if a single skill is
 /// broken, this display logic — kept separate from the eprintln! call so

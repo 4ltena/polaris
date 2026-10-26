@@ -252,3 +252,31 @@ pub(super) fn handle<B: Backend, R: KeyReader>(
         _ => Err("/mcp secret set opens dedicated input without arguments. Delete with /mcp secret delete <reference>. Do not type values into normal input.".into()),
     }
 }
+
+#[cfg(test)]
+mod screen_copy_tests {
+    use super::*;
+    struct Keys(std::collections::VecDeque<KeyCode>);
+    impl KeyReader for Keys {
+        fn read_key(&mut self) -> std::io::Result<KeyCode> {
+            Ok(self.0.pop_front().unwrap())
+        }
+    }
+    #[test]
+    fn typed_secret_never_reaches_visible_screen_copy() {
+        let canary = "not-rendered-secret-canary";
+        let terminal = RefCell::new(crate::terminal::test_terminal(120, 15));
+        let mut keys = Keys(
+            canary
+                .chars()
+                .map(KeyCode::Char)
+                .chain([KeyCode::Esc])
+                .collect(),
+        );
+        assert!(read_value(&terminal, &mut keys).unwrap().is_none());
+        let copied = crate::terminal::test_copy_all(&mut terminal.borrow_mut());
+        assert!(copied.contains("The value and character count are hidden"));
+        assert!(!copied.contains(canary));
+        assert!(!copied.contains(&canary.len().to_string()));
+    }
+}

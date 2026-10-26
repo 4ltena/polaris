@@ -38,7 +38,7 @@ pub struct CrosstermKeyReader;
 impl KeyReader for CrosstermKeyReader {
     fn read_key(&mut self) -> std::io::Result<KeyCode> {
         loop {
-            if let ratatui::crossterm::event::Event::Key(k) = ratatui::crossterm::event::read()?
+            if let ratatui::crossterm::event::Event::Key(k) = crate::terminal::read_event()?
                 && k.kind == KeyEventKind::Press
             {
                 return Ok(k.code);
@@ -48,7 +48,7 @@ impl KeyReader for CrosstermKeyReader {
 
     fn read_secret_key(&mut self) -> std::io::Result<KeyCode> {
         loop {
-            if let ratatui::crossterm::event::Event::Key(key) = ratatui::crossterm::event::read()?
+            if let ratatui::crossterm::event::Event::Key(key) = crate::terminal::read_event()?
                 && let Some(code) = secret_key_code(key)
             {
                 return Ok(code);
@@ -58,7 +58,7 @@ impl KeyReader for CrosstermKeyReader {
 
     fn read_secret_input(&mut self) -> std::io::Result<SecretInputEvent> {
         loop {
-            if let Some(input) = secret_input_event(ratatui::crossterm::event::read()?) {
+            if let Some(input) = secret_input_event(crate::terminal::read_event()?) {
                 return Ok(input);
             }
         }

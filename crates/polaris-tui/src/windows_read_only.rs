@@ -32,7 +32,7 @@ pub fn run_windows_read_only() -> ExitCode {
         },
         || {
             ratatui::Terminal::with_options(
-                ratatui::backend::CrosstermBackend::new(io::stdout()),
+                crate::terminal::backend(),
                 ratatui::TerminalOptions {
                     viewport: ratatui::Viewport::Fullscreen,
                 },
@@ -49,7 +49,7 @@ pub fn run_windows_read_only() -> ExitCode {
     };
     guard.enable_mouse_and_cursor();
     let mut view = ReadOnlyView::new(cwd);
-    let result = run_loop(&mut terminal, &mut view, ratatui::crossterm::event::read);
+    let result = run_loop(&mut terminal, &mut view, crate::terminal::read_event);
     match linux_finish_guarded_terminal(result, &mut guard, linux_restore_terminal_step) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -29,7 +29,9 @@ impl FileClick {
     ) -> Option<PathBuf> {
         let point = Position::new(mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left)
+                if crate::screen_selection::link_modifier(mouse.modifiers) =>
+            {
                 self.press(history, cwd, area, scroll, point)
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -266,6 +268,47 @@ mod tests {
             0,
             Position::new(text[..offset].width() as u16, row as u16),
         )
+    }
+
+    #[test]
+    fn file_reveal_requires_modified_press_and_matching_release() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("target.txt"), "synthetic").unwrap();
+        let history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("target.txt"),
+            shaded: false,
+        }];
+        let area = Rect::new(0, 0, 80, 5);
+        for modifiers in [
+            ratatui::crossterm::event::KeyModifiers::NONE,
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+            ratatui::crossterm::event::KeyModifiers::SUPER,
+        ] {
+            let mut gesture = FileClick::default();
+            let mut event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers,
+            };
+            assert!(
+                gesture
+                    .mouse(event, &history, root.path(), area, 0)
+                    .is_none()
+            );
+            event.kind = MouseEventKind::Up(MouseButton::Left);
+            assert_eq!(
+                gesture
+                    .mouse(event, &history, root.path(), area, 0)
+                    .is_some(),
+                crate::screen_selection::link_modifier(modifiers)
+            );
+            assert!(
+                gesture
+                    .mouse(event, &history, root.path(), area, 0)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

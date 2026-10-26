@@ -165,7 +165,7 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
         terminal,
         reader,
         |url, state| async move {
-            let result = crate::auth_browser::callback(url, state, false, |url, status, scroll| {
+            let result = crate::auth_browser::callback(url, state, |url, status, scroll| {
                 crate::auth_browser::draw_link(&mut *terminal.borrow_mut(), url, status, scroll)
             })
             .await;
@@ -271,7 +271,7 @@ pub(crate) async fn browser_cancel() {
         if !event::poll(Duration::ZERO)? {
             return Ok(None);
         }
-        Ok(match event::read()? {
+        Ok(match crate::terminal::read_event()? {
             Event::Key(key) => Some(key),
             _ => None,
         })

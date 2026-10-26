@@ -194,13 +194,17 @@ use std::path::Path;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use ratatui::backend::{Backend, CrosstermBackend};
+use crate::terminal::DefaultTerminal;
+#[cfg(target_os = "linux")]
+use ratatui::Terminal;
+#[cfg(target_os = "linux")]
+use ratatui::backend::Backend;
+#[cfg(all(target_os = "linux", test))]
+use ratatui::backend::CrosstermBackend;
 #[cfg(target_os = "linux")]
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-#[cfg(target_os = "linux")]
-use ratatui::{DefaultTerminal, Terminal};
 
 /// Which credential became available once onboarding completes
 /// successfully. `polaris-cli::main()` uses this to decide which
@@ -310,7 +314,7 @@ fn read_onboarding_event() -> Result<ratatui::crossterm::event::Event, Onboardin
         }
     }
 
-    let event = match ratatui::crossterm::event::read() {
+    let event = match crate::terminal::read_event() {
         Ok(event) => event,
         Err(_) if shutdown_requested() => return Err(OnboardingError::Cancelled),
         Err(_) => return Err(OnboardingError::Auth("failed to read a key".to_string())),
@@ -371,7 +375,7 @@ fn restore_acquired_terminal<B: Backend>(
 }
 
 /// Owns raw mode, the alternate screen and cursor visibility. Onboarding
-/// only enables scoped mouse capture while the subscription link is shown.
+/// uses the shared backend for mouse selection and never changes cursor shape.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct OnboardingTerminal {
@@ -390,7 +394,7 @@ impl OnboardingTerminal {
         ratatui::crossterm::execute!(io::stdout(), EnterAlternateScreen)
             .map_err(|error| OnboardingError::Auth(error.to_string()))?;
         owner.alternate = true;
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+        let mut terminal = Terminal::new(crate::terminal::backend())
             .map_err(|error| OnboardingError::Auth(error.to_string()))?;
         terminal
             .hide_cursor()
@@ -449,7 +453,7 @@ pub async fn run_registered(
     run_mode(LoginMode::Registered(owner), api_key_path).await
 }
 
-fn render_registered_wait(frame: &mut Frame) {
+pub(crate) fn render_registered_wait(frame: &mut Frame) {
     frame.render_widget(
         Paragraph::new("Authorize in your browser. Esc / Ctrl-C: cancel.").block(
             Block::default()
@@ -463,18 +467,17 @@ fn render_registered_wait(frame: &mut Frame) {
 #[cfg(unix)]
 async fn register(
     owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut crate::terminal::DefaultTerminal,
 ) -> Result<Outcome, OnboardingError> {
     let (ready, after_callback) = tokio::sync::oneshot::channel();
     owner
         .register(
             None,
             |url, state| async move {
-                let result =
-                    crate::auth_browser::callback(url, state, true, |url, status, scroll| {
-                        crate::auth_browser::draw_link(terminal, url, status, scroll)
-                    })
-                    .await;
+                let result = crate::auth_browser::callback(url, state, |url, status, scroll| {
+                    crate::auth_browser::draw_link(terminal, url, status, scroll)
+                })
+                .await;
                 let _ = ready.send(());
                 result
             },
@@ -493,7 +496,7 @@ async fn register(
 #[cfg(not(unix))]
 async fn register(
     _owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
-    _terminal: &mut ratatui::DefaultTerminal,
+    _terminal: &mut crate::terminal::DefaultTerminal,
 ) -> Result<Outcome, OnboardingError> {
     Err(OnboardingError::Auth(
         "protected account storage is unavailable".into(),
@@ -502,19 +505,36 @@ async fn register(
 
 async fn legacy_subscription(
     auth_store_path: &Path,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut crate::terminal::DefaultTerminal,
 ) -> Result<polaris_auth::Credentials, polaris_auth::AuthError> {
-    polaris_auth::login::run_with_callback(
+    let exchanging = std::rc::Rc::new(std::cell::Cell::new(false));
+    let phase = exchanging.clone();
+    let login = polaris_auth::login::run_with_callback(
         polaris_auth::ISSUER,
         auth_store_path,
         |url, state| async move {
-            crate::auth_browser::callback(url, state, true, |url, status, scroll| {
+            let result = crate::auth_browser::callback(url, state, |url, status, scroll| {
                 crate::auth_browser::draw_link(terminal, url, status, scroll)
             })
-            .await
+            .await;
+            phase.set(result.is_ok());
+            result
         },
-    )
-    .await
+    );
+    tokio::pin!(login);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            result = &mut login => return result,
+            _ = tick.tick(), if exchanging.get() => {
+                // Keep visible-text gestures alive without abandoning the
+                // existing legacy token exchange or changing its cancel policy.
+                if ratatui::crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                    let _ = crate::terminal::read_event();
+                }
+            }
+        }
+    }
 }
 
 /// Shows the onboarding screen and drives it to completion. Owns the
@@ -685,7 +705,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
         return Err(OnboardingError::NonInteractive);
     }
 
-    let mut terminal = ratatui::init();
+    let mut terminal = crate::terminal::init();
     let mut selected = Choice::ChatGpt;
 
     let outcome = 'outer: loop {
@@ -697,7 +717,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                 "failed to draw the terminal".to_string(),
             ));
         }
-        let event = match ratatui::crossterm::event::read() {
+        let event = match crate::terminal::read_event() {
             Ok(e) => e,
             Err(_) => break 'outer Err(OnboardingError::Auth("failed to read a key".to_string())),
         };
@@ -729,12 +749,12 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                     break 'outer register(owner, &mut terminal).await;
                 };
                 let result = legacy_subscription(auth_store_path, &mut terminal).await;
-                ratatui::restore();
+                crate::terminal::restore();
                 if matches!(&result, Err(polaris_auth::AuthError::Denied(reason)) if reason == "cancelled")
                 {
                     break 'outer Err(OnboardingError::Cancelled);
                 }
-                terminal = ratatui::init();
+                terminal = crate::terminal::init();
                 match result {
                     Ok(_) => break 'outer Ok(Outcome::CodexLoggedIn),
                     Err(e) => {
@@ -756,7 +776,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                         {
                             break 'outer Err(OnboardingError::Auth(e.to_string()));
                         }
-                        let _ = ratatui::crossterm::event::read();
+                        let _ = crate::terminal::read_event();
                         continue;
                     }
                 }
@@ -772,7 +792,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             "failed to draw the terminal".to_string(),
                         ));
                     }
-                    let event = match ratatui::crossterm::event::read() {
+                    let event = match crate::terminal::read_event() {
                         Ok(e) => e,
                         Err(_) => {
                             break 'outer Err(OnboardingError::Auth(
@@ -797,7 +817,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
         }
     };
 
-    ratatui::restore();
+    crate::terminal::restore();
     outcome
 }
 

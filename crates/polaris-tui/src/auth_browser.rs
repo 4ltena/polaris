@@ -2,25 +2,13 @@
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
-        execute,
-    },
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::{io, time::Duration};
-
-struct MouseCapture(bool);
-impl Drop for MouseCapture {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = execute!(io::stdout(), event::DisableMouseCapture);
-        }
-    }
-}
+use std::time::Duration;
 
 fn render(frame: &mut Frame, url: &str, status: &str, scroll: u16) -> Rect {
     if url.is_empty() {
@@ -44,7 +32,7 @@ fn render(frame: &mut Frame, url: &str, status: &str, scroll: u16) -> Rect {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from("Authorize in your browser"),
-            Line::from("Enter/o or click URL: open | c: copy link | Esc/Ctrl-C: cancel"),
+            Line::from("Ctrl/Cmd-click or Enter/o: open | drag: copy | c: copy URL | Esc: cancel"),
             Line::from("Up/Down: scroll link"),
             Line::from(status.to_owned()),
             Line::from("Authorization link (includes query):"),
@@ -81,7 +69,16 @@ enum Action {
     Down,
     None,
 }
-fn action(event: Event, link: Rect, url: &str, scroll: u16) -> Action {
+fn action(
+    event: Event,
+    link: Rect,
+    url: &str,
+    scroll: u16,
+    click: &mut crate::screen_selection::LinkClick,
+) -> Action {
+    if !matches!(&event, Event::Mouse(_)) {
+        click.cancel();
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
             KeyCode::Esc => Action::Cancel,
@@ -94,15 +91,17 @@ fn action(event: Event, link: Rect, url: &str, scroll: u16) -> Action {
             KeyCode::Down => Action::Down,
             _ => Action::None,
         },
-        Event::Mouse(mouse)
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && link.contains((mouse.column, mouse.row).into())
-                // authorize_url produces an ASCII, percent-encoded URL. Its
-                // wrapped cells map directly to byte offsets, including scroll.
-                && ((usize::from(mouse.row - link.y) + usize::from(scroll))
-                    * usize::from(link.width) + usize::from(mouse.column - link.x)) < url.len() =>
-        {
-            Action::Open
+        Event::Mouse(mouse) => {
+            let hit = link.contains((mouse.column, mouse.row).into())
+                && ((usize::from(mouse.row.saturating_sub(link.y)) + usize::from(scroll))
+                    * usize::from(link.width)
+                    + usize::from(mouse.column.saturating_sub(link.x)))
+                    < url.len();
+            if click.mouse(mouse, hit) {
+                Action::Open
+            } else {
+                Action::None
+            }
         }
         _ => Action::None,
     }
@@ -132,23 +131,18 @@ pub(crate) fn draw_link<B: Backend>(
 pub(crate) async fn callback(
     url: String,
     state: String,
-    own_mouse: bool,
     mut draw: impl FnMut(&str, &str, u16) -> Result<Rect, polaris_auth::AuthError>,
 ) -> Result<String, polaris_auth::AuthError> {
     use polaris_auth::{AuthError, login};
     // Bind first: a manually opened link must never race listener setup.
     let listener = login::bind_callback().await?;
-    let mut mouse = MouseCapture(false);
-    if own_mouse {
-        execute!(io::stdout(), event::EnableMouseCapture)?;
-        mouse.0 = true;
-    }
     let callback = login::wait_for_callback(listener, &state, Duration::from_secs(300));
     tokio::pin!(callback);
     let mut launch = Box::pin(login::launch_browser(&url));
     let mut launch_done = false;
     let mut status = "Requesting your default browser...";
     let mut scroll = 0u16;
+    let mut click = crate::screen_selection::LinkClick::default();
     loop {
         let link = draw(&url, status, scroll)?;
         tokio::select! {
@@ -168,7 +162,7 @@ pub(crate) async fn callback(
                     return Err(AuthError::Denied("cancelled".into()));
                 }
                 if !event::poll(Duration::ZERO)? { continue; }
-                match action(event::read()?, link, &url, scroll) {
+                match action(crate::terminal::read_event()?, link, &url, scroll, &mut click) {
                     Action::Cancel => return Err(AuthError::Denied("cancelled".into())),
                     Action::Copy => {
                         status = copy_link(&url, crate::clipboard::copy_to_clipboard);
@@ -195,12 +189,50 @@ pub(crate) async fn cancel_after_callback(ready: tokio::sync::oneshot::Receiver<
 }
 
 #[cfg(test)]
+pub(crate) fn test_link_event(
+    event: Event,
+    link: Rect,
+    url: &str,
+    click: &mut crate::screen_selection::LinkClick,
+) -> bool {
+    action(event, link, url, 0, click) == Action::Open
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{
         backend::TestBackend,
-        crossterm::event::{KeyEvent, MouseEvent},
+        crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     };
+
+    #[test]
+    fn modified_click_opens_once_on_release_and_plain_click_does_not_open() {
+        let rect = Rect::new(1, 6, 80, 5);
+        let url = "https://example.invalid/?dummy=1";
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            let mut gesture = crate::screen_selection::LinkClick::default();
+            let mut mouse = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 6,
+                modifiers,
+            };
+            assert_eq!(
+                action(Event::Mouse(mouse), rect, url, 0, &mut gesture),
+                Action::None
+            );
+            mouse.kind = MouseEventKind::Up(MouseButton::Left);
+            assert_eq!(
+                action(Event::Mouse(mouse), rect, url, 0, &mut gesture),
+                Action::Open
+            );
+            assert_eq!(
+                action(Event::Mouse(mouse), rect, url, 0, &mut gesture),
+                Action::None
+            );
+        }
+    }
 
     #[test]
     fn only_visible_url_cells_are_underlined_and_clickable_after_wrap_scroll_and_resize() {
@@ -228,7 +260,19 @@ mod tests {
                         modifiers: KeyModifiers::NONE,
                     });
                     assert_eq!(
-                        action(click, rect, url, scroll),
+                        {
+                            let mut gesture = crate::screen_selection::LinkClick::default();
+                            let Event::Mouse(mut down) = click else {
+                                unreachable!()
+                            };
+                            down.modifiers = KeyModifiers::CONTROL;
+                            assert_eq!(
+                                action(Event::Mouse(down), rect, url, scroll, &mut gesture),
+                                Action::None
+                            );
+                            down.kind = MouseEventKind::Up(MouseButton::Left);
+                            action(Event::Mouse(down), rect, url, scroll, &mut gesture)
+                        },
                         if is_url { Action::Open } else { Action::None }
                     );
                     if is_url {
@@ -300,7 +344,8 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
                 rect,
                 url,
-                0
+                0,
+                &mut crate::screen_selection::LinkClick::default()
             ),
             Action::Copy
         );
@@ -309,7 +354,8 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
                 rect,
                 url,
-                0
+                0,
+                &mut crate::screen_selection::LinkClick::default()
             ),
             Action::Cancel
         );
@@ -323,9 +369,10 @@ mod tests {
                 }),
                 rect,
                 url,
-                0
+                0,
+                &mut crate::screen_selection::LinkClick::default()
             ),
-            Action::Open
+            Action::None
         );
         assert_eq!(
             action(
@@ -337,7 +384,8 @@ mod tests {
                 }),
                 rect,
                 url,
-                0
+                0,
+                &mut crate::screen_selection::LinkClick::default()
             ),
             Action::None
         );

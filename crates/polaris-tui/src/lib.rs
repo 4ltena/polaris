@@ -56,6 +56,7 @@ mod workspace_commands;
 pub use memory::{configure_archive, configure_memory, lock_memory};
 pub mod render;
 mod rewind_ui;
+mod screen_selection;
 mod selection;
 pub mod sessions;
 #[cfg(target_os = "linux")]
@@ -64,6 +65,7 @@ pub mod signal;
 pub mod slash;
 #[cfg(target_os = "linux")]
 mod source_apply;
+mod terminal;
 mod time;
 pub mod tool_memory;
 
@@ -262,7 +264,7 @@ struct LinuxTerminalGuard {
 #[cfg(any(target_os = "linux", windows))]
 impl LinuxTerminalGuard {
     #[cfg(target_os = "linux")]
-    fn enter() -> Result<(Self, ratatui::DefaultTerminal), String> {
+    fn enter() -> Result<(Self, crate::terminal::DefaultTerminal), String> {
         let mut guard = Self::default();
         ratatui::crossterm::execute!(
             std::io::stdout(),
@@ -275,7 +277,7 @@ impl LinuxTerminalGuard {
         }
         guard.raw = true;
         let terminal = ratatui::Terminal::with_options(
-            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            crate::terminal::backend(),
             ratatui::TerminalOptions {
                 viewport: ratatui::Viewport::Fullscreen,
             },
@@ -2815,12 +2817,14 @@ fn show_startup_read_only_resume(
         ratatui::crossterm::terminal::EnterAlternateScreen
     )
     .map_err(|error| error.to_string())?;
-    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Fullscreen,
-    }));
+    let terminal = RefCell::new(crate::terminal::init_with_options(
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fullscreen,
+        },
+    ));
     let mut reader = CrosstermKeyReader;
     let result = show_persisted_read_only_resume(&terminal, &mut reader, persistence, reason);
-    ratatui::restore();
+    crate::terminal::restore();
     result
 }
 
@@ -2834,12 +2838,14 @@ fn show_startup_workflow_confirmation(view: &render::WorkflowChangeConfirmView<'
     {
         return false;
     }
-    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Fullscreen,
-    }));
+    let terminal = RefCell::new(crate::terminal::init_with_options(
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fullscreen,
+        },
+    ));
     let mut reader = CrosstermKeyReader;
     let accepted = confirm_workflow_change(&terminal, &mut reader, view);
-    ratatui::restore();
+    crate::terminal::restore();
     accepted
 }
 
@@ -3003,7 +3009,7 @@ fn draw_chat_frame<B: Backend>(
 /// The terminal's current (width, height), or a fallback if the size
 /// can't be read (matches the fallback other `run()` call sites already
 /// use — see e.g. `abbreviate_home`'s caller).
-fn terminal_size(terminal: &RefCell<ratatui::DefaultTerminal>) -> (u16, u16) {
+fn terminal_size(terminal: &RefCell<crate::terminal::DefaultTerminal>) -> (u16, u16) {
     terminal
         .borrow()
         .size()
@@ -3011,11 +3017,11 @@ fn terminal_size(terminal: &RefCell<ratatui::DefaultTerminal>) -> (u16, u16) {
         .unwrap_or((80, 24))
 }
 
-fn terminal_width(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
+fn terminal_width(terminal: &RefCell<crate::terminal::DefaultTerminal>) -> u16 {
     terminal_size(terminal).0
 }
 
-fn terminal_height(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
+fn terminal_height(terminal: &RefCell<crate::terminal::DefaultTerminal>) -> u16 {
     terminal_size(terminal).1
 }
 
@@ -3402,9 +3408,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     #[cfg(not(target_os = "linux"))]
-    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Fullscreen,
-    }));
+    let terminal = RefCell::new(crate::terminal::init_with_options(
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fullscreen,
+        },
+    ));
     #[cfg(target_os = "linux")]
     let (mut terminal_guard, terminal) = match linux_start_terminal(
         signal::pending_linux_process_shutdown,
@@ -3422,12 +3430,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         terminal_guard.enable_mouse_and_cursor();
         RefCell::new(terminal)
     };
-    // Trackpad/mouse wheel scrolling of the conversation history, and mouse
-    // drag-to-select (see `selection.rs`) — without this, crossterm never
+    // Trackpad/mouse wheel scrolling and shared visible-cell drag selection
+    // (see `terminal.rs`) — without capture, crossterm never
     // emits `Event::Mouse` at all. This blocks the terminal's own native
     // mouse handling (including drag-select) while polaris is running — see
     // `selection.rs`'s module doc for why polaris implements its own
-    // selection instead of relying on that. Best-effort: a terminal that
+    // selection instead of relying on that. The old history-only selection is
+    // retained for non-wrapped backends. Best-effort: a terminal that
     // doesn't support mouse reporting just keeps not sending mouse events,
     // same as before.
     #[cfg(not(target_os = "linux"))]
@@ -3677,7 +3686,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 break ExitCode::FAILURE;
             }
             match ratatui::crossterm::event::poll(Duration::from_millis(100)) {
-                Ok(true) => match ratatui::crossterm::event::read() {
+                Ok(true) => match crate::terminal::read_event() {
                     Ok(ratatui::crossterm::event::Event::Key(key))
                         if key.code == ratatui::crossterm::event::KeyCode::Char('c')
                             && key
@@ -3971,7 +3980,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     Ok(None) | Err(_) => break 'outer ExitCode::FAILURE,
                 };
                 #[cfg(not(target_os = "linux"))]
-                let candidate = match ratatui::crossterm::event::read() {
+                let candidate = match crate::terminal::read_event() {
                     Ok(e) => e,
                     Err(_) => break 'outer ExitCode::FAILURE,
                 };
@@ -3998,7 +4007,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     ) {
                         status = notice;
                     }
-                    use ratatui::crossterm::event::MouseEventKind;
+                    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+                    if screen_selection::link_modifier(mouse.modifiers)
+                        && matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(MouseButton::Left)
+                                | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Up(MouseButton::Left)
+                        )
+                    {
+                        conversation_view.selection = None;
+                        continue 'outer;
+                    }
                     match mouse.kind {
                         MouseEventKind::Moved => continue,
                         MouseEventKind::ScrollUp => {
@@ -7154,6 +7174,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         rendered_suggestion_count = suggestions.len();
                     }
                     maybe_event = event_stream.next() => {
+                        let maybe_event = maybe_event.map(|event| event.and_then(crate::terminal::filter_event));
                         use ratatui::crossterm::event::{
                             Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
                             MouseEventKind,
@@ -7407,6 +7428,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     },
                                 }
                             }
+                            Some(Ok(Event::Mouse(mouse))) if screen_selection::link_modifier(mouse.modifiers)
+                                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)) => {
+                                    conversation_view.selection = None;
+                                }
                             Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
                                 MouseEventKind::ScrollUp => {
                                     conversation_view.scroll_offset = conversation_view
@@ -7917,7 +7942,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     }
     // ratatui restores the alternate screen on the other platforms.
     #[cfg(not(target_os = "linux"))]
-    ratatui::restore();
+    crate::terminal::restore();
     // Restore the terminal's own default cursor shape, undoing the
     // BlinkingBar set at startup — best-effort, same as the set itself.
     #[cfg(not(target_os = "linux"))]

@@ -236,10 +236,36 @@ async fn wait<B: Backend, T>(
                 lost |= terminal.borrow_mut().draw(|frame| frame.render_widget(Paragraph::new(message).block(Block::default().borders(Borders::ALL).title("Environment")), frame.area())).is_err();
                 if lost { cancelled.store(true, Ordering::Release); }
                 if event::poll(Duration::ZERO).unwrap_or(false)
-                    && let Ok(Event::Key(key)) = event::read()
+                    && let Ok(Event::Key(key)) = crate::terminal::read_event()
                     && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
                 { cancelled.store(true, Ordering::Release); }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_copy_tests {
+    use super::*;
+    #[tokio::test]
+    async fn environment_wait_text_uses_the_shared_visible_copy_backend() {
+        let terminal = RefCell::new(crate::terminal::test_terminal(100, 15));
+        let cancelled = AtomicBool::new(false);
+        let worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok::<_, String>(())
+        });
+        wait(
+            &terminal,
+            "synthetic environment progress 日本語",
+            worker,
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::terminal::test_copy_all(&mut terminal.borrow_mut())
+                .contains("synthetic environment progress 日本語")
+        );
     }
 }

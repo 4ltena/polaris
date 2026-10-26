@@ -8,9 +8,11 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 ### 追加・変更
 
+- ログイン画面・ダイアログ・実行中を含め、表示文字のドラッグコピーに対応。認証URLとFinderリンクはCtrl-click（端末対応時はCmd-click）で開き、通常クリック・ドラッグでは開かない。
+
 - `env plan`・`env set`・`env status`をCLI/TUIへ追加し、Node、Next.js、React/Vite、Vue/Vite、SvelteKit、Astro、Nuxt、Angular、Python、Rust、Goの固定プロファイルを用意する。取得計画の確認、専用runtime、offline導入、既存ファイルの保持を共通の実行経路で扱う。
 - TUIの既定・推奨モデルをGPT-6.1 Solへ変更し、起動ヘッダにバージョンを表示する。
-- ファイルのD&Dをまとめて削除できる入力リンクとして扱い、出力されたファイルのクリックからFinderで保存場所を表示する。範囲選択した文章は追加の確認画面なしでコピーする。
+- ファイルのD&Dをまとめて削除できる入力リンクとして扱い、出力されたファイルへのCtrl-click（端末対応時はCmd-click）からFinderで保存場所を表示する。範囲選択した文章は追加の確認画面なしでコピーする。
 - help・ログ・エラーを英語へ統一する。TUIのアカウント操作は`/login`・`/logout`・`/status`へ、remember設定は`/memory configure`へ集約する。CLIの`polaris account`は保持する。
 - 会話の再開・分岐・巻戻し、原文参照、workflowとskill、MCP・subagentをTUIから扱える。
 - working中の補完と子タスク照会、入力受理ID、整理したstatus表示を提供する。
@@ -21,7 +23,7 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 - 認証リンクの下線とクリック判定をURL文字の範囲だけに限定し、折り返し後の行末や下の空白を除外した。
 
-- Subscription認証待ちにクエリ付きURLとクリック・コピー操作を追加した。ブラウザ起動に失敗しても手動URLから続行でき、認証待ちを終了しない。
+- Subscription認証待ちにクエリ付きURLとCtrl-click・コピー操作を追加した。ブラウザ起動に失敗しても手動URLから続行でき、認証待ちを終了しない。
 
 - Rust環境構築で、既存Command Line Toolsを環境変数から明示選択できるようにした。Appleのglobal設定とライセンス同意状態は変更しない。
 

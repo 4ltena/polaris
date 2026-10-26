@@ -1690,6 +1690,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `runtime_commands.rs` — Commands over the live host control plane; no desktop-state mirror.
 - `runtime_effects.rs` — Runtime management requests use the bound activity lease, never source mutation.
 - `sandbox_commands.rs` — Explicit argv execution under the startup ceiling and durable C38 receipt.
+- `screen_selection.rs` — Selection of visible terminal cells only; no input buffers or persistence.
 - `selection.rs` — Mouse drag-to-select over the conversation history. Operates entirely
 - `session_activation.rs` — 保存会話の設定とプロセス所有サービスを実行中のセッションへ適用する。
 - `session_commands.rs` — Saved session controls use the conversation owner and shared project lease.
@@ -1697,6 +1698,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `signal.rs` — Linux process-signal capture for the interactive terminal lifetime.
 - `slash.rs` — Slash commands: local, client-side commands recognized when the input
 - `source_apply.rs` — Linux terminal adapter for the existing source-bound native owner.
+- `terminal.rs` — Shared visible-cell selection across TUI screens, with no history or disk sink.
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
 - `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
 - `windows_admission_tests.rs` — Windows TUI admission and slash command tests that preserve rejected work and state.

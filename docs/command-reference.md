@@ -85,9 +85,9 @@ profileは`node`・`nextjs`・`react`・`vue`・`svelte`・`astro`・`nuxt`・`a
 
 `/resume`で会話を開いても、現在の作業ファイルと保存状態が一致しない場合は閲覧のみになる。`/new`・`/fork`・`/resume`は別の操作であり、IDは`/session current`で確認できる。
 
-会話の範囲選択は、実行が終わった状態でドラッグを離すと選択した本文だけを直接clipboardへコピーする。追加の確認画面は表示しない。
+ログイン画面・ダイアログ・実行中も、可視文字をドラッグして離すと選択範囲を直接clipboardへコピーする。非表示の秘密値は対象外で、追加の確認画面は表示しない。リンクはCtrl-click、端末が通知する場合はCmd-clickで開く。通常のクリック・ドラッグでは開かない。
 
-macOSでは、会話に表示された実在するファイル名やローカルパスを宛先とするMarkdownリンクをクリックすると、Finderでそのファイルの所在を表示する。ファイル自体は開かない。相対パスはproject rootから解決し、`src/main.rs:12:3`のような行・列指定にも対応する。日本語・折り返されたパス、インラインコードで示された空白入りのファイル名も対象になる。ドラッグ操作は範囲選択として扱う。Webリンクや存在しないファイルはFinderで開かない。
+macOSでは、会話に表示された実在するファイル名やローカルパスを宛先とするMarkdownリンクをCtrl-click（端末対応時はCmd-click）すると、Finderでそのファイルの所在を表示する。ファイル自体は開かない。相対パスはproject rootから解決し、`src/main.rs:12:3`のような行・列指定にも対応する。日本語・折り返されたパス、インラインコードで示された空白入りのファイル名も対象になる。ドラッグ操作は範囲選択として扱う。Webリンクや存在しないファイルはFinderで開かない。
 
 ### ファイルのD&Dと入力リンク
 
@@ -404,7 +404,7 @@ C08/C10の確定は端末での確認、または`--yes`を必要とする。結
 ## 現在の提供状況で注意する点
 
 - バージョンはシェルで`polaris --version`。TUIの`/version`・`/usage`・`/effort`は存在しない。
-- `/web-search`・`/models`・`/browse`・`/attachment`・`/recipe`・`/handoff`・`/remember`・`/account`は削除した。モデル選択は`/model`、macOSでのファイル所在の表示は会話中のファイル名クリックを使う。エージェント内部のWeb検索経路と提供条件は維持している。
+- `/web-search`・`/models`・`/browse`・`/attachment`・`/recipe`・`/handoff`・`/remember`・`/account`は削除した。モデル選択は`/model`、macOSでのファイル所在の表示は会話中のファイル名へのCtrl-click（端末対応時はCmd-click）を使う。エージェント内部のWeb検索経路と提供条件は維持している。
 - `polaris setting nextjs`と`/setting nextjs`は廃止した。環境構築は`polaris env set <profile>`／`/env set <profile>`へ移した。旧コマンドの別名ではなく、固定計画の確認と専用runtimeによる導入を行う。
 - `read`や`skill`はツール名で、`/read`・`/skill`というコマンドではない。
 - `/model`で変更するのはモデル。推論強度の固定指定は起動時の`--effort`で行う。

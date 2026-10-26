@@ -25,7 +25,7 @@ cargo build --release
 
 TUIの`/web-search`・`/models`・`/browse`・`/attachment`・`/recipe`・`/handoff`・`/remember`・`/account`は提供しない。モデル選択は`/model`、履歴の記憶設定は`/memory configure on/off`を使う。認証は`/login`・`/logout`、保存されたログイン状態・対話ID・使用トークンの確認は`/status`へ集約している。CLIの`polaris account`は保持している。
 
-macOSでは会話に表示された実在ファイル名をクリックすると、Finderで所在を表示する。会話のドラッグは範囲選択になる。ファイルを端末へD&Dすると、入力欄にファイル名のリンクブロックを挿入し、直後のBackspaceで一括削除できる。ファイル本文は自動で読み込まない。内部のWeb検索経路と上記の提供条件は維持している。
+macOSでは会話に表示された実在ファイル名をCtrl-clickすると、Finderで所在を表示する。認証URLもCtrl-clickで開ける。Cmd-clickは端末が修飾キーを通知する場合に対応する。Terminal.app標準のURL操作はCmd-double-clickである。通常のクリックでは開かない。ログイン画面・ダイアログ・実行中も、表示された文字をドラッグして離すと確認なしでコピーする。非表示の秘密値はコピーしない。ファイルを端末へD&Dすると、入力欄にファイル名のリンクブロックを挿入し、直後のBackspaceで一括削除できる。ファイル本文は自動で読み込まない。内部のWeb検索経路と上記の提供条件は維持している。
 
 one-shot実行の推論強度は、省略時に`xhigh`を使う。対話TUIでは省略時に自動判定し、`--effort`で明示した値が優先される。APIにはモデル名と推論強度を別々に渡す。CLIが受け付ける値は`low`・`medium`・`high`・`xhigh`・`max`の5つである。`max`はResponses API限定だが、主経路が`/responses`なので使える。この設定はroot実行自身の強度であり、委譲先の強度は`[tier.*]`が決める。
 

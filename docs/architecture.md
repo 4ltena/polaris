@@ -244,7 +244,7 @@ processが動く。
 - `crates/polaris-sandbox/src/confine.rs:991`
 - `crates/polaris-sandbox/src/confine.rs:1027`
 - `crates/polaris-tui/src/clipboard.rs:67`
-- `crates/polaris-tui/src/file_reveal.rs:226`
+- `crates/polaris-tui/src/file_reveal.rs:228`
 
 ### gitの呼出し
 
@@ -264,4 +264,4 @@ processが動く。
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/sync/repository/c10.rs:1551`
 - `crates/polaris-desktop-service/src/workspace_view.rs:470`
-- `crates/polaris-tui/src/lib.rs:12663`
+- `crates/polaris-tui/src/lib.rs:12688`

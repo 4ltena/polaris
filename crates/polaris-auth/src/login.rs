@@ -101,19 +101,19 @@ fn callback_page(page: CallbackPage) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{status} · Polaris</title>
 <style>
-:root {{ color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; }}
+:root {{ color-scheme: dark; font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; color: #f3f7fb; background: #050a10; background-image: linear-gradient(rgba(110,180,224,.07) 1px, transparent 1px), linear-gradient(90deg, rgba(110,180,224,.07) 1px, transparent 1px); background-size: 52px 52px; }}
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; color: #f4f4f4; background: #050a10; background-image: linear-gradient(rgba(110,180,224,.07) 1px, transparent 1px), linear-gradient(90deg, rgba(110,180,224,.07) 1px, transparent 1px); background-size: 52px 52px; }}
 main {{ width: min(760px, calc(100% - 40px)); display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 52px; align-items: center; }}
-.brand {{ display: flex; flex-direction: column; align-items: center; gap: 18px; color: #a8c7da; font-size: 14px; letter-spacing: .08em; }}
+.brand {{ display: flex; flex-direction: column; align-items: center; gap: 18px; color: #b8b8b8; font-size: 14px; letter-spacing: .08em; }}
 .mark {{ position: relative; width: 74px; height: 74px; color: #c9eaff; }}
 .mark i {{ position: absolute; left: 50%; top: 50%; width: 25px; height: 7px; border-radius: 5px; background: currentColor; transform-origin: -9px 50%; transform: translate(9px,-50%) rotate(var(--r)); }}
-.status {{ display: flex; align-items: center; gap: 10px; color: #a7c7dc; font-size: 14px; }}
+.status {{ display: flex; align-items: center; gap: 10px; color: #b8b8b8; font-size: 14px; }}
 .status::before {{ content: ""; width: 8px; height: 8px; flex: none; border-radius: 50%; background: #8fd4ff; box-shadow: 0 0 14px rgba(143,212,255,.72); }}
 .failure .status::before {{ background: #ff9d96; box-shadow: 0 0 14px rgba(255,115,105,.55); }}
-h1 {{ margin: 18px 0 12px; font-size: clamp(38px,7vw,68px); line-height: .98; letter-spacing: -.045em; font-weight: 600; }}
-p {{ max-width: 520px; margin: 0; color: #92a4b7; font-size: 18px; line-height: 1.55; }}
-small {{ display: block; margin-top: 28px; color: #62778a; font-size: 14px; }}
+h1 {{ margin: 18px 0 12px; font-size: clamp(32px,5vw,54px); line-height: .98; letter-spacing: -.045em; font-weight: 600; }}
+p {{ max-width: 520px; margin: 0; color: #a3a3a3; font-size: 18px; line-height: 1.55; }}
+small {{ display: block; margin-top: 28px; color: #858585; font-size: 14px; }}
 @media (max-width: 620px) {{ main {{ grid-template-columns: 1fr; gap: 34px; padding-block: 48px; }} .brand {{ align-items: flex-start; }} h1 {{ font-size: clamp(42px,14vw,64px); }} }}
 @media (prefers-reduced-motion: no-preference) {{ .status::before {{ animation: pulse 1.8s ease-in-out 1; }} @keyframes pulse {{ 0% {{ transform: scale(.5); opacity: .3; }} 55% {{ transform: scale(1.45); opacity: 1; }} 100% {{ transform: scale(1); opacity: 1; }} }} }}
 </style>

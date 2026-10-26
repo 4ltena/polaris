@@ -8,6 +8,7 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 ### 追加・変更
 
+- 認証完了・失敗ページのフォントをJetBrains Mono優先に変更し、文字色を無彩色に統一。背景とロゴ・状態マークのアクセント色は保持する。フォント未導入時は等幅フォントへフォールバックする。
 - ログイン画面・ダイアログ・実行中を含め、表示文字のドラッグコピーに対応。認証URLとFinderリンクはCtrl-click（端末対応時はCmd-click）で開き、通常クリック・ドラッグでは開かない。
 
 - `env plan`・`env set`・`env status`をCLI/TUIへ追加し、Node、Next.js、React/Vite、Vue/Vite、SvelteKit、Astro、Nuxt、Angular、Python、Rust、Goの固定プロファイルを用意する。取得計画の確認、専用runtime、offline導入、既存ファイルの保持を共通の実行経路で扱う。

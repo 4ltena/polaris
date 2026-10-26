@@ -85,7 +85,7 @@ profileは`node`・`nextjs`・`react`・`vue`・`svelte`・`astro`・`nuxt`・`a
 
 `/resume`で会話を開いても、現在の作業ファイルと保存状態が一致しない場合は閲覧のみになる。`/new`・`/fork`・`/resume`は別の操作であり、IDは`/session current`で確認できる。
 
-ログイン画面・ダイアログ・実行中も、可視文字をドラッグして離すと選択範囲を直接clipboardへコピーする。非表示の秘密値は対象外で、追加の確認画面は表示しない。リンクはCtrl-click、端末が通知する場合はCmd-clickで開く。通常のクリック・ドラッグでは開かない。
+ログイン画面・ダイアログ・実行中も、可視文字をドラッグして離すと選択範囲を直接clipboardへコピーする。非表示の秘密値は対象外で、追加の確認画面は表示しない。リンクはCtrl-click、端末が通知する場合はCmd-clickで開く。通常のクリック・ドラッグでは開かない。Terminal.appのCmd＋単クリックは未対応であり、Ctrl-clickを使う。
 
 macOSでは、会話に表示された実在するファイル名やローカルパスを宛先とするMarkdownリンクをCtrl-click（端末対応時はCmd-click）すると、Finderでそのファイルの所在を表示する。ファイル自体は開かない。相対パスはproject rootから解決し、`src/main.rs:12:3`のような行・列指定にも対応する。日本語・折り返されたパス、インラインコードで示された空白入りのファイル名も対象になる。ドラッグ操作は範囲選択として扱う。Webリンクや存在しないファイルはFinderで開かない。
 
@@ -272,7 +272,7 @@ Rustの既存Command Line Toolsを使う場合は、起動時に`POLARIS_ENVKIT_
 
 | オプション | 役割 |
 | --- | --- |
-| `--model <ID>` | モデルを指定。省略時は`POLARIS_MODEL`、未設定なら`gpt-6-astra`。 |
+| `--model <ID>` | モデルを指定。省略時は`POLARIS_MODEL`、未設定ならTUIは`gpt-6.1-sol`、単発実行は`gpt-6-astra`。 |
 | `--account <登録ID>` | 送信に使う登録アカウントを指定。 |
 | `--effort low\|medium\|high\|xhigh\|max` | rootの推論強度を固定。省略時、TUIは自動、非対話実行はxhigh。`ultra`は受け付けない。 |
 | `--max-turns <n>` | 1runのturn上限。既定20。 |

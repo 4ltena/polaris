@@ -19,19 +19,9 @@ Polaris is a Rust coding agent that selects the context needed for the current t
 
 Provisional v1.0.0 distributes the macOS arm64 TUI only. GUI and other-platform sources remain in the repository. See the [system overview](docs/system-overview.md), [release scope](docs/releases/v1.0.0.md), and [command reference](docs/command-reference.md) (Japanese). No v1.0.0 tag or release has been published for this candidate.
 
-## v0.12.0 comparison with stock Codex
-
-Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow enabled. These partial results cover 15 matched PRE02–08 trials with two turns each against Codex CLI 0.154.0. The additional PRE01 measurement was skipped.
-
-| Metric | Polaris | Stock Codex CLI 0.154.0 | Reduction |
-| --- | ---: | ---: | ---: |
-| Total tokens | **95,139** | 467,901 | **79.7%** |
-| Hypothetical API cost | **$2.37915** | $3.600914 | **33.9%** |
-| Quality checks | 15/15 passed | 15/15 passed | — |
-
-Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. Polaris took 23.5% longer across these 15 trials. These short synthetic tasks were run sequentially and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果).
-
 ## Using this development checkout
+
+Start from a project directory. Starting from your home directory currently fails helper preparation with `RuntimeDenied`; see [startup troubleshooting](docs/usage.md#起動時のトラブル).
 
 On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-1.0.0-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
 
@@ -43,7 +33,7 @@ target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris
 ```
 
-With no prompt argument, Polaris starts the interactive TUI; `-p` runs one prompt. The default provider is `openai` and requires an API key, so set `POLARIS_PROVIDER=codex` for ChatGPT authentication as shown. Use `target/release/polaris` when testing from source to distinguish it from another installed version.
+With no prompt argument, Polaris starts the interactive TUI; `-p` runs one prompt. Without an explicit provider, an available OpenAI-compatible API key selects `openai`; saved ChatGPT authentication selects `codex` when no API key is available. With neither, interactive startup shows the login screen. The example explicitly selects `codex`. Use `target/release/polaris` when testing from source to distinguish it from another installed version.
 
 Use `--phase` to choose the starting phase:
 
@@ -63,24 +53,32 @@ The API-key `openai` provider currently uses Chat Completions and does not suppo
 
 The macOS CLI preview package contains no optional resources. The GUI installer has a manifest-verified download path for llama.cpp, the embedding runtime, and multilingual-e5-small/base under `~/.polaris`; Rust is optional. Qwen3.5-4B is a candidate for the SemIf classifier, but its pinned distribution artifacts and acceptance checks are incomplete, so it is not automatically downloaded. Signed distribution assets and real-device acceptance are still missing. See the [macOS guide](apps/macos/README.md) for the verified scope.
 
+## v0.12.0 comparison with stock Codex
+
+These are historical v0.12.0 measurements, not results for provisional v1.0.0. The current-version comparison has not been run.
+
+Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow enabled. These partial results cover 15 matched PRE02–08 trials with two turns each against Codex CLI 0.154.0. The additional PRE01 measurement was skipped.
+
+| Metric | Polaris | Stock Codex CLI 0.154.0 | Reduction |
+| --- | ---: | ---: | ---: |
+| Total tokens | **95,139** | 467,901 | **79.7%** |
+| Hypothetical API cost | **$2.37915** | $3.600914 | **33.9%** |
+| Quality checks | 15/15 passed | 15/15 passed | — |
+
+Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. Polaris took 23.5% longer across these 15 trials. These short synthetic tasks were run sequentially and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果).
+
 ## Documentation
 
-The detailed documents below are in Japanese.
+Start with the [documentation index](docs/README.md). Detailed documents below are in Japanese.
 
 | Document | Contents |
 | --- | --- |
-| [Usage guide](docs/usage.md) | Authentication, configuration, workflow, TUI, resume, and fork. |
-| [macOS desktop](apps/macos/README.md) | Local app and installer assembly, storage boundaries, and local models. |
-| [Architecture](docs/architecture.md) | Crate dependencies and external integration points. |
-| [Context efficiency](docs/context-efficiency.md) | Compaction, archival, retrieval, embeddings, and strict10. |
-| [Subagents](docs/subagents.md) | Parallel execution, schemas, and execution limits. |
-| [Preimplementation measurements](docs/preimplementation-evaluation.md) | Planning quality and the stock Codex comparison. |
-| [v0.11.0 validation](docs/sadalmelik-validation.md) | Control tests, real-model tests, and unverified behavior. |
-| [Testing](docs/testing.md) | Automated checks and manual TUI verification. |
-| [Earlier GPT-6 measurements](docs/gpt6-efficiency-results.md) | Synthetic tasks and measurement conditions at v0.9.0. |
-| [Large skill/plugin comparison](docs/skill-scaling-benchmark.md) | Conditions behind the earlier 547-token initial input. |
-| [Request pacing and caching](docs/gpt6-cache-pacing-results.md) | The v0.10.0 long-conversation cache experiment. |
-| [Codex update investigation](docs/codex-update-efficiency.md) | Public changes and control of automatic model requests. |
+| [Documentation index](docs/README.md) | Current guides, implementation references, and historical measurements. |
+| [Usage guide](docs/usage.md) | Authentication, startup troubleshooting, configuration, envkit, and conversations. |
+| [Command reference](docs/command-reference.md) | CLI/TUI commands and their output. |
+| [System overview](docs/system-overview.md) | Execution, storage, isolation, and crate roles. |
+| [Provisional v1.0.0](docs/releases/v1.0.0.md) | Distribution scope, candidate checksums, verification, and limits. |
+
 
 ## Development and verification
 

@@ -33,6 +33,19 @@ one-shot実行の推論強度は、省略時に`xhigh`を使う。対話TUIで�
 
 `polaris sandbox -- <コマンド...>`はエージェントループを介さず、選択中のサンドボックスポリシーでコマンドを実行し、終了コードと標準出力・標準エラーを返す。`polaris doctor`は保存済み資格情報、既定プロバイダ、サンドボックスの可否を読み取り専用で診断し、鍵の中身は表示しない。`polaris completion <bash|zsh|fish|elvish|powershell>`は補完スクリプトを標準出力へ生成する。
 
+## 起動時のトラブル
+
+`polaris`は作業対象のプロジェクトディレクトリから起動する。
+
+```sh
+cd /path/to/project
+polaris
+```
+
+ホームディレクトリで起動すると、既定の書込み範囲に実行用バイナリと保護用の保存先が入り、`Isolated execution preparation refused: RuntimeDenied`で停止する場合がある。プロジェクトへ移動して再起動する。ホームからの起動を自動調整する修正は未実装であり、サンドボックスを解除して回避しない。
+
+認証待ちでブラウザが表示されなければ、Enterまたは`o`で再度開くか、`c`でクエリ付きURL全文をコピーして通常のブラウザで開く。認可が終わるまでPolarisの画面は閉じない。Terminal.appのCmd＋単クリックはPolarisへ通知されず、現在の実装では開けない。Ctrl-clickまたは上記のキー操作を使う。
+
 ## 固定profileによる環境構築
 
 macOS arm64では、例えば空の対象directoryで次を実行する。
@@ -224,7 +237,7 @@ POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
 
 `polaris login`はブラウザを開き、`http://localhost:1455/auth/callback`で認可を受け取る。資格情報は`~/.polaris/auth.json`に0600で保管し、`~/.codex/`には読み書きしない。`polaris logout`はPolarisが保存した資格情報を削除する。`ls -l ~/.polaris/auth.json`で`-rw-------`であることを確認できる。
 
-Subscriptionの認証待ち画面には、クエリを含む認証URLを表示する。URLクリック・Enter・`o`で既定ブラウザへ開き、`c`でURL全文をコピーする。長いURLは↑↓でスクロールできる。自動起動に失敗しても認証待ちは続くため、手動で開いた後も画面を閉じずに認可を進める。ブラウザ認可待ちはEsc・Ctrl-Cで取り消せる。URLはこの画面だけに表示し、会話や監査ログには保存しない。CLIのログインでは端末へURLを表示する。
+Subscriptionの認証待ち画面には、クエリを含む認証URLを表示する。URLへのCtrl-click・Enter・`o`で既定ブラウザへ開き、`c`でURL全文をコピーする。長いURLは↑↓でスクロールできる。自動起動に失敗しても認証待ちは続くため、手動で開いた後も画面を閉じずに認可を進める。ブラウザ認可待ちはEsc・Ctrl-Cで取り消せる。URLはこの画面だけに表示し、会話や監査ログには保存しない。CLIのログインでは端末へURLを表示する。
 
 期限切れの更新経路を手で確認する場合は、テスト用の資格情報に限り`expires_at`を過去のUnix秒または`null`へ変更し、再実行後に`expires_at`、`account_id`、0600が維持されることを確認する。JSONを壊さないこと。
 
@@ -276,7 +289,8 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 | `/memory import <JSONL>`、`/memory search <query>`、`/memory get <session> <id>`、`/memory source <session> <id>`、`/memory forget <session>` | 記録の取り込み、検索・参照、確認後の記憶削除を行う。取り込みと削除は巻き戻しでは取り消せない。 |
 | `/diff`、`/review` | 変更点を表示し、またはレビュー指示を通常のモデルターンとして送る。 |
 | `/export` | 会話をMarkdownへ書き出す。ファイル名省略時はタイムスタンプ付きの名前を使う。 |
-| `/logout`、`/quit`、`/exit` | 保存済み認証を削除し、または終了する。 |
+| `/logout [登録ID]` | 追加確認なしで指定認証を解除し、結果を表示する。省略時は使用中の認証が対象。 |
+| `/quit`、`/exit` | Polarisを終了する。 |
 
 `/resume`は作業ディレクトリ別に会話をグループ化し、現在のディレクトリを先頭に表示する。選んだ会話への送信は既存ファイルへ追記する。
 

@@ -1574,7 +1574,17 @@ pub(crate) async fn run_loop(
                 .map_err(std::io::Error::other)?;
             workflow_context_projected = projection.inserted;
         }
+        // The frozen quotation of the project's AGENTS.md rides on every
+        // request as its own message, outside the system prompt.
+        let project_reference = session
+            .request_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.project_reference())
+            .map(polaris_provider::Message::user);
         let total_tokens = crate::budget::always_on_tokens(&sending_system, &sending_tools)
+            + project_reference
+                .as_ref()
+                .map_or(0, |message| crate::budget::count_tokens(&message.content))
             + crate::compaction::session_tokens(&session.examples)
             // The memory evidence is deliberately absent. It exists only
             // under strict10/structured10, and compaction is disabled under
@@ -1648,6 +1658,7 @@ pub(crate) async fn run_loop(
 
         session.check_persistence()?;
         let mut request_messages = session.examples.clone();
+        request_messages.extend(project_reference);
         if let Some(evidence) = &historical_evidence {
             request_messages.push(evidence.clone());
         }

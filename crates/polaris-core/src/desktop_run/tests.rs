@@ -223,7 +223,8 @@ fn readonly_project_routes_use_the_run_copy_while_rules_stay_host_bound() {
     assert!(systems[0].contains("src/COPY_ROUTE.rs"));
     assert!(systems[0].contains("COPY_ROUTE: settled"));
     assert!(!systems[0].contains("HOST_ROUTE"));
-    assert!(systems[0].contains("HOST_RULE"));
+    // The project's AGENTS.md is quoted data now, so it is not in the system.
+    assert!(!systems[0].contains("HOST_RULE"));
     assert_eq!(shared_prompt.project_root(), Some(source.as_path()));
     assert!(requests.try_recv().is_err());
 }
@@ -282,7 +283,11 @@ fn agents_refresh_uses_original_source_at_each_desktop_request() {
     }
     let (temp, mut input, mut requests, _) = fixture(Behavior::Complete);
     let source = std::fs::canonicalize(temp.path().join("source")).unwrap();
-    let original = source.join("AGENTS.md");
+    // The owner's file is re-read at each request; a project's is quoted once.
+    let owner_home = tempfile::tempdir().unwrap();
+    let original = std::fs::canonicalize(owner_home.path())
+        .unwrap()
+        .join("AGENTS.md");
     std::fs::write(&original, "## Always on\n- initial host instruction\n").unwrap();
     std::fs::write(
         input.prepared.snapshot().path().join("AGENTS.md"),
@@ -291,7 +296,9 @@ fn agents_refresh_uses_original_source_at_each_desktop_request() {
     .unwrap();
     input.always_on = input
         .always_on
-        .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &source).unwrap())
+        .with_agents_refresh(
+            crate::constitution::AgentsRefresh::new(Some(&original), &source).unwrap(),
+        )
         .unwrap();
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     input.provider = Arc::new(UpdatingProvider {

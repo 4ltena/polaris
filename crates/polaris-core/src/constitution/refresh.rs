@@ -270,23 +270,59 @@ impl AgentsRefresh {
         self.read_checked(|| {})
     }
 
+    /// The owner's own rules only. The project file is not opened.
+    pub fn read_global(&self) -> io::Result<String> {
+        self.read_parts(true, false, || {})
+            .map(|(global, _)| global)
+    }
+
+    /// The project's `## Always on` text only, for the one read a session makes.
+    pub fn read_project(&self) -> io::Result<String> {
+        self.read_parts(false, true, || {})
+            .map(|(_, project)| project)
+    }
+
     fn read_checked(&self, after_reads: impl FnOnce()) -> io::Result<String> {
+        self.read_parts(true, true, after_reads)
+            .map(|(global, project)| combine(&global, &project))
+    }
+
+    /// Both scopes are read and verified under one registry lock; a scope not
+    /// asked for is neither opened nor reported.
+    fn read_parts(
+        &self,
+        want_global: bool,
+        want_project: bool,
+        after_reads: impl FnOnce(),
+    ) -> io::Result<(String, String)> {
         polaris_auth::protection::with_protected_paths(|registered| {
             let secrets =
                 RegisteredSecrets::from_auth_registry(registered).map_err(|_| denied())?;
-            let global = self.global.as_ref().map(|s| s.read(&secrets)).transpose()?;
-            let project = self.project.read(&secrets)?;
+            let global = match (want_global, &self.global) {
+                (true, Some(source)) => Some(source.read(&secrets)?),
+                _ => None,
+            };
+            let project = if want_project {
+                Some(self.project.read(&secrets)?)
+            } else {
+                None
+            };
             after_reads();
             if let Some(global) = &global {
                 global.verify()?;
             }
-            project.verify()?;
-            Ok(combine(
-                &global
+            if let Some(project) = &project {
+                project.verify()?;
+            }
+            Ok((
+                global
                     .as_ref()
                     .map(|g| extract_always_on(&g.body))
                     .unwrap_or_default(),
-                &extract_always_on(&project.body),
+                project
+                    .as_ref()
+                    .map(|p| extract_always_on(&p.body))
+                    .unwrap_or_default(),
             ))
         })
         .map_err(|_| denied())?

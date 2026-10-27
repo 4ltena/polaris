@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::budget::count_tokens;
 
+pub(crate) mod reference;
 #[cfg(unix)]
 mod refresh;
 #[cfg(unix)]
@@ -266,15 +267,17 @@ fn reach_of(path: PathBuf, whole: &str, capped: Option<&str>) -> Reach {
 /// to report about a file that was never going to contribute. A source that
 /// has one and loses lines to the ceiling is the case this exists for.
 ///
-/// The halving is the part nobody sees coming: a `~/.polaris/AGENTS.md`
-/// with one always-on line takes half the ceiling off the project's share,
-/// so rules that reached the model yesterday stop reaching it today because
-/// of a file in a different directory, and nothing in either file changed.
+/// The owner's file is a rule of the system prompt; the project's file is
+/// only quoted, in a message of its own, so the two no longer take turns at
+/// one ceiling.
 pub fn reach_from(global_agents: Option<&Path>, project_root: &Path) -> Vec<Reach> {
     let global = global_agents.map(read_block).unwrap_or_default();
     let project_path = project_root.join("AGENTS.md");
     let project = read_block(&project_path);
-    let (global_capped, project_capped) = capped_parts(&global, &project);
+    // The owner's rules and the quoted project file no longer share a
+    // ceiling: each is cut to its own allowance.
+    let global_capped = (!global.is_empty()).then(|| cap(&global, CONSTITUTION_LIMIT));
+    let project_capped = (!project.is_empty()).then(|| cap(&project, CONSTITUTION_LIMIT));
     let mut out = Vec::new();
     if let Some(path) = global_agents
         && !global.is_empty()
@@ -607,13 +610,17 @@ Long procedure. Not loaded.
         std::fs::write(project.path().join("AGENTS.md"), agents_md(&many)).unwrap();
         std::fs::write(&global_path, agents_md(&many)).unwrap();
 
-        let sent = load_from(Some(&global_path), project.path());
         let reported = reach_from(Some(&global_path), project.path());
         assert_eq!(reported.len(), 2, "{reported:?}");
+        // The owner's rules reach the system prompt alone; the project's file
+        // reaches the model as the quoted lines of its framed message.
+        let global_sent = cap(&read_block(&global_path), CONSTITUTION_LIMIT);
+        let quoted = reference::frame(&read_block(&project.path().join("AGENTS.md")), "n").unwrap();
+        assert_eq!(reported[0].delivered, global_sent.lines().count());
         assert_eq!(
-            reported.iter().map(|r| r.delivered).sum::<usize>(),
-            sent.lines().count(),
-            "reported {reported:?} against sent {sent:?}"
+            reported[1].delivered,
+            quoted.lines().filter(|l| l.starts_with("| ")).count(),
+            "reported {reported:?} against quoted {quoted:?}"
         );
         // Both sides lost lines; neither is a full copy of the file.
         for r in &reported {
@@ -621,10 +628,11 @@ Long procedure. Not loaded.
         }
     }
 
-    /// The halving. A file in another directory, which the project's own
-    /// tooling never reads, takes lines out of the project's rules.
+    /// There is no halving any more: the owner's file is a rule of the system
+    /// prompt and the project's file is quoted separately, so a file in
+    /// another directory costs the project nothing.
     #[test]
-    fn a_global_always_on_section_takes_lines_away_from_the_project() {
+    fn a_global_always_on_section_no_longer_takes_lines_from_the_project() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let global_path = home.path().join("AGENTS.md");
@@ -644,10 +652,7 @@ Long procedure. Not loaded.
 
         let project_alone = alone[0].delivered;
         let project_shared = shared[1].delivered;
-        assert!(
-            project_shared < project_alone,
-            "the global file cost the project nothing: {project_alone} vs {project_shared}"
-        );
+        assert_eq!(project_shared, project_alone);
         assert_eq!(
             shared[1].dropped,
             many.len() - project_shared,

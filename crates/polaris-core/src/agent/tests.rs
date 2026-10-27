@@ -929,10 +929,14 @@ async fn agents_refresh_same_turn_keeps_workflow_and_raw_history() {
     for (change, invalid) in [(true, false), (false, false), (false, true)] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let path = root.join("AGENTS.md");
+        // The owner's own file is re-read at every request; the project's is not.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().canonicalize().unwrap().join("AGENTS.md");
         std::fs::write(&path, "## Always on\nOld rule.").unwrap();
         let prompt = crate::prompt::assemble_always_on("", "fixed environment", &[])
-            .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &root).unwrap())
+            .with_agents_refresh(
+                crate::constitution::AgentsRefresh::new(Some(&path), &root).unwrap(),
+            )
             .unwrap();
         let provider = Changing {
             path,
@@ -1005,10 +1009,11 @@ async fn agents_refresh_same_turn_keeps_workflow_and_raw_history() {
 async fn agents_refresh_initial_read_failure_makes_zero_provider_calls() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let path = root.join("AGENTS.md");
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap().join("AGENTS.md");
     std::fs::write(&path, "## Always on\nOriginal.").unwrap();
     let prompt = crate::prompt::assemble_always_on("", "", &[])
-        .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &root).unwrap())
+        .with_agents_refresh(crate::constitution::AgentsRefresh::new(Some(&path), &root).unwrap())
         .unwrap();
     std::fs::write(&path, [0xff]).unwrap();
     let mut session = Session::new();
@@ -8674,4 +8679,74 @@ mod opening {
             vec![None, Some("xhigh".to_owned())]
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_agents_file_reaches_the_request_only_as_a_framed_message() {
+    struct Capture(Mutex<Vec<CompletionRequest>>);
+    #[async_trait::async_trait]
+    impl Provider for Capture {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            self.0.lock().unwrap().push(req);
+            Ok(CompletionResponse {
+                text: "done".into(),
+                ..Default::default()
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("AGENTS.md"), "## Always on\n- PROJECT_RULE").unwrap();
+    let prompt = crate::prompt::assemble_always_on("", "", &[])
+        .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &root).unwrap())
+        .unwrap();
+    let provider = Capture(Mutex::new(vec![]));
+    let mut session = Session::new();
+    session.push_user("hello");
+    let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+    let mut ctx = ToolContext {
+        sandbox: &sandbox,
+        helper: &helper,
+        gate: &mut gate,
+        approver: &mut approver,
+    };
+    run(
+        &provider,
+        &mut session,
+        dummy_audit(&dir),
+        &mut StopTracker::new(2),
+        &prompt,
+        &[],
+        &[],
+        unused_provider_pool(),
+        1,
+        1,
+        None,
+        &mut ctx,
+    )
+    .await
+    .unwrap();
+    let requests = provider.0.lock().unwrap();
+    let request = &requests[0];
+    assert!(!request.system.contains("PROJECT_RULE"));
+    let framed: Vec<_> = request
+        .messages
+        .iter()
+        .filter(|m| m.content.contains("PROJECT_RULE"))
+        .collect();
+    assert_eq!(framed.len(), 1);
+    assert!(framed[0].content.contains("| - PROJECT_RULE"));
+    // It rides ahead of the real input, which stays the user's own message.
+    assert_eq!(request.messages.last().unwrap().content, "hello");
+    // And it never enters the saved history.
+    assert!(
+        session
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("PROJECT_RULE"))
+    );
 }

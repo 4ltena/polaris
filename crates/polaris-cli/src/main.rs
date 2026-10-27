@@ -3164,6 +3164,9 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     #[cfg(not(unix))]
     let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills)
         .with_profile(prompt_profile);
+    if let Some(problem) = always_on.project_reference_problem() {
+        eprintln!("Warning: {problem}");
+    }
     let always_on = match always_on.with_project_root(&project_root) {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -4484,16 +4487,9 @@ async fn run_doctor() -> ExitCode {
             reach.tokens,
         );
     }
-    if reached.len() == 2 {
-        println!(
-            "  both files have a section, so the global one is capped at {} tokens",
-            polaris_core::constitution::CONSTITUTION_LIMIT / 2
-        );
-        println!(
-            "  and the project gets whatever is left of {}.",
-            polaris_core::constitution::CONSTITUTION_LIMIT
-        );
-    }
+    println!("  the global file is a rule of the system prompt; the project file is only quoted,");
+    println!("  as untrusted data in a message of its own, read once per run. It cannot change");
+    println!("  the rules, tools, permissions or approvals.");
 
     ExitCode::SUCCESS
 }

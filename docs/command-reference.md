@@ -286,6 +286,7 @@ Rustの既存Command Line Toolsを使う場合は、起動時に`POLARIS_ENVKIT_
 | `--history-mode legacy\|strict10\|structured10` | 会話履歴の方式。strict10には固定したローカル埋め込み設定が必要。 |
 | `--resume <ID>`、`--fork <ID>` | 保存会話を再開、または別UUIDへ分岐する。同時指定不可。 |
 | `--workflow-mode manual\|adaptive\|off` | workflowの実行方式を指定。 |
+| `--prompt-profile default\|unattended` | ルートのsystemに加える内部プロファイルを指定。本人の`[prompt] profile`より優先する。 |
 | `--phase <段階>` | general/brainstorm/specify/implement/review/verify/deliverを指定。resume/forkとの同時指定不可。 |
 | `--mcp-external` | MCPの実行・登録を許す起動時の上限。操作ごとの確認は別途行う。 |
 | `--mcp-prompt <SERVER/PROMPT>`、`--mcp-prompt-arg KEY=VALUE` | 初回要求の前に使うMCP promptを1件選ぶ。引数は複数指定可能。 |

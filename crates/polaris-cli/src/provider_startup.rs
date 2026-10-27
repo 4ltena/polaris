@@ -157,14 +157,20 @@ pub(super) async fn prepare(
                     Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
                         as Arc<dyn polaris_provider::Provider>
                 });
-                let weights = tier_providers(&config.tiers, &model, initial_effort_name, |named| {
-                    OpenAiProvider::new(base.clone(), key.clone(), named.to_owned())
-                        .map(|provider| {
-                            Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
-                                as Arc<dyn polaris_provider::Provider>
-                        })
-                        .map_err(|error| error.to_string())
-                });
+                let weights = tier_providers(
+                    &config.tiers,
+                    &model,
+                    initial_effort_name,
+                    |_| None,
+                    |named| {
+                        OpenAiProvider::new(base.clone(), key.clone(), named.to_owned())
+                            .map(|provider| {
+                                Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
+                                    as Arc<dyn polaris_provider::Provider>
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                );
                 let weights = match weights {
                     Ok(weights) => weights,
                     Err(message) => {
@@ -237,18 +243,24 @@ pub(super) async fn prepare(
                     Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
                         as Arc<dyn polaris_provider::Provider>
                 });
-                let weights = tier_providers(&config.tiers, &model, initial_effort_name, |named| {
-                    polaris_provider::codex::CodexProvider::new(
-                        polaris_provider::codex::ENDPOINT_BASE.to_string(),
-                        named.to_owned(),
-                        tokens.clone(),
-                    )
-                    .map(|provider| {
-                        Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
-                            as Arc<dyn polaris_provider::Provider>
-                    })
-                    .map_err(|error| error.to_string())
-                });
+                let weights = tier_providers(
+                    &config.tiers,
+                    &model,
+                    initial_effort_name,
+                    crate::codex_tier_default,
+                    |named| {
+                        polaris_provider::codex::CodexProvider::new(
+                            polaris_provider::codex::ENDPOINT_BASE.to_string(),
+                            named.to_owned(),
+                            tokens.clone(),
+                        )
+                        .map(|provider| {
+                            Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
+                                as Arc<dyn polaris_provider::Provider>
+                        })
+                        .map_err(|error| error.to_string())
+                    },
+                );
                 let weights = match weights {
                     Ok(weights) => weights,
                     Err(message) => {

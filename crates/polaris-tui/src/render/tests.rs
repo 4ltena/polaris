@@ -867,7 +867,10 @@ fn the_rewind_preview_warns_about_file_changes_and_requires_a_second_action() {
 
 #[test]
 fn the_model_picker_marks_the_current_model_and_highlights_the_selection() {
-    assert_eq!(MODEL_CATALOG, &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"]);
+    assert_eq!(
+        MODEL_CATALOG,
+        &["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"]
+    );
     let backend = TestBackend::new(70, 14);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
@@ -889,7 +892,7 @@ fn the_model_picker_marks_the_current_model_and_highlights_the_selection() {
     assert!(rows.iter().any(|r| r.contains("gpt-6-astra")));
     assert!(rows.iter().any(|r| r.contains("gpt-6-luna")));
     assert!(rows.iter().any(|r| r.contains("Local model")));
-    assert!(!rows.iter().any(|r| r.contains("terra")));
+    assert!(rows.iter().any(|r| r.contains("gpt-6.1-terra")));
     assert!(rows.iter().any(|r| r.contains("enter to confirm")));
 }
 
@@ -915,8 +918,8 @@ fn the_model_picker_marks_a_local_selection_separately() {
 fn the_model_picker_keeps_the_selected_option_visible_on_a_short_terminal() {
     let mut terminal = Terminal::new(TestBackend::new(70, 8)).expect("terminal");
     for (selected, expected) in [
-        (MODEL_CATALOG.len(), "❯ 4. Local model"),
-        (MODEL_CATALOG.len() - 1, "❯ 3. gpt-6-luna"),
+        (MODEL_CATALOG.len(), "❯ 5. Local model"),
+        (MODEL_CATALOG.len() - 1, "❯ 4. gpt-6-luna"),
     ] {
         terminal
             .draw(|f| render_model_picker(f, "gpt-6-astra", false, selected))

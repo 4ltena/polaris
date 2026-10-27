@@ -301,6 +301,23 @@ class BenchmarkCostsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             price('gpt-6-astra', 1.5, 0, 0, 0)
 
+    def test_the_gpt_6_1_models_match_a_hand_calculation(self):
+        # 200,000 input of which 100,000 read and 20,000 written from cache, so
+        # 80,000 is billed as ordinary input; 10,000 output; per-million rates.
+        for model, expected in (
+            ('gpt-6.1-sol', '0.32'),      # .08*2 + .1*.1 + .02*2.5 + .01*10
+            ('gpt-6.1-terra', '0.16'),    # .08*1 + .1*.05 + .02*1.25 + .01*5
+            ('gpt-6-luna', '0.0165'),     # .08*.1 + .1*.01 + .02*.125 + .01*.5
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    price_usage(model, 200000, 100000, 20000, 10000),
+                    __import__('decimal').Decimal(expected))
+        # Past 272,000 input, input and cache double and output is 1.5x.
+        self.assertEqual(
+            price_usage('gpt-6.1-terra', 300000, 0, 0, 10000),
+            __import__('decimal').Decimal('0.675'))  # .3*1*2 + .01*5*1.5
+
 
 if __name__ == '__main__':
     unittest.main()

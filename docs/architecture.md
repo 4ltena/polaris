@@ -122,7 +122,7 @@ crate 14件、依存 47件。名前の`polaris-`は省いた。開発用の依�
 - `crates/polaris-provider/src/codex.rs:283`
 - `crates/polaris-provider/src/codex.rs:681`
 - `crates/polaris-provider/src/codex.rs:685`
-- `crates/polaris-provider/src/codex_metrics.rs:137`
+- `crates/polaris-provider/src/codex_metrics.rs:141`
 - `crates/polaris-provider/src/decision/jev.rs:33`
 - `crates/polaris-provider/src/decision/jev.rs:71`
 - `crates/polaris-provider/src/decision/jev.rs:239`
@@ -158,11 +158,11 @@ processが動く。
 
 呼び出し側 44件。
 
-- `crates/polaris-cli/src/main.rs:2558`
-- `crates/polaris-cli/src/main.rs:2611`
-- `crates/polaris-cli/src/main.rs:2614`
-- `crates/polaris-cli/src/main.rs:4031`
-- `crates/polaris-cli/src/main.rs:4041`
+- `crates/polaris-cli/src/main.rs:2575`
+- `crates/polaris-cli/src/main.rs:2628`
+- `crates/polaris-cli/src/main.rs:2631`
+- `crates/polaris-cli/src/main.rs:4048`
+- `crates/polaris-cli/src/main.rs:4058`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/environment/native.rs:246`
 - `crates/polaris-core/src/execution_owner.rs:442`

@@ -1913,3 +1913,53 @@ fn default_audit_path_lives_under_home_state_not_cwd() {
     assert_eq!(got.file_name().unwrap(), "audit.jsonl");
     assert!(got.parent().unwrap().is_dir(), "directory was not created");
 }
+
+struct Unused;
+
+#[async_trait::async_trait]
+impl polaris_provider::Provider for Unused {
+    async fn complete(
+        &self,
+        _: polaris_provider::CompletionRequest,
+    ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
+        unreachable!("only construction is under test")
+    }
+}
+
+fn models_built(
+    tiers: &polaris_core::config::TierConfig,
+    defaults: impl Fn(polaris_skills::Tier) -> Option<&'static str>,
+) -> Vec<String> {
+    let built = std::cell::RefCell::new(Vec::new());
+    tier_providers(tiers, "parent", None, defaults, |named| {
+        built.borrow_mut().push(named.to_owned());
+        Ok(std::sync::Arc::new(Unused) as Shared)
+    })
+    .expect("providers");
+    built.into_inner()
+}
+
+#[test]
+fn the_hosted_backend_prices_every_weight_and_a_tier_setting_overrides_it() {
+    use polaris_core::config::{TierConfig, TierSettings};
+    let none = TierConfig::default();
+    // Light to heavy, the order Tier::ALL declares.
+    assert_eq!(
+        models_built(&none, codex_tier_default),
+        ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra"]
+    );
+    // Another backend names nothing, so every weight keeps the parent.
+    assert!(models_built(&none, |_| None).is_empty());
+    // An explicit model wins for its weight; the others keep the default.
+    let own = TierConfig {
+        subgiant: TierSettings {
+            model: Some("gpt-6.1-sol".into()),
+            effort: None,
+        },
+        ..TierConfig::default()
+    };
+    assert_eq!(
+        models_built(&own, codex_tier_default),
+        ["gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-sol", "gpt-6-astra"]
+    );
+}

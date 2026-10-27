@@ -1930,7 +1930,7 @@ pub fn render_workflow_change_confirmation(
 
 /// Fixed hosted choices for `/model`. Local runtimes are discovered only
 /// after the separate local-model row is chosen.
-pub const MODEL_CATALOG: &[&str] = &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"];
+pub const MODEL_CATALOG: &[&str] = &["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"];
 pub const RECOMMENDED_MODEL: &str = "gpt-6.1-sol";
 pub const LOCAL_MODEL_LABEL: &str = "Local model";
 

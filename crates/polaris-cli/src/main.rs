@@ -2302,6 +2302,19 @@ type Shared = std::sync::Arc<dyn polaris_provider::Provider>;
 /// One entry per priced weight, keyed by the weight's own spelling.
 type TierWeights = std::collections::HashMap<String, Shared>;
 
+/// The model each weight uses on the hosted `codex` backend when `[tier.*]`
+/// names none: luna only for the lightest mechanical work, terra for the
+/// everyday small jobs, sol for main agentic coding, astra where size pays.
+fn codex_tier_default(tier: polaris_skills::Tier) -> Option<&'static str> {
+    use polaris_skills::Tier;
+    Some(match tier {
+        Tier::Dwarf => "gpt-6-luna",
+        Tier::Subgiant => "gpt-6.1-terra",
+        Tier::Giant => "gpt-6.1-sol",
+        Tier::Supergiant => "gpt-6-astra",
+    })
+}
+
 /// Builds one provider instance per priced weight. Each gets its own model
 /// and effort at construction and is never retuned afterwards, because the
 /// instances are shared across a wave of concurrent delegations — switching
@@ -2315,18 +2328,22 @@ fn tier_providers(
     tiers: &polaris_core::config::TierConfig,
     parent_model: &str,
     session_effort: Option<&str>,
+    defaults: impl Fn(polaris_skills::Tier) -> Option<&'static str>,
     mut build: impl FnMut(&str) -> Result<std::sync::Arc<dyn polaris_provider::Provider>, String>,
 ) -> Result<std::collections::HashMap<String, std::sync::Arc<dyn polaris_provider::Provider>>, String>
 {
     let mut held = std::collections::HashMap::new();
     for tier in polaris_skills::Tier::ALL {
         let settings = tiers.for_tier(tier);
-        if settings.model.is_none() && settings.effort.is_none() {
+        // A `[tier.*]` model always wins; the backend's own default fills
+        // only a weight the user left unpriced.
+        let model = settings.model.as_deref().or_else(|| defaults(tier));
+        if model.is_none() && settings.effort.is_none() {
             continue;
         }
         // Pricing only an effort is a real choice: the same model, told to
         // think harder for the heavy weight.
-        let provider = build(settings.model.as_deref().unwrap_or(parent_model))
+        let provider = build(model.unwrap_or(parent_model))
             .map_err(|error| format!("Cannot create the provider for [tier.{tier}]: {error}"))?;
         // The session's own `--effort` still applies to a weight that does
         // not name one, so the flag keeps meaning what it says.

@@ -54,7 +54,7 @@ profileは`node`・`nextjs`・`react`・`vue`・`svelte`・`astro`・`nuxt`・`a
 
 | コマンド | 役割 | 主な出力・反映時期 |
 | --- | --- | --- |
-| `/model` | 次のターンで使うモデルを選ぶ。 | `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6-luna`、`Local model`の選択画面。成功時`model set to <model>`。 |
+| `/model` | 次のターンで使うモデルを選ぶ。 | `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-luna`、`Local model`の選択画面。成功時`model set to <model>`。 |
 | `/permissions` | 起動時に許された範囲で承認方針を選ぶ。 | Never / OnRequest / Alwaysの選択画面と`permissions set to <policy>`。起動時の境界を超える選択は拒否し、再起動用の引数を案内する。 |
 | `/sandbox [status]` | 起動時に固定されたsandboxと承認方針を確認する。 | `sandbox: ...`、`approval: OnRequest`等。sandboxの変更は新しい起動に適用する。 |
 

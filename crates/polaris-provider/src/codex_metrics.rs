@@ -79,7 +79,11 @@ pub(super) fn apply_cache_mode(
             ProviderError::Decode("Set POLARIS_CACHE_MODE to implicit or explicit".into())
         })?;
     let model = body["model"].as_str().unwrap_or_default();
-    if model != "gpt-6" && !model.starts_with("gpt-6-") && model != "gpt-6.1-sol" {
+    if model != "gpt-6"
+        && !model.starts_with("gpt-6-")
+        && model != "gpt-6.1-sol"
+        && model != "gpt-6.1-terra"
+    {
         return Err(ProviderError::Decode(
             "POLARIS_CACHE_MODE is an experimental setting for GPT-6 models only".into(),
         ));
@@ -691,7 +695,8 @@ mod tests {
         for model in [
             "gpt-5.6-sol",
             "gpt-6.1-sol-preview",
-            "gpt-6.1-terra",
+            "gpt-6.1-terra-preview",
+            "gpt-6.1-terrax",
             "gpt-6.1-sol-extra",
         ] {
             let mut request = body();

@@ -9,6 +9,54 @@ use super::metrics;
 use crate::web_search::{parse_hosted_web_search_item, parse_url_citations};
 use crate::{CompletionResponse, ProviderError, ReasoningItem, ToolCall, sse};
 
+/// The exact `arguments` text the server produced for each recent tool call.
+///
+/// The Responses WebSocket continues from a response only when the history it
+/// is sent matches, string for string, what the server holds. Polaris parses
+/// `arguments` into JSON and writes it back with `to_string`, which drops the
+/// server's spacing and can reorder keys, so a continuation was refused as
+/// "differs at .arguments" on 9 of 21 requests in the 2026-10-27 run. Keeping
+/// the original text and sending it back unchanged removes that difference.
+/// Bounded: the oldest entries go first.
+static RAW_ARGUMENTS: std::sync::Mutex<RawArguments> = std::sync::Mutex::new(RawArguments {
+    order: std::collections::VecDeque::new(),
+    text: None,
+});
+
+const RAW_ARGUMENT_ENTRIES: usize = 4096;
+
+struct RawArguments {
+    order: std::collections::VecDeque<String>,
+    text: Option<std::collections::HashMap<String, String>>,
+}
+
+pub(super) fn remember_arguments(call_id: &str, raw: &str) {
+    let Ok(mut held) = RAW_ARGUMENTS.lock() else {
+        return;
+    };
+    let held = &mut *held;
+    let map = held.text.get_or_insert_with(Default::default);
+    if map.insert(call_id.to_owned(), raw.to_owned()).is_none() {
+        held.order.push_back(call_id.to_owned());
+        while held.order.len() > RAW_ARGUMENT_ENTRIES {
+            if let Some(oldest) = held.order.pop_front() {
+                map.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// The text to send back for a call: the server's own, when it is still
+/// known and still means exactly what `arguments` holds.
+pub(super) fn arguments_text(call_id: &str, arguments: &Value) -> String {
+    RAW_ARGUMENTS
+        .lock()
+        .ok()
+        .and_then(|held| held.text.as_ref()?.get(call_id).cloned())
+        .filter(|raw| serde_json::from_str::<Value>(raw).is_ok_and(|v| &v == arguments))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 /// SSE semantics. Framing is left to `sse::SseDecoder`; this only holds
 /// event interpretation. Keeping it separate from HTTP means it can be
 /// tested without a network.
@@ -242,6 +290,7 @@ impl Folder {
                 let arguments: Value = serde_json::from_str(raw).map_err(|e| {
                     ProviderError::Decode(format!("function_call's arguments is not JSON: {e}"))
                 })?;
+                remember_arguments(id, raw);
                 self.tool_calls.push(ToolCall {
                     id: id.to_string(),
                     name: name.to_string(),

@@ -127,7 +127,7 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                         "call_id": c.id,
                         "name": c.name,
                         // A string holding JSON, not JSON itself.
-                        "arguments": c.arguments.to_string(),
+                        "arguments": fold::arguments_text(&c.id, &c.arguments),
                     }));
                 }
             }

@@ -275,6 +275,42 @@ fn a_function_call_item_becomes_a_tool_call() {
     assert_eq!(r.tool_calls[0].arguments["path"], "a.txt");
 }
 
+/// The WebSocket continues only when the resent history matches the server's
+/// record string for string. The server spaces its JSON and orders its keys
+/// its own way; resending `Value::to_string()` made 9 of 21 requests in the
+/// 2026-10-27 run start over with the whole history.
+#[test]
+fn a_tool_call_is_sent_back_with_the_servers_own_arguments_text() {
+    let raw = r#"{"path": "a.txt",  "limit": 5, "offset":1}"#;
+    let mut f = Folder::new();
+    f.push(&frame(
+        "response.output_item.done",
+        function_call_item("call_exact_text", "read", raw),
+    ))
+    .expect("push should succeed");
+    f.push(&frame("response.completed", serde_json::json!({})))
+        .expect("push should succeed");
+    let r = f.finish().expect("should be complete");
+    // What Polaris used to send: parsed and rewritten, so it differs.
+    assert_ne!(r.tool_calls[0].arguments.to_string(), raw);
+    let items = input_items(&[Message::assistant_with_tool_calls("", r.tool_calls.clone())]);
+    assert_eq!(items[0]["arguments"], raw);
+
+    // A call the folder never saw, or one whose arguments changed since, falls
+    // back to the rewritten text instead of sending something stale.
+    let mut changed = r.tool_calls[0].clone();
+    changed.arguments["path"] = serde_json::json!("b.txt");
+    let items = input_items(&[Message::assistant_with_tool_calls(
+        "",
+        vec![changed.clone()],
+    )]);
+    assert_eq!(items[0]["arguments"], changed.arguments.to_string());
+    let mut unseen = r.tool_calls[0].clone();
+    unseen.id = "call_never_folded".into();
+    let items = input_items(&[Message::assistant_with_tool_calls("", vec![unseen.clone()])]);
+    assert_eq!(items[0]["arguments"], unseen.arguments.to_string());
+}
+
 #[test]
 fn a_reasoning_item_is_captured_with_its_encrypted_content() {
     let mut f = Folder::new();

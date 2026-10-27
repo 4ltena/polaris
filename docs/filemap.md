@@ -352,6 +352,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/constitution`
 
+- `reference.rs` — The project's AGENTS.md as quoted data, never as part of the system prompt.
 - `refresh.rs` — Request-boundary reads of two owner-selected files. No polling or model paths.
 
 ## `crates/polaris-core/src/constitution/refresh`

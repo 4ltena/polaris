@@ -30,7 +30,7 @@ Rules:
 - Read docs/filemap.md before tree searches only when filemap=ready.
 - Verify counts and causal claims against real output before stating them.
 - A cited path:line must actually support the claim it's attached to.
-- Size the work first. Spawn it whole, one delegation per feature; below a file or two the round trip costs more than it saves.
+- Size the work first. Spawn it whole, one delegation per feature; below a file or two the round trip costs more than it saves. Give work that reads the same files to one delegation, not several.
 ";
 
 /// A built-in behavior preset for the root system prompt. It is compiled in,

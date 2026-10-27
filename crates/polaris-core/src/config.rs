@@ -11,6 +11,9 @@ pub use decision_system_one::SystemOneConfig;
 /// The merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Built-in behavior preset for the root system prompt. User-owned: a
+    /// project's configuration is refused if it names one.
+    pub prompt_profile: crate::prompt::Profile,
     /// User-owned presentation preferences. Project configuration is not
     /// allowed to change these values for a shared checkout.
     pub presentation: PresentationConfig,
@@ -317,6 +320,7 @@ impl Default for Config {
                     .collect(),
                 ..Default::default()
             },
+            prompt_profile: crate::prompt::Profile::Default,
             files_md_auto_regenerate: false,
             skills_paths: Vec::new(),
             agents_paths: Vec::new(),
@@ -334,7 +338,14 @@ impl Default for Config {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawPrompt {
+    profile: Option<crate::prompt::Profile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawConfig {
+    #[serde(default)]
+    prompt: Option<RawPrompt>,
     #[serde(default)]
     presentation: Option<RawPresentation>,
     #[serde(default)]
@@ -827,6 +838,8 @@ pub enum ConfigError {
         "[decision] base_url may only be set in the OS user's ~/.polaris/config.toml: the decider sends its API key to that address"
     )]
     UserOnlyDecisionEndpoint,
+    #[error("[prompt] may only be set in the OS user's ~/.polaris/config.toml")]
+    UserOnlyPromptProfile,
     #[error(
         "[decision.fallback] requires purposes=[\"routing\"], 1–3 targets, max_attempts from 1 to target count + 1, and time limits within 1–300000 ms"
     )]
@@ -961,6 +974,12 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
             if raw.decision.base_url.is_some() && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyDecisionEndpoint);
             }
+            if raw.prompt.is_some() && Some(index) != user_index {
+                return Err(ConfigError::UserOnlyPromptProfile);
+            }
+            if let Some(profile) = raw.prompt.as_ref().and_then(|prompt| prompt.profile) {
+                merged.prompt_profile = profile;
+            }
             let has_user_only = raw.presentation.is_some() || raw.answer_finalizer.is_some();
             if has_user_only && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyFinalizerSetting);
@@ -1062,6 +1081,31 @@ pub fn try_load_workflow_from(
         }
     }
     Ok(merged)
+}
+
+/// Reads only the prompt profile. A project that names one is refused, so a
+/// checkout cannot change how the root agent is told to behave.
+pub fn try_load_prompt_profile_from(
+    user: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<crate::prompt::Profile, ConfigError> {
+    #[derive(Deserialize)]
+    struct PromptOnly {
+        #[serde(default)]
+        prompt: Option<RawPrompt>,
+    }
+    let mut profile = crate::prompt::Profile::Default;
+    if let Some(raw) = user.map(read_one::<PromptOnly>).transpose()?.flatten()
+        && let Some(chosen) = raw.prompt.and_then(|prompt| prompt.profile)
+    {
+        profile = chosen;
+    }
+    if let Some(raw) = project.map(read_one::<PromptOnly>).transpose()?.flatten()
+        && raw.prompt.is_some()
+    {
+        return Err(ConfigError::UserOnlyPromptProfile);
+    }
+    Ok(profile)
 }
 
 /// Reads only input preparation so desktop startup can freeze the same
@@ -2080,6 +2124,41 @@ mod tests {
         let p = dir.join("config.toml");
         std::fs::write(&p, body).expect("could not write");
         p
+    }
+
+    #[test]
+    fn only_the_user_layer_can_choose_a_prompt_profile() {
+        use crate::prompt::Profile;
+        let user_dir = tempfile::tempdir().expect("temp directory");
+        let project_dir = tempfile::tempdir().expect("temp directory");
+        let user = write(user_dir.path(), "[prompt]\nprofile = \"unattended\"\n");
+        let project = write(project_dir.path(), "[prompt]\nprofile = \"unattended\"\n");
+        let quiet_dir = tempfile::tempdir().expect("temp directory");
+        let none = write(quiet_dir.path(), "# nothing\n");
+
+        assert_eq!(Config::default().prompt_profile, Profile::Default);
+        assert_eq!(
+            try_load_from(Some(&user), Some(&none))
+                .unwrap()
+                .prompt_profile,
+            Profile::Unattended
+        );
+        assert_eq!(
+            try_load_prompt_profile_from(Some(&user), None).unwrap(),
+            Profile::Unattended
+        );
+        // The same text in a project is refused by both loaders.
+        assert!(matches!(
+            try_load_from(None, Some(&project)),
+            Err(ConfigError::UserOnlyPromptProfile)
+        ));
+        assert!(matches!(
+            try_load_prompt_profile_from(Some(&user), Some(&project)),
+            Err(ConfigError::UserOnlyPromptProfile)
+        ));
+        // An unknown name is an error, not a silent fallback.
+        let bad = write(user_dir.path(), "[prompt]\nprofile = \"loud\"\n");
+        assert!(try_load_prompt_profile_from(Some(&bad), None).is_err());
     }
 
     #[test]

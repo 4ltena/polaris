@@ -131,6 +131,10 @@ struct Args {
     #[arg(long, value_enum)]
     workflow_mode: Option<WorkflowModeArg>,
 
+    /// Built-in behavior preset for the root agent: default or unattended. Overrides the user's [prompt] setting.
+    #[arg(long, value_name = "NAME", value_parser = parse_prompt_profile)]
+    prompt_profile: Option<polaris_core::prompt::Profile>,
+
     /// History storage mode. strict10 requires pinned local embedding resources.
     #[arg(long, value_enum)]
     history_mode: Option<HistoryModeArg>,
@@ -315,6 +319,11 @@ enum PhaseArg {
     Review,
     Verify,
     Deliver,
+}
+
+fn parse_prompt_profile(name: &str) -> Result<polaris_core::prompt::Profile, String> {
+    polaris_core::prompt::Profile::parse(name)
+        .ok_or_else(|| format!("unknown prompt profile {name:?}; use default or unattended"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -2659,6 +2668,8 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     if let Some(mode) = args.workflow_mode {
         mode.apply(&mut config.workflow);
     }
+    // The flag outranks the user's own setting; a project cannot set either.
+    let prompt_profile = args.prompt_profile.unwrap_or(config.prompt_profile);
     let configured_history_mode = args
         .history_mode
         .map(polaris_core::conversation_state::HistoryMode::from)
@@ -3141,6 +3152,7 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     // TUI retains this capability across turns; children keep their own prompts.
     #[cfg(unix)]
     let always_on = match prompt::assemble_always_on("", &environment, &discovered.skills)
+        .with_profile(prompt_profile)
         .with_agents_refresh(agents_refresh)
     {
         Ok(prompt) => prompt,
@@ -3150,7 +3162,8 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
         }
     };
     #[cfg(not(unix))]
-    let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
+    let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills)
+        .with_profile(prompt_profile);
     let always_on = match always_on.with_project_root(&project_root) {
         Ok(prompt) => prompt,
         Err(error) => {

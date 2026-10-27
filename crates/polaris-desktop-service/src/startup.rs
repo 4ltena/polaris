@@ -659,7 +659,15 @@ fn start_at(
     if workflow.enabled && runtime_workflow.begin_turn(&skills.skills).is_err() {
         return Err(StartupError::Generic);
     }
+    // The same user-only setting the terminal reads; a project that names one
+    // stops startup, as it does there.
+    let prompt_profile = polaris_core::config::try_load_prompt_profile_from(
+        Some(&home.join(".polaris/config.toml")),
+        Some(&args.confirmed_source_path.join(".polaris/config.toml")),
+    )
+    .map_err(|_| StartupError::Generic)?;
     let always_on = assemble_always_on("", "macOS desktop; isolated workspace", &skills.skills)
+        .with_profile(prompt_profile)
         .with_agents_refresh(
             AgentsRefresh::new(
                 Some(&home.join(".polaris/AGENTS.md")),

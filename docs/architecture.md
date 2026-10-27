@@ -158,11 +158,11 @@ processが動く。
 
 呼び出し側 44件。
 
-- `crates/polaris-cli/src/main.rs:2575`
-- `crates/polaris-cli/src/main.rs:2628`
-- `crates/polaris-cli/src/main.rs:2631`
-- `crates/polaris-cli/src/main.rs:4048`
-- `crates/polaris-cli/src/main.rs:4058`
+- `crates/polaris-cli/src/main.rs:2584`
+- `crates/polaris-cli/src/main.rs:2637`
+- `crates/polaris-cli/src/main.rs:2640`
+- `crates/polaris-cli/src/main.rs:4061`
+- `crates/polaris-cli/src/main.rs:4071`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/environment/native.rs:246`
 - `crates/polaris-core/src/execution_owner.rs:442`
@@ -216,7 +216,7 @@ processが動く。
 - `crates/polaris-auth/src/login.rs:207`
 - `crates/polaris-cli/src/account.rs:477`
 - `crates/polaris-cli/src/decided.rs:112`
-- `crates/polaris-cli/src/main.rs:920`
+- `crates/polaris-cli/src/main.rs:929`
 - `crates/polaris-core/src/computer/macos.rs:45`
 - `crates/polaris-core/src/conversation_memory/strict_history.rs:1124`
 - `crates/polaris-core/src/llama_server.rs:114`

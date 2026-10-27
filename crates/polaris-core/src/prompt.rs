@@ -33,6 +33,48 @@ Rules:
 - Size the work first. Spawn it whole, one delegation per feature; below a file or two the round trip costs more than it saves.
 ";
 
+/// A built-in behavior preset for the root system prompt. It is compiled in,
+/// never read from a file, and chosen only by the user's own configuration or
+/// the `--prompt-profile` flag, so no repository can select or change it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Today's behavior: nothing is added.
+    #[default]
+    Default,
+    /// Nobody is there to answer: finish the change and show the checks.
+    Unattended,
+}
+
+const UNATTENDED: &str = "\
+- Unattended run: nobody will answer questions, so never ask. Note an assumption in one line and proceed.
+- Change the files directly, then run the available checks and show their output.
+- Do not stop at analysis or a plan. Finish when the change is applied and verified, or report the exact blocker.";
+
+impl Profile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Unattended => "unattended",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            "unattended" => Some(Self::Unattended),
+            _ => None,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Unattended => UNATTENDED,
+        }
+    }
+}
+
 /// Assembles the context that's always loaded. Drops empty sections
 /// heading and all.
 ///
@@ -55,9 +97,20 @@ Rules:
 /// ceiling could be broken by a single abnormally long cwd. To leave no
 /// way around it short of going through the caller, this is aligned with
 /// the same "cap here too, redundantly" design as the constitution.
-pub(crate) fn build_system(constitution: &str, environment: &str) -> String {
-    let constitution =
-        crate::constitution::cap(constitution, crate::constitution::CONSTITUTION_LIMIT);
+///
+/// The profile text and the user's rules share the one rules allowance: the
+/// profile comes first and the rules get what is left, so the worst case
+/// stays where it was.
+pub(crate) fn build_system(profile: Profile, constitution: &str, environment: &str) -> String {
+    let preset = profile.text();
+    let room =
+        crate::constitution::CONSTITUTION_LIMIT.saturating_sub(crate::budget::count_tokens(preset));
+    let rules = crate::constitution::cap(constitution, room);
+    let constitution = match (preset.is_empty(), rules.is_empty()) {
+        (true, _) => rules,
+        (false, true) => preset.to_owned(),
+        (false, false) => format!("{preset}\n{rules}"),
+    };
     let environment = crate::constitution::cap(environment, crate::constitution::ENVIRONMENT_LIMIT);
     let mut s = String::from(SYSTEM_PROMPT);
     if !constitution.is_empty() {
@@ -99,7 +152,8 @@ pub struct AlwaysOn {
     // Host-selected routing scope, never serialized into the prompt or treated
     // as a write grant. Desktop runs bind their own sanitized workspace copy.
     project_root: Option<std::path::PathBuf>,
-    #[cfg(unix)]
+    profile: Profile,
+    constitution: String,
     environment: String,
     #[cfg(unix)]
     agents_refresh: Option<crate::constitution::AgentsRefresh>,
@@ -123,6 +177,17 @@ impl AlwaysOn {
         self.project_root.as_deref()
     }
 
+    /// Choose the built-in preset. The system prompt is rebuilt with it.
+    pub fn with_profile(mut self, profile: Profile) -> Self {
+        self.profile = profile;
+        self.system = build_system(profile, &self.constitution, &self.environment);
+        self
+    }
+
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+
     /// Trusted owner only: bind the original host sources, never a run copy.
     /// No timer is started. Failure on the initial read is not an empty profile.
     #[cfg(unix)]
@@ -130,7 +195,7 @@ impl AlwaysOn {
         mut self,
         source: crate::constitution::AgentsRefresh,
     ) -> std::io::Result<Self> {
-        self.system = build_system(&source.read()?, &self.environment);
+        self.system = build_system(self.profile, &source.read()?, &self.environment);
         self.agents_refresh = Some(source);
         Ok(self)
     }
@@ -140,7 +205,11 @@ impl AlwaysOn {
     pub fn system_for_request(&self) -> std::io::Result<String> {
         #[cfg(unix)]
         if let Some(source) = &self.agents_refresh {
-            return Ok(build_system(&source.read()?, &self.environment));
+            return Ok(build_system(
+                self.profile,
+                &source.read()?,
+                &self.environment,
+            ));
         }
         Ok(self.system.clone())
     }
@@ -193,11 +262,12 @@ pub fn assemble_always_on(
     skills: &[polaris_skills::Skill],
 ) -> AlwaysOn {
     AlwaysOn {
-        system: build_system(constitution, environment),
+        system: build_system(Profile::Default, constitution, environment),
         tools: polaris_tools::all_specs(),
         skills_seen: skills.len(),
         project_root: None,
-        #[cfg(unix)]
+        profile: Profile::Default,
+        constitution: constitution.to_owned(),
         environment: environment.to_owned(),
         #[cfg(unix)]
         agents_refresh: None,
@@ -241,7 +311,7 @@ mod tests {
         // caller passes raw text and forgot to truncate it, the
         // constitution portion does not exceed the ceiling.
         let oversized = "rule".repeat(5000);
-        let system = build_system(&oversized, "");
+        let system = build_system(Profile::Default, &oversized, "");
 
         let prefix = format!("{SYSTEM_PROMPT}\n## Project rules\n");
         let body = system
@@ -284,7 +354,46 @@ mod tests {
     fn already_capped_input_is_unchanged() {
         // Input that's already been truncated is unchanged, since cap() is idempotent.
         let already_capped = crate::constitution::cap("a fixed rule.", CONSTITUTION_LIMIT);
-        let system = build_system(&already_capped, "");
+        let system = build_system(Profile::Default, &already_capped, "");
         assert!(system.contains("a fixed rule."));
+    }
+
+    #[test]
+    fn the_unattended_profile_is_in_the_root_system_and_default_is_not() {
+        let rules = "- keep it short";
+        let default = assemble_always_on(rules, "", &[]);
+        let unattended = assemble_always_on(rules, "", &[]).with_profile(Profile::Unattended);
+        assert!(!default.system().contains("Unattended run"));
+        assert!(unattended.system().contains("Unattended run"));
+        assert!(unattended.system().contains(rules));
+        assert_eq!(default.profile(), Profile::Default);
+        assert_eq!(Profile::parse("unattended"), Some(Profile::Unattended));
+        assert_eq!(Profile::parse("Unattended"), None);
+        // The preset comes before the user's rules.
+        let system = unattended.system();
+        assert!(system.find("Unattended run") < system.find(rules));
+    }
+
+    #[test]
+    fn the_profile_and_the_rules_share_one_allowance_and_the_worst_case_fits() {
+        let preset = crate::budget::count_tokens(UNATTENDED);
+        let rules: String = (0..400).map(|i| format!("rule number {i}\n")).collect();
+        let system = build_system(Profile::Unattended, &rules, "");
+        let section = system.split("## Project rules\n").nth(1).unwrap();
+        let used = crate::budget::count_tokens(section.trim_end());
+        assert!(
+            used <= crate::constitution::CONSTITUTION_LIMIT,
+            "{used} tokens in the shared allowance"
+        );
+        assert!(preset < crate::constitution::CONSTITUTION_LIMIT);
+        // Worst case: full rules, the largest environment block, the preset.
+        let huge_cwd: String = (0..600).map(|i| format!("/component{i}")).collect();
+        let env = crate::constitution::environment_block(
+            std::path::Path::new(&huge_cwd),
+            std::path::Path::new(&huge_cwd),
+            Some("feat/m1-headless-loop"),
+        );
+        let always_on = assemble_always_on(&rules, &env, &[]).with_profile(Profile::Unattended);
+        assert!(always_on.tokens() <= crate::budget::BUDGET_LIMIT);
     }
 }

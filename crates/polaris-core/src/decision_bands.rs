@@ -239,7 +239,9 @@ pub enum DecisionBuildError {
     LocalOnlyUnavailable,
     #[error("Cannot resolve the System One credential reference")]
     MissingSystemOneKey,
-    #[error("POLARIS_JEV_API_KEY is missing")]
+    #[error(
+        "Neither POLARIS_JEV_API_KEY nor a readable ~/.polaris/decision_keys.json holds the Jev key"
+    )]
     MissingJevKey,
     #[error("The helper is not an existing absolute path")]
     MissingSemIfHelper,
@@ -257,12 +259,46 @@ pub fn build_configured(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
 ) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    build_configured_with_key_file(
+        config,
+        purpose,
+        polaris_auth::decision_key::default_path().ok().as_deref(),
+    )
+}
+
+/// `build_configured` with the saved-key location named, so the lookup
+/// order can be tested without touching the real home.
+pub fn build_configured_with_key_file(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+    key_file: Option<&std::path::Path>,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
     build_with_credentials(
         config,
         purpose,
-        |name| std::env::var(name).ok(),
+        |name| credential(name, |name| std::env::var(name).ok(), key_file),
         crate::managed_decision::build,
     )
+}
+
+/// The environment first, as before. Only the Jev key falls back to the
+/// owner-only store the onboarding screen writes; a System One
+/// `credential_env` stays environment-only. A corrupt or unreadable store
+/// reads as absent, and its contents never reach a message.
+fn credential(
+    name: &str,
+    environment: impl Fn(&str) -> Option<String>,
+    key_file: Option<&std::path::Path>,
+) -> Option<String> {
+    if let Some(value) = environment(name).filter(|value| !value.is_empty()) {
+        return Some(value);
+    }
+    if name != "POLARIS_JEV_API_KEY" {
+        return None;
+    }
+    polaris_auth::decision_key::load_jev_from(key_file?)
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]

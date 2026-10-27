@@ -23,6 +23,7 @@ pub mod conversation_state;
 pub mod decision_bands;
 pub mod decision_capacity;
 pub mod decision_diagnostics;
+pub mod decision_enable;
 pub mod decision_policy;
 pub mod decisions;
 pub mod desktop_approval;

@@ -565,3 +565,71 @@ fn system_one_factory_resolves_only_selected_user_reference_after_policy_checks(
     .unwrap();
     assert_eq!(count, 1, "unreachable fallback target read its credential");
 }
+
+#[cfg(unix)]
+#[test]
+fn the_jev_key_comes_from_the_environment_first_then_the_saved_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("decision_keys.json");
+    polaris_auth::decision_key::save_jev_to(&file, "stored-sentinel").unwrap();
+    let none = |_: &str| None;
+    let env = |name: &str| (name == "POLARIS_JEV_API_KEY").then(|| "env-sentinel".to_owned());
+    let empty = |_: &str| Some(String::new());
+    assert_eq!(
+        credential("POLARIS_JEV_API_KEY", none, Some(&file)).as_deref(),
+        Some("stored-sentinel")
+    );
+    assert_eq!(
+        credential("POLARIS_JEV_API_KEY", env, Some(&file)).as_deref(),
+        Some("env-sentinel")
+    );
+    assert_eq!(
+        credential("POLARIS_JEV_API_KEY", empty, Some(&file)).as_deref(),
+        Some("stored-sentinel")
+    );
+    // A System One credential reference never reads the Jev store.
+    assert_eq!(credential("MY_SYSTEM_ONE_KEY", none, Some(&file)), None);
+    assert_eq!(credential("POLARIS_JEV_API_KEY", none, None), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_saved_jev_key_builds_the_decider_and_a_corrupt_store_reads_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("decision_keys.json");
+    let config = crate::config::DecisionConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let missing = build_with_credentials(
+        &config,
+        DecisionUse::Routing,
+        |name| credential(name, |_| None, Some(&file)),
+        |_| panic!("clef was not selected"),
+    );
+    let error = missing.err().expect("no key yet");
+    assert!(matches!(error, DecisionBuildError::MissingJevKey));
+    assert!(error.to_string().contains("decision_keys.json"));
+
+    polaris_auth::decision_key::save_jev_to(&file, "stored-sentinel").unwrap();
+    let built = build_with_credentials(
+        &config,
+        DecisionUse::Routing,
+        |name| credential(name, |_| None, Some(&file)),
+        |_| panic!("clef was not selected"),
+    )
+    .expect("built")
+    .expect("enabled");
+    assert_eq!(built.name(), "jev");
+
+    std::fs::write(&file, b"{ \"jev\": stored-sentinel").unwrap();
+    let corrupt = build_with_credentials(
+        &config,
+        DecisionUse::Routing,
+        |name| credential(name, |_| None, Some(&file)),
+        |_| panic!("clef was not selected"),
+    );
+    let error = corrupt.err().expect("corrupt store");
+    assert!(matches!(error, DecisionBuildError::MissingJevKey));
+    assert!(!error.to_string().contains("stored-sentinel"));
+}

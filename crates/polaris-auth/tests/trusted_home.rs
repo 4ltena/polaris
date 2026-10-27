@@ -25,8 +25,9 @@ fn trusted_home_child() {
     assert!(use_trusted_home(&home.join("other")).is_err());
     let auth = home.join(".polaris/auth.json");
     let api = home.join(".polaris/api_key.json");
+    let decision = home.join(".polaris/decision_keys.json");
     with_protected_paths(|paths| {
-        for path in [&auth, &api] {
+        for path in [&auth, &api, &decision] {
             assert!(paths.paths().contains(path));
             assert!(paths.paths().contains(&path.with_extension("json.tmp")));
         }

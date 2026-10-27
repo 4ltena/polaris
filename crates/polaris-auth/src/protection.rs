@@ -2748,6 +2748,7 @@ pub fn use_trusted_home(home: &Path) -> Result<(), AuthError> {
     let defaults = vec![
         home.join(".polaris/auth.json"),
         home.join(".polaris/api_key.json"),
+        home.join(".polaris/decision_keys.json"),
         home.join(".polaris/mcp/servers.json"),
         home.join(".polaris/mcp/secrets.json"),
     ];
@@ -2822,6 +2823,7 @@ fn with_protected_paths_locked<R>(
                 parent.join("mcp/secrets.json"),
                 auth,
                 crate::api_key::default_path()?,
+                crate::decision_key::default_path()?,
             ]
         }
     };
@@ -3082,6 +3084,7 @@ mod tests {
             for path in [
                 store::default_path().unwrap(),
                 api_key::default_path().unwrap(),
+                crate::decision_key::default_path().unwrap(),
                 parent.join("mcp/servers.json"),
                 parent.join("mcp/secrets.json"),
             ] {

@@ -128,7 +128,12 @@ fn is_harness_credential(path: &Path) -> bool {
     match directory.as_deref() {
         Some(".polaris") => matches!(
             name.as_str(),
-            "auth.json" | "auth.json.tmp" | "api_key.json" | "api_key.json.tmp"
+            "auth.json"
+                | "auth.json.tmp"
+                | "api_key.json"
+                | "api_key.json.tmp"
+                | "decision_keys.json"
+                | "decision_keys.json.tmp"
         ),
         Some(".codex") => matches!(name.as_str(), "auth.json" | "auth.json.tmp" | "config.toml"),
         // MCP detector sources may hold header and environment credentials.
@@ -181,6 +186,8 @@ mod tests {
             "/home/u/.polaris/auth.json.tmp",
             "/home/u/.polaris/api_key.json",
             "/home/u/.polaris/api_key.json.tmp",
+            "/home/u/.polaris/decision_keys.json",
+            "/home/u/.polaris/decision_keys.json.tmp",
             "/home/u/.POLARIS/AUTH.JSON",
             "/home/u/.codex/auth.json",
             "/home/u/.codex/config.toml",
@@ -194,6 +201,7 @@ mod tests {
         }
         assert!(!is_denied(Path::new("/project/src/auth.json")));
         assert!(!is_denied(Path::new("/home/u/.polaris/config.toml")));
+        assert!(!is_denied(Path::new("/home/u/.polaris/decision_keys.md")));
         assert!(!is_denied(Path::new("/project/mcp/servers.json")));
     }
 

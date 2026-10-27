@@ -379,8 +379,10 @@ mod tests {
         for name in [
             "auth.json",
             "api_key.json",
+            "decision_keys.json",
             "auth.json.tmp",
             "api_key.json.tmp",
+            "decision_keys.json.tmp",
         ] {
             let path = store.join(name);
             std::fs::write(&path, "DUMMY_SECRET_SENTINEL").unwrap();

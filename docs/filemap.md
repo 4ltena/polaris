@@ -56,6 +56,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-auth/src`
 
 - `api_key.rs` — Storage for a plain OpenAI API key at `~/.polaris/api_key.json`.
+- `decision_key.rs` — Storage for the decider's API key at `~/.polaris/decision_keys.json`.
 - `git_credentials.rs` — C08/C10 shared, local Keychain credential binding.
 - `lib.rs` — Lifecycle of ChatGPT subscription auth (OAuth) and storage of credentials.
 - `login.rs` — Building the authorization URL, and receiving the callback exactly once.
@@ -218,6 +219,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `decision_bands.rs` — The band rule, in one place.
 - `decision_capacity.rs` — Memory recommendations and conservative admission for a trusted model profile.
 - `decision_diagnostics.rs` — Read-only typed-stage diagnostics shared by CLI and TUI; no connection probes.
+- `decision_enable.rs` — Turning the Jev decider on from the onboarding screen.
 - `decision_policy.rs` — Local-only admission for judgments and auxiliary generative arbitration.
 - `decisions.rs` — What this project has already settled, so it is not settled twice.
 - `desktop_approval.rs` — Bounded approval mailbox. The controller owns the pending request and

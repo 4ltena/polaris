@@ -13,6 +13,7 @@
 
 pub mod accounts;
 pub mod api_key;
+pub mod decision_key;
 pub mod git_credentials;
 pub mod login;
 pub mod pkce;

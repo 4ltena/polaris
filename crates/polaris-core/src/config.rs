@@ -824,6 +824,10 @@ pub enum ConfigError {
     #[error("[decision.fallback] may only be set in user configuration")]
     UserOnlyDecisionFallback,
     #[error(
+        "[decision] base_url may only be set in the OS user's ~/.polaris/config.toml: the decider sends its API key to that address"
+    )]
+    UserOnlyDecisionEndpoint,
+    #[error(
         "[decision.fallback] requires purposes=[\"routing\"], 1–3 targets, max_attempts from 1 to target count + 1, and time limits within 1–300000 ms"
     )]
     InvalidDecisionFallback,
@@ -951,6 +955,11 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
             }
             if raw.decision.fallback.is_some() && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyDecisionFallback);
+            }
+            // The address the decider sends its API key to. A project is
+            // untrusted input and must not choose where a stored secret goes.
+            if raw.decision.base_url.is_some() && Some(index) != user_index {
+                return Err(ConfigError::UserOnlyDecisionEndpoint);
             }
             let has_user_only = raw.presentation.is_some() || raw.answer_finalizer.is_some();
             if has_user_only && Some(index) != user_index {
@@ -1097,6 +1106,9 @@ pub fn try_load_decision_from(
             }
             if raw.decision.fallback.is_some() && !is_user {
                 return Err(ConfigError::UserOnlyDecisionFallback);
+            }
+            if raw.decision.base_url.is_some() && !is_user {
+                return Err(ConfigError::UserOnlyDecisionEndpoint);
             }
             raw.decision.apply_to(&mut merged)?;
         }
@@ -1979,7 +1991,9 @@ mod tests {
                 dir.path(),
                 &format!("[decision]\nbackend = \"clef\"\n{extra}"),
             );
-            let error = try_load_from(None, Some(&path)).unwrap_err();
+            // The user's own file, so the case under test (what Clef refuses)
+            // is not pre-empted by the user-only rule on `base_url`.
+            let error = try_load_from(Some(&path), None).unwrap_err();
             assert!(matches!(
                 (expected, error),
                 ("missing", ConfigError::MissingClefProfile)
@@ -2066,6 +2080,36 @@ mod tests {
         let p = dir.join("config.toml");
         std::fs::write(&p, body).expect("could not write");
         p
+    }
+
+    #[test]
+    fn a_project_cannot_choose_where_the_decider_key_is_sent() {
+        let body = "[decision]\nenabled = true\nbackend = \"jev\"\nbase_url = \"https://attacker.invalid/v1\"\n";
+        let user_dir = tempfile::tempdir().expect("temp directory");
+        let project_dir = tempfile::tempdir().expect("temp directory");
+        let user = write(user_dir.path(), body);
+        let project = write(project_dir.path(), body);
+
+        // The project layer is refused by both loaders, with its own error.
+        assert!(matches!(
+            try_load_from(None, Some(&project)),
+            Err(ConfigError::UserOnlyDecisionEndpoint)
+        ));
+        assert!(matches!(
+            try_load_decision_from(None, Some(&project)),
+            Err(ConfigError::UserOnlyDecisionEndpoint)
+        ));
+        // Contrast: the same text in the user's own file is accepted, so the
+        // refusal is about the layer and not about the value.
+        let held = try_load_from(Some(&user), None).expect("user layer");
+        assert_eq!(
+            held.decision.base_url.as_deref(),
+            Some("https://attacker.invalid/v1")
+        );
+        assert!(try_load_decision_from(Some(&user), None).is_ok());
+        // A project that names no endpoint is unaffected.
+        let plain = write(project_dir.path(), "[decision]\nenabled = true\n");
+        assert!(try_load_from(Some(&user), Some(&plain)).is_ok());
     }
 
     #[test]

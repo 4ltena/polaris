@@ -4861,6 +4861,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             status = Status::Idle;
                             continue;
                         }
+                        slash::Action::Decider => {
+                            status = run_decider_command(&terminal, &mut key_reader, &args.cwd);
+                            continue;
+                        }
                         #[cfg(unix)]
                         action @ (slash::Action::Phase(_) | slash::Action::Workflow(_)) => {
                             handle_managed_workflow_action(
@@ -5865,6 +5869,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 Some(slash::Action::Skills) => {
                     run_skills_picker(&terminal, &mut key_reader, &effective_skills);
                     status = Status::Idle;
+                    continue;
+                }
+                Some(slash::Action::Decider) => {
+                    status = run_decider_command(&terminal, &mut key_reader, &args.cwd);
                     continue;
                 }
                 #[cfg(unix)]
@@ -10885,6 +10893,54 @@ fn run_skills_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+/// `/decider`: the onboarding decider step, reachable after sign-in. The
+/// running session keeps its decider; the change applies from the next launch.
+fn run_decider_command<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    cwd: &std::path::Path,
+) -> Status {
+    use ratatui::crossterm::event::{Event, KeyEvent, KeyModifiers};
+    let (Ok(key_path), Some(config_path)) = (
+        polaris_auth::decision_key::default_path(),
+        polaris_core::decision_enable::user_config_path(),
+    ) else {
+        return Status::Error("Cannot determine where to save the decider key".into());
+    };
+    // Unreadable settings must not offer the remote judge a local_only
+    // configuration would refuse.
+    let local_only = polaris_core::config::load(&polaris_core::project::resolve_root(cwd))
+        .map(|config| config.decision.local_only)
+        .unwrap_or(true);
+    let setup = onboarding::DeciderSetup {
+        key_path,
+        config_path,
+        local_only,
+    };
+    let result = onboarding::decider_step(
+        &mut terminal.borrow_mut(),
+        &setup,
+        || {
+            reader.read_secret_input().ok().map(|input| match input {
+                approver::SecretInputEvent::Key(code) => {
+                    Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+                }
+                approver::SecretInputEvent::Paste(text) => Event::Paste(text.to_string()),
+            })
+        },
+        false,
+    );
+    match result {
+        onboarding::DeciderResult::Enabled => {
+            Status::Notice("Jev decider saved; it takes effect from the next launch".into())
+        }
+        onboarding::DeciderResult::SavedOnly(reason) => {
+            Status::Notice(format!("Decider key saved. {reason}"))
+        }
+        onboarding::DeciderResult::Skipped => Status::Idle,
+    }
+}
+
 /// What running a resolved slash command should do next, distinct from
 /// `ExitCode` so the two call sites (Enter-on-a-highlighted-suggestion,
 /// and Enter-on-fully-typed-but-unmatched text) can each decide how to
@@ -11941,6 +11997,7 @@ fn apply_slash_action(
         | slash::Action::Fork
         | slash::Action::Model
         | slash::Action::Skills
+        | slash::Action::Decider
         | slash::Action::Compact => {
             // Never reached: `run()` recognizes all of these before
             // dispatch — `Review` expands into a normal model turn;

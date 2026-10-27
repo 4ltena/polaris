@@ -112,6 +112,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "show workflow mode or set it to manual, adaptive, or off",
     },
     SlashCommand {
+        name: "decider",
+        description: "choose a decider and save its API key (takes effect from the next launch)",
+    },
+    SlashCommand {
         name: "skills",
         description: "browse the skills polaris discovered in this project",
     },
@@ -220,6 +224,9 @@ pub enum Action {
     /// skills (needs the terminal, which `apply_slash_action` doesn't
     /// have).
     Skills,
+    /// Intercepted by the caller like `Skills`: a full-screen step that saves
+    /// the decider key and turns the decider on for the next launch.
+    Decider,
     /// Not a local command in the usual sense — the caller intercepts
     /// this before dispatch and rotates to a brand-new session (new id,
     /// new file) instead of running it through `apply_slash_action`,
@@ -435,6 +442,7 @@ pub fn parse(line: &str) -> Option<Action> {
         "phase" => Action::Phase(extra),
         "workflow" => Action::Workflow(extra),
         "skills" => Action::Skills,
+        "decider" => Action::Decider,
         "new" => Action::New,
         "resume" => Action::Resume,
         "clear" => Action::Clear,
@@ -600,6 +608,8 @@ mod tests {
             matches!(parse("/compare a | b"), Some(Action::Compare(value)) if value == "a | b")
         );
         assert!(matches!(parse("/phase"), Some(Action::Phase(value)) if value.is_empty()));
+        assert!(matches!(parse("/decider"), Some(Action::Decider)));
+        assert!(matches!(action_for("decider"), Action::Decider));
         assert!(
             matches!(parse("/workflow mode adaptive"), Some(Action::Workflow(value)) if value == "mode adaptive")
         );

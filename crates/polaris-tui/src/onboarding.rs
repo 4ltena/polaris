@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
@@ -104,20 +104,273 @@ pub fn render_choice_screen(frame: &mut Frame, selected: Choice) {
 }
 
 pub fn render_api_key_prompt(frame: &mut Frame, typed_len: usize) {
+    render_secret_prompt(
+        frame,
+        typed_len,
+        "Paste or type your OpenAI API key, then press Enter.\nEsc/Ctrl-C to cancel.",
+        "API key",
+    );
+}
+
+/// A masked single-line entry: only the character count is ever drawn.
+fn render_secret_prompt(frame: &mut Frame, typed_len: usize, prompt: &str, title: &str) {
     let area = frame.area();
     let [prompt_area, input_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Length(3)]).areas(area);
+        Layout::vertical([Constraint::Length(4), Constraint::Length(3)]).areas(area);
     frame.render_widget(
-        Paragraph::new(
-            "Paste or type your OpenAI API key, then press Enter.\nEsc/Ctrl-C to cancel.",
-        ),
+        Paragraph::new(prompt.to_owned()).wrap(Wrap { trim: false }),
         prompt_area,
     );
     let masked: String = "*".repeat(typed_len);
     frame.render_widget(
-        Paragraph::new(masked).block(Block::default().borders(Borders::ALL).title("API key")),
+        Paragraph::new(masked).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title.to_owned()),
+        ),
         input_area,
     );
+}
+
+/// Where the decider step saves the key and turns the decider on, and
+/// whether a `local_only` setting rules the remote judge out.
+#[derive(Debug, Clone)]
+pub struct DeciderSetup {
+    pub key_path: std::path::PathBuf,
+    pub config_path: std::path::PathBuf,
+    pub local_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeciderChoice {
+    Jev,
+    Skip,
+}
+
+pub const JEV_DISCLOSURE: &str =
+    "Enabling Jev sends the conversation state to api.typesafe.ai to classify each turn.";
+
+pub fn render_decider_screen(frame: &mut Frame, selected: DeciderChoice, local_only: bool) {
+    let marker = |choice| if choice == selected { "> " } else { "  " };
+    let style = |choice| {
+        if choice == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    };
+    let mut lines = vec![
+        Line::styled(
+            "Choose a decider",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("A decider classifies each turn so polaris can move between workflow"),
+        Line::from("phases (for example from general to implement). It is off by default."),
+        Line::from(""),
+    ];
+    if local_only {
+        lines.push(Line::styled(
+            "Jev is unavailable: decision.local_only is set, and Jev is a remote service.",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw(marker(DeciderChoice::Jev)),
+            Span::styled("1. Jev (enter its API key)", style(DeciderChoice::Jev)),
+        ]));
+        lines.push(Line::styled(
+            format!("     {JEV_DISCLOSURE}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::raw(marker(DeciderChoice::Skip)),
+        Span::styled(
+            if local_only {
+                "Continue without a decider"
+            } else {
+                "2. No decider"
+            },
+            style(DeciderChoice::Skip),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "\u{2191}/\u{2193} or 1/2 to choose, Enter to continue, Esc to skip",
+    ));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("polaris")),
+        frame.area(),
+    );
+}
+
+/// What the decider step left behind. Only `Enabled` changes this launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeciderResult {
+    Skipped,
+    Enabled,
+    /// The key was saved, but the configuration was not changed; the text
+    /// says why. Never carries the key.
+    SavedOnly(String),
+}
+
+/// Saves the key and turns Jev on. Split from the screen so it is testable.
+pub fn save_jev_and_enable(setup: &DeciderSetup, key: &str) -> Result<DeciderResult, String> {
+    polaris_auth::decision_key::save_jev_to(&setup.key_path, key)
+        .map_err(|error| format!("Could not save the decider key: {error}"))?;
+    use polaris_core::decision_enable::EnableOutcome;
+    let manual = "Add `[decision]` with `enabled = true` and `backend = \"jev\"` yourself.";
+    Ok(
+        match polaris_core::decision_enable::enable_jev(&setup.config_path) {
+            Ok(EnableOutcome::Appended | EnableOutcome::Created) => DeciderResult::Enabled,
+            Ok(EnableOutcome::AlreadyConfigured) => DeciderResult::SavedOnly(
+                "config.toml already has a decision setting, so it was left unchanged.".into(),
+            ),
+            Ok(EnableOutcome::Unparsable) => DeciderResult::SavedOnly(format!(
+                "config.toml could not be parsed, so it was left unchanged. {manual}"
+            )),
+            Ok(EnableOutcome::Symlink) => DeciderResult::SavedOnly(format!(
+                "config.toml is a symlink, so it was left unchanged. {manual}"
+            )),
+            Err(error) => DeciderResult::SavedOnly(format!(
+                "config.toml could not be updated ({error}). {manual}"
+            )),
+        },
+    )
+}
+
+/// The decider step shown after a successful subscription sign-in and by
+/// `/decider`. Sign-in already succeeded, so Esc, "No decider", a failed
+/// draw or a save error all end the step without failing it.
+pub fn decider_step<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    setup: &DeciderSetup,
+    mut read: impl FnMut() -> Option<ratatui::crossterm::event::Event>,
+    applies_now: bool,
+) -> DeciderResult {
+    use ratatui::crossterm::event::Event;
+    let mut selected = if setup.local_only {
+        DeciderChoice::Skip
+    } else {
+        DeciderChoice::Jev
+    };
+    loop {
+        if terminal
+            .draw(|f| render_decider_screen(f, selected, setup.local_only))
+            .is_err()
+        {
+            return DeciderResult::Skipped;
+        }
+        // `None` is the end of input (cancel, shutdown or a read error).
+        let Some(event) = read() else {
+            return DeciderResult::Skipped;
+        };
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Press && !setup.local_only {
+            // The footer says 1/2 choose; here they select, not flip.
+            match key.code {
+                KeyCode::Char('1') => {
+                    selected = DeciderChoice::Jev;
+                    continue;
+                }
+                KeyCode::Char('2') => {
+                    selected = DeciderChoice::Skip;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match apply_choice_key(key) {
+            ChoiceAction::Continue => continue,
+            ChoiceAction::Toggle if !setup.local_only => {
+                selected = match selected {
+                    DeciderChoice::Jev => DeciderChoice::Skip,
+                    DeciderChoice::Skip => DeciderChoice::Jev,
+                };
+                continue;
+            }
+            ChoiceAction::Toggle => continue,
+            ChoiceAction::Quit => return DeciderResult::Skipped,
+            ChoiceAction::Submit if selected == DeciderChoice::Skip => {
+                return DeciderResult::Skipped;
+            }
+            ChoiceAction::Submit => {}
+        }
+        let mut typed = String::new();
+        let key = loop {
+            let prompt = "Paste or type your Jev API key, then press Enter.\n\
+                          It is saved to ~/.polaris/decision_keys.json (owner-only), never to .env. Esc to skip.";
+            if terminal
+                .draw(|f| render_secret_prompt(f, typed.chars().count(), prompt, "Jev API key"))
+                .is_err()
+            {
+                return DeciderResult::Skipped;
+            }
+            let Some(event) = read() else {
+                return DeciderResult::Skipped;
+            };
+            let event = match event {
+                Event::Key(event) => event,
+                // Inside the chat TUI bracketed paste is on, so a pasted key
+                // arrives whole rather than as keystrokes.
+                Event::Paste(text) => {
+                    // A newline or escape in a pasted key would only fail later,
+                    // at header construction; refuse it here.
+                    if !text.trim().chars().any(char::is_control) {
+                        typed.push_str(text.trim());
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            match apply_key_entry_key(&mut typed, event) {
+                KeyEntryAction::Continue => continue,
+                KeyEntryAction::Quit => return DeciderResult::Skipped,
+                KeyEntryAction::Submit(key) => break key,
+            }
+        };
+        let result = save_jev_and_enable(setup, &key);
+        drop(key);
+        let when = if applies_now {
+            "It takes effect now."
+        } else {
+            "It takes effect from the next launch."
+        };
+        let (message, outcome) = match result {
+            Ok(DeciderResult::Enabled) => (
+                format!("Jev is enabled and its key is saved. {when}"),
+                DeciderResult::Enabled,
+            ),
+            Ok(DeciderResult::SavedOnly(reason)) => (
+                format!("The key is saved. {reason}"),
+                DeciderResult::SavedOnly(reason),
+            ),
+            Ok(DeciderResult::Skipped) => return DeciderResult::Skipped,
+            Err(reason) => (reason, DeciderResult::Skipped),
+        };
+        let _ = terminal.draw(|f| {
+            f.render_widget(
+                Paragraph::new(format!("{message}\n\nPress any key to continue."))
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().borders(Borders::ALL).title("polaris")),
+                f.area(),
+            )
+        });
+        while let Some(event) = read() {
+            if matches!(event, Event::Key(_)) {
+                break;
+            }
+        }
+        return outcome;
+    }
 }
 
 pub enum ChoiceAction {
@@ -213,6 +466,17 @@ use ratatui::crossterm::terminal::{
 pub enum Outcome {
     ApiKeySaved,
     CodexLoggedIn,
+    /// Signed in, and the decider step turned Jev on: the caller reloads
+    /// the decision settings before it builds the decider.
+    CodexLoggedInDeciderEnabled,
+}
+
+fn signed_in(result: DeciderResult) -> Outcome {
+    if result == DeciderResult::Enabled {
+        Outcome::CodexLoggedInDeciderEnabled
+    } else {
+        Outcome::CodexLoggedIn
+    }
 }
 
 #[derive(Debug)]
@@ -293,6 +557,21 @@ fn reenter_after_oauth_error<T>(
         return Err(OnboardingError::Auth(auth_error.to_string()));
     }
     enter()
+}
+
+/// The decider step after a successful sign-in. Esc and "No decider" still
+/// end a successful login, but a real exit request during the step is not
+/// swallowed: the login is already saved, so cancelling here loses nothing.
+#[cfg(target_os = "linux")]
+fn decider_after_login(
+    terminal: &mut DefaultTerminal,
+    decider: &DeciderSetup,
+) -> Result<Outcome, OnboardingError> {
+    let result = decider_step(terminal, decider, || read_onboarding_event().ok(), true);
+    if shutdown_requested() {
+        return Err(OnboardingError::Cancelled);
+    }
+    Ok(signed_in(result))
 }
 
 #[cfg(target_os = "linux")]
@@ -436,21 +715,26 @@ enum LoginMode<'a> {
     Registered(std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>),
 }
 
-pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
-    run_mode(LoginMode::Legacy(auth_store_path), api_key_path).await
+pub async fn run(
+    auth_store_path: &Path,
+    api_key_path: &Path,
+    decider: &DeciderSetup,
+) -> Result<Outcome, OnboardingError> {
+    run_mode(LoginMode::Legacy(auth_store_path), api_key_path, decider).await
 }
 
 /// Reconnect logged-out registrations without falling back to the legacy store.
 pub async fn run_registered(
     owner: std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
     api_key_path: &Path,
+    decider: &DeciderSetup,
 ) -> Result<Outcome, OnboardingError> {
     if cfg!(not(unix)) {
         return Err(OnboardingError::Auth(
             "protected account storage is unavailable".into(),
         ));
     }
-    run_mode(LoginMode::Registered(owner), api_key_path).await
+    run_mode(LoginMode::Registered(owner), api_key_path, decider).await
 }
 
 pub(crate) fn render_registered_wait(frame: &mut Frame) {
@@ -543,7 +827,11 @@ async fn legacy_subscription(
 /// whatever the caller does with the terminal afterward — the chat loop's
 /// own `run()` re-inits the terminal fresh once this returns.
 #[cfg(target_os = "linux")]
-async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+async fn run_mode(
+    mode: LoginMode<'_>,
+    api_key_path: &Path,
+    decider: &DeciderSetup,
+) -> Result<Outcome, OnboardingError> {
     let mut terminal = enter_onboarding_terminal_with(shutdown_requested, || {
         if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
             return Err(OnboardingError::NonInteractive);
@@ -598,7 +886,11 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             "failed to draw the terminal".into(),
                         ));
                     }
-                    break 'outer register(owner, terminal.terminal_mut()).await;
+                    let result = register(owner, terminal.terminal_mut()).await;
+                    break 'outer match result {
+                        Ok(_) => decider_after_login(terminal.terminal_mut(), decider),
+                        Err(error) => Err(error),
+                    };
                 };
                 if shutdown_requested() {
                     break 'outer Err(OnboardingError::Cancelled);
@@ -621,7 +913,7 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             Ok(None) => break 'outer Ok(Outcome::CodexLoggedIn),
                             Err(error) => break 'outer Err(error),
                         };
-                        break 'outer Ok(Outcome::CodexLoggedIn);
+                        break 'outer decider_after_login(terminal.terminal_mut(), decider);
                     }
                     Err(e) => {
                         // Stay on the choice screen and let the user try
@@ -700,7 +992,11 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
 
 /// Preserve the existing non-Linux onboarding behavior.
 #[cfg(not(target_os = "linux"))]
-async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+async fn run_mode(
+    mode: LoginMode<'_>,
+    api_key_path: &Path,
+    decider: &DeciderSetup,
+) -> Result<Outcome, OnboardingError> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(OnboardingError::NonInteractive);
     }
@@ -746,7 +1042,15 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                             "failed to draw the terminal".into(),
                         ));
                     }
-                    break 'outer register(owner, &mut terminal).await;
+                    let result = register(owner, &mut terminal).await;
+                    break 'outer result.map(|_| {
+                        signed_in(decider_step(
+                            &mut terminal,
+                            decider,
+                            || crate::terminal::read_event().ok(),
+                            true,
+                        ))
+                    });
                 };
                 let result = legacy_subscription(auth_store_path, &mut terminal).await;
                 crate::terminal::restore();
@@ -756,7 +1060,14 @@ async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, O
                 }
                 terminal = crate::terminal::init();
                 match result {
-                    Ok(_) => break 'outer Ok(Outcome::CodexLoggedIn),
+                    Ok(_) => {
+                        break 'outer Ok(signed_in(decider_step(
+                            &mut terminal,
+                            decider,
+                            || crate::terminal::read_event().ok(),
+                            true,
+                        )));
+                    }
                     Err(e) => {
                         // Stay on the choice screen and let the user try
                         // again rather than exiting the whole process over
@@ -1059,6 +1370,296 @@ mod tests {
         assert!(matches!(result, Ok(Outcome::ApiKeySaved)));
     }
 
+    /// Delegates to `TestBackend` and keeps every flushed screen, so a
+    /// sentinel typed into the masked prompt can be checked against all of them.
+    struct Recording {
+        inner: TestBackend,
+        frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl ratatui::backend::Backend for Recording {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> std::io::Result<()> {
+            self.inner.scroll_region_up(region, line_count)
+        }
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> std::io::Result<()> {
+            self.inner.scroll_region_down(region, line_count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let screen = self
+                .inner
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            self.frames.borrow_mut().push(screen);
+            self.inner.flush()
+        }
+    }
+
+    fn drive(setup: &DeciderSetup, keys: &[KeyCode]) -> (DeciderResult, Vec<String>) {
+        use ratatui::crossterm::event::Event;
+        let frames = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Terminal::new(Recording {
+            inner: TestBackend::new(110, 20),
+            frames: frames.clone(),
+        })
+        .expect("terminal");
+        let mut queue: std::collections::VecDeque<_> = keys.iter().copied().collect();
+        let result = decider_step(
+            &mut terminal,
+            setup,
+            || queue.pop_front().map(|code| Event::Key(press(code))),
+            true,
+        );
+        let frames = frames.borrow().clone();
+        (result, frames)
+    }
+
+    fn setup(dir: &std::path::Path, local_only: bool) -> DeciderSetup {
+        DeciderSetup {
+            key_path: dir.join("decision_keys.json"),
+            config_path: dir.join("config.toml"),
+            local_only,
+        }
+    }
+
+    #[test]
+    fn the_decider_screen_offers_jev_with_its_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, frames) = drive(&setup(dir.path(), false), &[KeyCode::Esc]);
+        assert_eq!(result, DeciderResult::Skipped);
+        assert!(frames[0].contains("1. Jev"));
+        assert!(frames[0].contains("api.typesafe.ai"));
+        assert!(!dir.path().join("decision_keys.json").exists());
+        assert!(!dir.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn no_decider_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, _) = drive(&setup(dir.path(), false), &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(result, DeciderResult::Skipped);
+        assert!(!dir.path().join("decision_keys.json").exists());
+        assert!(!dir.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn local_only_hides_jev_and_enter_continues_without_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, frames) = drive(&setup(dir.path(), true), &[KeyCode::Up, KeyCode::Enter]);
+        assert_eq!(result, DeciderResult::Skipped);
+        assert!(!frames[0].contains("1. Jev"));
+        assert!(frames[0].contains("local_only"));
+        assert!(!dir.path().join("decision_keys.json").exists());
+    }
+
+    #[test]
+    fn a_typed_jev_key_is_saved_enabled_and_never_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[embedding]\n").unwrap();
+        let sentinel = "jevsentinel0123";
+        let mut keys = vec![KeyCode::Enter];
+        keys.extend(sentinel.chars().map(KeyCode::Char));
+        keys.extend([KeyCode::Enter, KeyCode::Char('x')]);
+        let (result, frames) = drive(&setup(dir.path(), false), &keys);
+        assert_eq!(result, DeciderResult::Enabled);
+        assert!(frames.iter().any(|frame| frame.contains("Jev API key")));
+        assert!(frames.iter().any(|frame| frame.contains("Jev is enabled")));
+        assert!(frames.iter().all(|frame| !frame.contains(sentinel)));
+        // Contrast: the key did reach the owner-only store.
+        assert!(
+            std::fs::read_to_string(dir.path().join("decision_keys.json"))
+                .unwrap()
+                .contains(sentinel)
+        );
+        let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(config.starts_with("[embedding]\n"));
+        assert!(config.contains("[decision]") && !config.contains(sentinel));
+    }
+
+    #[test]
+    fn a_pasted_jev_key_is_accepted_as_a_whole() {
+        use ratatui::crossterm::event::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let frames = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Terminal::new(Recording {
+            inner: TestBackend::new(110, 20),
+            frames: frames.clone(),
+        })
+        .unwrap();
+        let mut events = std::collections::VecDeque::from([
+            Event::Key(press(KeyCode::Enter)),
+            Event::Paste("  pastedsentinel42  ".into()),
+            Event::Key(press(KeyCode::Enter)),
+            Event::Key(press(KeyCode::Char('x'))),
+        ]);
+        let result = decider_step(
+            &mut terminal,
+            &setup(dir.path(), false),
+            || events.pop_front(),
+            false,
+        );
+        assert_eq!(result, DeciderResult::Enabled);
+        let stored = std::fs::read_to_string(dir.path().join("decision_keys.json")).unwrap();
+        assert!(stored.contains("\"pastedsentinel42\""));
+        assert!(
+            frames
+                .borrow()
+                .iter()
+                .any(|frame| frame.contains("next launch"))
+        );
+        assert!(
+            frames
+                .borrow()
+                .iter()
+                .all(|frame| !frame.contains("pastedsentinel42"))
+        );
+    }
+
+    #[test]
+    fn number_keys_select_instead_of_flipping() {
+        let dir = tempfile::tempdir().unwrap();
+        // `2` selects "No decider" and Enter then saves nothing; `1` back to Jev.
+        let (result, _) = drive(
+            &setup(dir.path(), false),
+            &[KeyCode::Char('2'), KeyCode::Enter],
+        );
+        assert_eq!(result, DeciderResult::Skipped);
+        let keys = [
+            KeyCode::Char('2'),
+            KeyCode::Char('1'),
+            KeyCode::Enter,
+            KeyCode::Char('k'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ];
+        let (result, _) = drive(&setup(dir.path(), false), &keys);
+        assert_eq!(result, DeciderResult::Enabled);
+    }
+
+    #[test]
+    fn the_disclosure_and_prompt_survive_an_80_column_terminal() {
+        use ratatui::crossterm::event::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let frames = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Terminal::new(Recording {
+            inner: TestBackend::new(80, 24),
+            frames: frames.clone(),
+        })
+        .unwrap();
+        let mut events = std::collections::VecDeque::from([
+            Event::Key(press(KeyCode::Enter)),
+            Event::Key(press(KeyCode::Esc)),
+        ]);
+        decider_step(
+            &mut terminal,
+            &setup(dir.path(), false),
+            || events.pop_front(),
+            false,
+        );
+        let frames = frames.borrow();
+        // Wrapping splits a sentence across rows and the border draws between
+        // them, so compare only the ASCII non-space characters.
+        let squash = |text: &str| {
+            text.chars()
+                .filter(|c| c.is_ascii() && !c.is_whitespace())
+                .collect::<String>()
+        };
+        assert!(squash(&frames[0]).contains(&squash("to classify each turn.")));
+        assert!(squash(&frames[1]).contains("Esctoskip."));
+    }
+
+    #[test]
+    fn a_pasted_key_with_a_control_character_is_ignored() {
+        use ratatui::crossterm::event::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(110, 20)).unwrap();
+        let mut events = std::collections::VecDeque::from([
+            Event::Key(press(KeyCode::Enter)),
+            Event::Paste("bad\nkey".into()),
+            Event::Key(press(KeyCode::Enter)),
+            Event::Key(press(KeyCode::Esc)),
+        ]);
+        let result = decider_step(
+            &mut terminal,
+            &setup(dir.path(), false),
+            || events.pop_front(),
+            false,
+        );
+        assert_eq!(result, DeciderResult::Skipped);
+        assert!(!dir.path().join("decision_keys.json").exists());
+    }
+
+    #[test]
+    fn esc_in_the_key_prompt_skips_without_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, _) = drive(
+            &setup(dir.path(), false),
+            &[KeyCode::Enter, KeyCode::Char('a'), KeyCode::Esc],
+        );
+        assert_eq!(result, DeciderResult::Skipped);
+        assert!(!dir.path().join("decision_keys.json").exists());
+    }
+
+    #[test]
+    fn an_existing_decision_setting_keeps_the_config_and_still_saves_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[decision]\nenabled = false\n";
+        std::fs::write(dir.path().join("config.toml"), original).unwrap();
+        let keys = [
+            KeyCode::Enter,
+            KeyCode::Char('k'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ];
+        let (result, _) = drive(&setup(dir.path(), false), &keys);
+        assert!(matches!(result, DeciderResult::SavedOnly(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            original
+        );
+        assert!(dir.path().join("decision_keys.json").exists());
+    }
+
     #[test]
     fn the_choice_screen_marks_the_selected_option() {
         let backend = TestBackend::new(80, 16);
@@ -1252,7 +1853,8 @@ mod tests {
         let auth_path = dir.path().join("auth.json");
         let key_path = dir.path().join("api_key.json");
 
-        let err = run(&auth_path, &key_path)
+        let decider = setup(dir.path(), false);
+        let err = run(&auth_path, &key_path, &decider)
             .await
             .expect_err("a non-interactive terminal must be refused");
         assert!(matches!(err, OnboardingError::NonInteractive));

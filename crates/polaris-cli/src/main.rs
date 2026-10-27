@@ -2775,6 +2775,14 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
         Ok(prepared) => prepared,
         Err(status) => return status,
     };
+    if prepared_providers.reload_decision {
+        // Onboarding wrote `[decision]` after the configuration was loaded;
+        // without this the decider would only appear on the next launch.
+        match polaris_core::config::load(&project_root) {
+            Ok(reloaded) => config.decision = reloaded.decision,
+            Err(error) => eprintln!("Cannot reload the decision settings: {error}"),
+        }
+    }
     let provider_name = prepared_providers.provider_name.clone();
     let model_name = prepared_providers.model_name.clone();
     let mcp_selection_provider = polaris_core::decision_policy::restrict_arbiter(

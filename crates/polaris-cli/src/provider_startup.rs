@@ -18,22 +18,26 @@ pub(super) struct PreparedProviders {
     pub(super) tier_weights: TierWeights,
     pub(super) provider_name: String,
     pub(super) model_name: String,
+    /// Onboarding turned the decider on; reload `[decision]` before building it.
+    pub(super) reload_decision: bool,
     _llama_server: Option<polaris_core::llama_server::LlamaServer>,
 }
 
 async fn onboard(
     store: &Path,
     accounts: account::StartupAccounts,
+    local_only: bool,
 ) -> Result<polaris_tui::onboarding::Outcome, ExitCode> {
     let api_key_path = polaris_auth::api_key::default_path().map_err(|error| {
         eprintln!("Can't determine where to store the API key: {error}");
         ExitCode::FAILURE
     })?;
+    let decider = decider_setup(local_only)?;
     let outcome = match accounts {
         account::StartupAccounts::LoggedOut(owner) => {
-            polaris_tui::onboarding::run_registered(owner, &api_key_path).await
+            polaris_tui::onboarding::run_registered(owner, &api_key_path, &decider).await
         }
-        _ => polaris_tui::onboarding::run(store, &api_key_path).await,
+        _ => polaris_tui::onboarding::run(store, &api_key_path, &decider).await,
     };
     outcome.map_err(|error| match error {
         polaris_tui::onboarding::OnboardingError::Cancelled => ExitCode::SUCCESS,
@@ -41,6 +45,26 @@ async fn onboard(
             eprintln!("{other}");
             ExitCode::FAILURE
         }
+    })
+}
+
+/// The decider step writes the owner-only key store and the user-layer
+/// `config.toml`, the same file `polaris_core::config::load` reads.
+pub(super) fn decider_setup(
+    local_only: bool,
+) -> Result<polaris_tui::onboarding::DeciderSetup, ExitCode> {
+    let key_path = polaris_auth::decision_key::default_path().map_err(|error| {
+        eprintln!("Can't determine where to store the decider key: {error}");
+        ExitCode::FAILURE
+    })?;
+    let config_path = polaris_core::decision_enable::user_config_path().ok_or_else(|| {
+        eprintln!("Can't determine the user configuration path: HOME is not set");
+        ExitCode::FAILURE
+    })?;
+    Ok(polaris_tui::onboarding::DeciderSetup {
+        key_path,
+        config_path,
+        local_only,
     })
 }
 
@@ -66,6 +90,7 @@ pub(super) async fn prepare(
 ) -> Result<PreparedProviders, ExitCode> {
     let model_name: String;
     let mut llama_server = None;
+    let mut reload_decision = false;
     let (provider, mcp_selection_provider, tier_weights): (Shared, Option<Shared>, TierWeights) = loop {
         match provider_name.as_str() {
             "openai" => {
@@ -96,10 +121,21 @@ pub(super) async fn prepare(
                                 return Err(ExitCode::FAILURE);
                             }
                         };
-                        match onboard(&auth_store_path, startup_accounts()?).await {
+                        match onboard(
+                            &auth_store_path,
+                            startup_accounts()?,
+                            config.decision.local_only,
+                        )
+                        .await
+                        {
                             Ok(polaris_tui::onboarding::Outcome::ApiKeySaved) => continue,
                             Ok(polaris_tui::onboarding::Outcome::CodexLoggedIn) => {
                                 provider_name = "codex".to_string();
+                                continue;
+                            }
+                            Ok(polaris_tui::onboarding::Outcome::CodexLoggedInDeciderEnabled) => {
+                                provider_name = "codex".to_string();
+                                reload_decision = true;
                                 continue;
                             }
                             Err(status) => return Err(status),
@@ -167,11 +203,14 @@ pub(super) async fn prepare(
                         account::StartupAccounts::Registered => false,
                     };
                     if needs_login {
-                        match onboard(&store, accounts).await? {
+                        match onboard(&store, accounts, config.decision.local_only).await? {
                             polaris_tui::onboarding::Outcome::ApiKeySaved => {
                                 provider_name = "openai".into();
                             }
                             polaris_tui::onboarding::Outcome::CodexLoggedIn => {}
+                            polaris_tui::onboarding::Outcome::CodexLoggedInDeciderEnabled => {
+                                reload_decision = true;
+                            }
                         }
                         continue;
                     }
@@ -307,6 +346,7 @@ pub(super) async fn prepare(
         tier_weights,
         provider_name,
         model_name,
+        reload_decision,
         _llama_server: llama_server,
     })
 }

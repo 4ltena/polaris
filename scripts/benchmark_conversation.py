@@ -62,7 +62,7 @@ from benchmark_profile import Profile, PREFIX, claim_attempt, verify_binary  # n
 
 REPO = Path(__file__).resolve().parent.parent
 POLARIS = REPO.parent / "polaris" / "target" / "release" / "polaris"
-CODEX = Path("/Users/example/.local/bin/codex")
+CODEX = Path(shutil.which("codex") or Path.home() / ".local" / "bin" / "codex")
 
 # ------------------------------------------------------------------ 台本
 

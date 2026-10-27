@@ -14,7 +14,7 @@
 # 止めると残りの段の状態が分からなくなる。
 set -u
 cd "$(dirname "$0")/.." || exit 1
-: "${CARGO_TARGET_DIR:=/Users/example/File/projects/codex/polaris/target}"
+: "${CARGO_TARGET_DIR:=$PWD/target}"
 export CARGO_TARGET_DIR
 fail=0
 clippy_failed=0

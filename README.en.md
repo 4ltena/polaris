@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>Provisional v1.0.0 · macOS TUI only · preparing publication</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
+  <strong>v1.0.0-rc · macOS TUI only · package not yet published</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
 </p>
 
 <p align="center">
@@ -17,13 +17,13 @@
 
 Polaris is a Rust coding agent that selects the context needed for the current task. Its main interfaces are a CLI and TUI, with a separate macOS workspace app. It stores workflow state and assembles instructions and skills for the active phase.
 
-Provisional v1.0.0 distributes the macOS arm64 TUI only. GUI and other-platform sources remain in the repository. See the [system overview](docs/system-overview.md), [release scope](docs/releases/v1.0.0.md), and [command reference](docs/command-reference.md) (Japanese). No v1.0.0 tag or release has been published for this candidate.
+v1.0.0-rc targets the macOS arm64 TUI. GUI and other-platform sources remain in the repository. See the [system overview](docs/system-overview.md), [release scope](docs/releases/v1.0.0.md), and [command reference](docs/command-reference.md) (Japanese). No RC tag, release, or package has been published.
 
 ## Using this development checkout
 
 Start from a project directory. Starting from your home directory currently fails helper preparation with `RuntimeDenied`; see [startup troubleshooting](docs/usage.md#起動時のトラブル).
 
-On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-1.0.0-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
+On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-1.0.0-rc-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
 
 Building from source requires Rust 1.96.0. To use ChatGPT authentication:
 
@@ -55,7 +55,7 @@ The macOS CLI preview package contains no optional resources. The GUI installer 
 
 ## v0.12.0 comparison with stock Codex
 
-These are historical v0.12.0 measurements, not results for provisional v1.0.0. The current-version comparison has not been run.
+These are historical v0.12.0 measurements, not results for v1.0.0-rc. The current-version comparison has not been run.
 
 Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow enabled. These partial results cover 15 matched PRE02–08 trials with two turns each against Codex CLI 0.154.0. The additional PRE01 measurement was skipped.
 
@@ -77,7 +77,7 @@ Start with the [documentation index](docs/README.md). Detailed documents below a
 | [Usage guide](docs/usage.md) | Authentication, startup troubleshooting, configuration, envkit, and conversations. |
 | [Command reference](docs/command-reference.md) | CLI/TUI commands and their output. |
 | [System overview](docs/system-overview.md) | Execution, storage, isolation, and crate roles. |
-| [Provisional v1.0.0](docs/releases/v1.0.0.md) | Distribution scope, candidate checksums, verification, and limits. |
+| [v1.0.0-rc](docs/releases/v1.0.0.md) | Distribution scope, candidate checksums, verification, and limits. |
 
 
 ## Development and verification

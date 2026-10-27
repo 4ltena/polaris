@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
-## [1.0.0] — 未リリース（macOS TUI暫定版）
+## [1.0.0-rc] — 未リリース（macOS TUI候補）
 
 macOS arm64のTUIを配布対象として準備する。GUIと他OSのソースは保持する。公開日・タグ・署名済み配布物が確定したことを示すものではない。
 
@@ -36,7 +36,7 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 ### 検証・備考
 
-- 最終候補の結果と未検証範囲は[暫定v1.0.0リリース資料](docs/releases/v1.0.0.md)に記録する。
+- 最終候補の結果と未検証範囲は[v1.0.0-rcリリース資料](docs/releases/v1.0.0.md)に記録する。
 - macOS TUI以外、署名・公証、全MCP・モデルの実接続、Clef実受入を完了としない。
 
 ## [0.12.0] — 未リリース "Alrescha"

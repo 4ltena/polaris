@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>暫定v1.0.0 · macOS TUI限定 · 公開準備中</strong> · <a href="CHANGELOG.md">変更履歴</a>
+  <strong>v1.0.0-rc · macOS TUI限定 · パッケージ未公開</strong> · <a href="CHANGELOG.md">変更履歴</a>
 </p>
 
 <p align="center">
@@ -17,13 +17,13 @@
 
 Polarisは、作業に必要な文脈を選んでモデルへ渡すRust製のコーディングエージェントである。CLIとTUIを主な操作経路とし、macOS向けの作業画面も備える。workflowの段階を状態として保存し、その段階に必要な指示・skillを組み立てる。
 
-暫定v1.0.0はmacOS arm64のTUIを配布対象とする。GUI・他OSのソースは保持するが、この版の配布対象には含めない。会話・巻戻し・MCP・subagentの操作は[利用ガイド](docs/usage.md)と[コマンド参照](docs/command-reference.md)、構成と今回の提供範囲は[システム構成図](docs/system-overview.md)と[リリース資料](docs/releases/v1.0.0.md)を参照。現在は公開準備中である。
+v1.0.0-rcはmacOS arm64のTUIを配布対象とする。GUI・他OSのソースは保持するが、この版の配布対象には含めない。会話・巻戻し・MCP・subagentの操作は[利用ガイド](docs/usage.md)と[コマンド参照](docs/command-reference.md)、構成と今回の提供範囲は[システム構成図](docs/system-overview.md)と[リリース資料](docs/releases/v1.0.0.md)を参照。RCパッケージは未公開である。
 
 ## 暫定版の利用方法
 
 起動前に作業対象のプロジェクトへ移動する。ホームディレクトリからの起動は、現在`RuntimeDenied`で停止する。[起動時のトラブル](docs/usage.md#起動時のトラブル)を参照。
 
-macOS arm64では、ビルド済みCLIを同梱したローカル検証用パッケージを作成できる。パッケージを取得した後の導入は`sudo installer -pkg polaris-cli-preview-1.0.0-arm64.pkg -target /`の1コマンドで、以後は`polaris`で起動する。利用者側にRustは不要。現時点では未署名・未公開であり、実機へのインストール受入も未完了。組立て方法と検証範囲は[macOSの説明](apps/macos/README.md)を参照。
+macOS arm64では、ビルド済みCLIを同梱したローカル検証用パッケージを作成できる。パッケージを取得した後の導入は`sudo installer -pkg polaris-cli-preview-1.0.0-rc-arm64.pkg -target /`の1コマンドで、以後は`polaris`で起動する。利用者側にRustは不要。現時点では未署名・未公開であり、実機へのインストール受入も未完了。組立て方法と検証範囲は[macOSの説明](apps/macos/README.md)を参照。
 
 このcheckoutをソースから実行する場合はRust 1.96.0を用意する。ChatGPT認証を使う例は次のとおり。
 
@@ -55,7 +55,7 @@ macOSのCLI専用プレビューパッケージには追加資源を含めない
 
 ## v0.12.0での純正Codexとの比較
 
-これはv0.12.0の過去の測定であり、暫定v1.0.0の実測結果ではない。現行版の再比較は未実施である。
+これはv0.12.0の過去の測定であり、v1.0.0-rcの実測結果ではない。現行版の再比較は未実施である。
 
 同じ`gpt-6-astra`／`medium`で、workflowを有効にしたPolarisとCodex CLI 0.154.0を比較した。下表はPRE02〜08で課題・反復がそろった15試行、各2ターンの部分結果である。PRE01の追加測定は省略した。
 
@@ -77,7 +77,7 @@ macOSのCLI専用プレビューパッケージには追加資源を含めない
 | [利用ガイド](docs/usage.md) | 認証、起動トラブル、設定、envkit、会話操作。 |
 | [コマンド参照](docs/command-reference.md) | CLI/TUIコマンドの役割と出力。 |
 | [システム構成図](docs/system-overview.md) | 実行、保存、隔離、各crateの役割。 |
-| [暫定v1.0.0](docs/releases/v1.0.0.md) | 配布範囲、候補checksum、検証結果と限界。 |
+| [v1.0.0-rc](docs/releases/v1.0.0.md) | 配布範囲、候補checksum、検証結果と限界。 |
 
 
 ## 開発と検証

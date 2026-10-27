@@ -262,7 +262,7 @@ Rustの既存Command Line Toolsを使う場合は、起動時に`POLARIS_ENVKIT_
 | `polaris common-tests <plan.json\|->` | JSONで指定したブラックボックス試験をsandbox内で実行する。 | JSONの`result: passed / failed / unavailable`、試験対象、各case、fallbackの要否等。指定プログラムの実行と一時領域の使用を伴う。 |
 | `polaris completion <shell>` | シェル補完scriptを生成する。 | script本文をstdoutへ出す。対応はbash/zsh/fish/elvish/powershell。導入は別操作。 |
 | `polaris --help`、`polaris help [command]` | CLIの構文を調べる。 | コマンド・引数・説明。`polaris mcp configure --help`のように絞れる。 |
-| `polaris --version`、`polaris -V` | バージョンを見る。 | `polaris 1.0.0`。TUIに`/version`はない。 |
+| `polaris --version`、`polaris -V` | バージョンを見る。 | `polaris 1.0.0-rc`。TUIに`/version`はない。 |
 
 一般的な成功は終了コード0、操作失敗は1、構文誤りは2。`sandbox`は子の終了コードを返す。`doctor`の終了コード0は、モデル等への実接続成功を示さない。
 

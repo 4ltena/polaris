@@ -1,6 +1,6 @@
 # macOSデスクトップ
 
-暫定v1.0.0の配布対象はCLI/TUIだけである。下記のGUI組立手順はソース開発用として保持し、今回の配布には含めない。[提供範囲と検証](../../docs/releases/v1.0.0.md)を参照。
+v1.0.0-rcの配布対象はCLI/TUIだけである。下記のGUI組立手順はソース開発用として保持し、今回の配布には含めない。[提供範囲と検証](../../docs/releases/v1.0.0.md)を参照。
 
 このディレクトリは、macOS 13以降で動作するSwiftUI版PolarisのSwift Packageである。Polaris本体と、初回設定・依存資源・本体配置を担当する独立インストーラを生成する。ローカル生成物は未署名で、署名・公証・公開は別工程である。
 
@@ -14,14 +14,14 @@ CLIだけを試す場合は、ビルド済み実行ファイルからプレビ�
 cargo build --locked --offline --release -p polaris-cli
 python3 apps/macos/scripts/assemble-cli-pkg.py \
   --binary "$PWD/target/release/polaris" \
-  --output /absolute/path/polaris-cli-preview-1.0.0-arm64.pkg
+  --output /absolute/path/polaris-cli-preview-1.0.0-rc-arm64.pkg
 python3 apps/macos/scripts/verify-cli-pkg.py \
-  --package /absolute/path/polaris-cli-preview-1.0.0-arm64.pkg \
+  --package /absolute/path/polaris-cli-preview-1.0.0-rc-arm64.pkg \
   --expected-cli "$PWD/target/release/polaris"
 ```
 
 ```sh
-sudo installer -pkg /absolute/path/polaris-cli-preview-1.0.0-arm64.pkg -target /
+sudo installer -pkg /absolute/path/polaris-cli-preview-1.0.0-rc-arm64.pkg -target /
 polaris
 ```
 

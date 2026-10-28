@@ -2523,6 +2523,11 @@ pub(crate) async fn run_loop(
                     // success in between gets misjudged as "consecutive"
                     // and stops the loop (see the comment in stop.rs).
                     stop.observe_success();
+                    let body = if call.name == "read" {
+                        session.read_result_for_history(call, body)
+                    } else {
+                        body
+                    };
                     session.push_tool_result(&call.id, &body);
                 }
                 Err(msg) => {

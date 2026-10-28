@@ -80,6 +80,14 @@ pub use delegation::{
     RootDelegationProjectionV1, RuntimeCancelEffectV1,
 };
 
+/// What a `read` request returned last, for `Session::read_result_for_history`.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SeenRead {
+    hash: String,
+    call_id: String,
+}
+
 #[derive(Default, Clone)]
 pub struct Session {
     /// Installed by root entry points only; new child sessions do not inherit it.
@@ -107,6 +115,11 @@ pub struct Session {
     /// Shared with every wave the session starts, so a follow-up addressed
     /// to the same worker continues rather than re-reads.
     pub child_memory: crate::spawn::ChildMemory,
+    /// The last result of each `read` request (path, offset, limit) in this
+    /// run, so an identical result can be answered with a note instead of the
+    /// same text again. In memory only: a resumed session reads in full once.
+    #[doc(hidden)]
+    pub read_seen: std::collections::HashMap<String, SeenRead>,
     /// Host-owned root control plane. Children receive the same owner only
     /// through a typed parent binding; model text can neither install nor
     /// alter it.
@@ -1026,6 +1039,59 @@ impl Session {
     }
 
     /// Records a tool result, tying it to the id of the call it responds to.
+    /// The text to put in the conversation for a successful `read`.
+    ///
+    /// The same range of an unchanged file, read again while the earlier
+    /// result is still in the conversation, is answered with a short note
+    /// pointing at it. Re-reading is common (after an edit, before a final
+    /// check) and each copy is carried in every later request. It is decided
+    /// here, when the result is created, so what was already sent is never
+    /// touched and a continuation stays valid.
+    ///
+    /// A changed file, a result that is no longer in the messages (summarised
+    /// away, replaced by a stored excerpt), a short result and a `memory://`
+    /// path all return the text as it is.
+    pub fn read_result_for_history(
+        &mut self,
+        call: &polaris_provider::ToolCall,
+        body: String,
+    ) -> String {
+        const MIN_BYTES: usize = 600;
+        let Some(path) = call.arguments["path"].as_str() else {
+            return body;
+        };
+        if path.starts_with("memory://") || body.len() < MIN_BYTES {
+            return body;
+        }
+        let offset = call.arguments["offset"].as_u64().unwrap_or(0);
+        let limit = call.arguments["limit"]
+            .as_u64()
+            .unwrap_or(polaris_tools::read::DEFAULT_LIMIT as u64);
+        let key = format!("{path}\0{offset}\0{limit}");
+        let hash = crate::conversation_state::content_hash(body.as_bytes());
+        if let Some(seen) = self.read_seen.get(&key)
+            && seen.hash == hash
+            && self.messages.iter().any(|message| {
+                message.role == polaris_provider::Role::Tool
+                    && message.tool_call_id.as_deref() == Some(seen.call_id.as_str())
+                    && crate::conversation_state::content_hash(message.content.as_bytes()) == hash
+            })
+        {
+            return format!(
+                "[Unchanged: this range of {path} is identical to the read at {}, whose text is already above in this conversation.]",
+                seen.call_id
+            );
+        }
+        self.read_seen.insert(
+            key,
+            SeenRead {
+                hash,
+                call_id: call.id.clone(),
+            },
+        );
+        body
+    }
+
     pub fn push_tool_result(&mut self, tool_call_id: &str, content: &str) {
         self.push_message(Message::tool_result(tool_call_id, content), false);
     }
@@ -1854,6 +1920,90 @@ mod memory_observation_tests {
                 Arc::new(|_| Ok(())),
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_dedupe_tests {
+    use super::*;
+
+    fn read(id: &str, path: &str, offset: Option<u64>) -> ToolCall {
+        let mut arguments = serde_json::json!({ "path": path });
+        if let Some(offset) = offset {
+            arguments["offset"] = offset.into();
+        }
+        ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments,
+        }
+    }
+
+    /// What the loop does: decide the text, then append it.
+    fn run(session: &mut Session, call: &ToolCall, body: &str) -> String {
+        let text = session.read_result_for_history(call, body.to_owned());
+        session.push_tool_result(&call.id, &text);
+        text
+    }
+
+    #[test]
+    fn the_same_unchanged_range_is_answered_with_a_note_and_a_change_is_not() {
+        let mut session = Session::new();
+        let body = "x".repeat(1000);
+        assert_eq!(run(&mut session, &read("c1", "/a.py", None), &body), body);
+        let again = run(&mut session, &read("c2", "/a.py", None), &body);
+        assert!(
+            again.starts_with("[Unchanged:") && again.contains("c1"),
+            "{again}"
+        );
+        assert!(again.len() < body.len() / 4);
+        // A different range, a different path and a changed body are all read in full.
+        assert_eq!(
+            run(&mut session, &read("c3", "/a.py", Some(5)), &body),
+            body
+        );
+        assert_eq!(run(&mut session, &read("c4", "/b.py", None), &body), body);
+        let changed = format!("{body}!");
+        assert_eq!(
+            run(&mut session, &read("c5", "/a.py", None), &changed),
+            changed
+        );
+        // After a change, the new text is the one to point at.
+        let note = run(&mut session, &read("c6", "/a.py", None), &changed);
+        assert!(
+            note.starts_with("[Unchanged:") && note.contains("c5"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_note_is_never_given_when_the_earlier_text_is_no_longer_in_the_conversation() {
+        let mut session = Session::new();
+        let body = "y".repeat(1000);
+        run(&mut session, &read("c1", "/a.py", None), &body);
+        // Summarised away, or replaced by a stored excerpt: the pointer would be empty.
+        session.messages.clear();
+        assert_eq!(run(&mut session, &read("c2", "/a.py", None), &body), body);
+        let mut session = Session::new();
+        run(&mut session, &read("c1", "/a.py", None), &body);
+        for message in &mut session.messages {
+            message.content = "[Stored tool result abc: 1000 UTF-8 bytes]".into();
+        }
+        assert_eq!(run(&mut session, &read("c2", "/a.py", None), &body), body);
+    }
+
+    #[test]
+    fn short_results_and_stored_memory_reads_are_left_alone() {
+        let mut session = Session::new();
+        let short = "z".repeat(200);
+        run(&mut session, &read("c1", "/a.py", None), &short);
+        assert_eq!(run(&mut session, &read("c2", "/a.py", None), &short), short);
+        let long = "m".repeat(1000);
+        run(&mut session, &read("c3", "memory://abc", None), &long);
+        assert_eq!(
+            run(&mut session, &read("c4", "memory://abc", None), &long),
+            long
         );
     }
 }

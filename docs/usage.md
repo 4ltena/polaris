@@ -325,7 +325,7 @@ polaris mcp configure <server-id> --preset unity-local-v2 --source /absolute/pat
 
 ### 内部プロファイル
 
-`--prompt-profile unattended`、または本人の`~/.polaris/config.toml`の`[prompt] profile = "unattended"`で、無人実行向けの3行をルートのsystemに加える（既定は`default`で何も加えない）。プロジェクトの`.polaris/config.toml`に`[prompt]`を書くと、読込みエラーになる。プロファイルの文面は実行ファイルに組み込まれており、ファイルから読まない。規則の枠100トークンを、プロファイルが先に、残りをグローバルの規則が使う。
+`--prompt-profile unattended`、または本人の`~/.polaris/config.toml`の`[prompt] profile = "unattended"`で、無人実行向けの4行（質問しない、直接変更して検査を示す、分析で止まらない、委譲は大きな独立部分だけ）をルートのsystemに加える（既定は`default`で何も加えない）。プロジェクトの`.polaris/config.toml`に`[prompt]`を書くと、読込みエラーになる。プロファイルの文面は実行ファイルに組み込まれており、ファイルから読まない。規則の枠100トークンを、プロファイルが先に、残りをグローバルの規則が使う。
 
 ### files.mdの自動更新
 

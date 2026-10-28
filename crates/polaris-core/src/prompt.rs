@@ -49,7 +49,8 @@ pub enum Profile {
 const UNATTENDED: &str = "\
 - Unattended run: nobody will answer questions, so never ask. Note an assumption in one line and proceed.
 - Change the files directly, then run the available checks and show their output.
-- Do not stop at analysis or a plan. Finish when the change is applied and verified, or report the exact blocker.";
+- Do not stop at analysis or a plan. Finish when the change is applied and verified, or report the exact blocker.
+- Work in this session. Delegate only a large part that does not depend on the rest; never delegate a review of files you just read.";
 
 impl Profile {
     pub fn name(self) -> &'static str {

@@ -35,9 +35,26 @@ pub fn run(policy: &SandboxPolicy, command: &str) -> Result<String, ToolError> {
 
     Err(ToolError::CommandFailed {
         status: outcome.status,
-        policy: policy.describe(),
+        policy: failure_policy(policy, &body),
         detail: body,
     })
+}
+
+/// How much of the policy a failed command's message repeats. The writable
+/// roots are two long absolute paths (about 250 bytes) and every failure used
+/// to carry them, though a failing test run has nothing to do with the
+/// sandbox. They are kept only when the output looks like a refusal, which is
+/// when the model needs to know where it may write.
+fn failure_policy(policy: &SandboxPolicy, body: &str) -> String {
+    let full = policy.describe();
+    let lowered = body.to_lowercase();
+    if lowered.contains("not permitted")
+        || lowered.contains("permission denied")
+        || lowered.contains("read-only file system")
+    {
+        return full;
+    }
+    full.split(" (writable:").next().unwrap_or(&full).to_owned()
 }
 
 /// A note naming the program that exists, when the one asked for does not.
@@ -140,6 +157,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("failure reason"), "stderr is missing: {msg}");
         assert!(msg.contains('3'), "exit code is missing: {msg}");
+    }
+
+    #[test]
+    fn an_ordinary_failure_does_not_repeat_the_writable_roots_but_a_refusal_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        // A failing test run says nothing about the sandbox: the mode is enough.
+        let plain = run(&workspace(&root), "echo 1 failure >&2; exit 1")
+            .expect_err("failure returned as success")
+            .to_string();
+        assert!(plain.contains("workspace-write"), "{plain}");
+        assert!(!plain.contains("writable:"), "{plain}");
+        assert!(!plain.contains(root.to_str().unwrap()), "{plain}");
+        // A refusal keeps the roots, which is where the model must write next.
+        let refused = run(
+            &workspace(&root),
+            "echo 'Operation not permitted' >&2; exit 1",
+        )
+        .expect_err("failure returned as success")
+        .to_string();
+        assert!(refused.contains("writable:"), "{refused}");
+        assert!(refused.contains(root.to_str().unwrap()), "{refused}");
     }
 
     #[test]

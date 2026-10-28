@@ -2094,32 +2094,42 @@ mod tests {
     }
 
     #[test]
-    fn file_reader_requires_bounded_evidence_and_explicit_gaps() {
+    fn file_reader_returns_one_bounded_markdown_in_a_fixed_line_format() {
         let agent = file_reader();
         assert_eq!(agent.tier, polaris_skills::Tier::Dwarf);
         assert_eq!(agent.allowed_tools, ["read"]);
         assert_eq!(agent.access, polaris_skills::AgentAccess::Read);
-        let valid = serde_json::json!({
-            "path": "/fixture/limits.rs",
-            "findings": [{"line": 17, "text": "The timeout is 30 seconds, except for retries."}],
-            "gaps": []
-        });
-        validate_output(&agent, &valid.to_string()).unwrap();
-        let partial = serde_json::json!({
-            "path": "/fixture/limits.rs", "findings": [], "gaps": ["The requested range was unreadable."]
-        });
-        validate_output(&agent, &partial.to_string()).unwrap();
+        let index = "# app\n\
+            - `sessions.py` — 処理: セッションを保持し、間隔で閉じる ／ 接続: `merger.py`: merge、`gc.py`: reclaim\n\
+            - `gc.py` — 処理: 期限切れの状態を回収する ／ 接続: なし\n";
+        let with_answer = format!(
+            "{index}## 回答\n- `gc.py:12` — The timeout is 30 seconds, except for retries.\n"
+        );
+        let with_unread = format!("{with_answer}## 未読\n- `big.bin`: バイナリ\n");
+        let none = "# (none)\n## 未読\n- `x`: パスが絶対パスでない\n";
+        let ascii = "# app\n- `a.py` - 処理: reads input / 接続: `b.py`: parse\n";
+        for valid in [index, &with_answer, &with_unread, none, ascii] {
+            let output = serde_json::json!({ "markdown": valid }).to_string();
+            validate_output(&agent, &output).unwrap_or_else(|e| panic!("rejected {valid:?}: {e}"));
+        }
+        let five_answers = format!("{index}## 回答\n{}", "- `gc.py:1` — x\n".repeat(5));
+        let eleven_unread = format!("{index}## 未読\n{}", "- `a`: r\n".repeat(11));
         for invalid in [
-            serde_json::json!({"path":"relative.rs", "findings":[], "gaps":["unread"]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings": valid["findings"]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"text":"30 seconds"}], "gaps":[]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"line":0,"text":"30 seconds"}], "gaps":[]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"line":17,"text":"x".repeat(281)}], "gaps":[]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":vec![valid["findings"][0].clone(); 5], "gaps":[]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":["x".repeat(161)]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":vec!["unread"; 4]}),
-            serde_json::json!({"path":format!("/{}", "x".repeat(512)), "findings":[], "gaps":["unread"]}),
-            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":[], "raw":"whole file"}),
+            // Not the line format: no header, no 処理/接続, wrong order.
+            serde_json::json!({"markdown": "- `a.py` — 処理: x ／ 接続: y\n"}),
+            serde_json::json!({"markdown": "# app\n- `a.py` 処理: x ／ 接続: y\n"}),
+            serde_json::json!({"markdown": "# app\n- `a.py` — 接続: y ／ 処理: x\n"}),
+            serde_json::json!({"markdown": "# app\nfree text instead of a line\n"}),
+            serde_json::json!({"markdown": format!("{index}## 未読\n{index}")}),
+            // The answer section needs a line number, and is capped.
+            serde_json::json!({"markdown": format!("{index}## 回答\n- `gc.py` — x\n")}),
+            serde_json::json!({"markdown": five_answers}),
+            serde_json::json!({"markdown": eleven_unread}),
+            // Bounded in size, and nothing else may ride along.
+            serde_json::json!({"markdown": format!("# app\n- `a.py` — 処理: {} ／ 接続: y\n", "文".repeat(6000))}),
+            serde_json::json!({"markdown": index, "raw": "whole file"}),
+            serde_json::json!({"markdown": ""}),
+            serde_json::json!({"path": "/x", "findings": [], "gaps": []}),
         ] {
             assert!(
                 validate_output(&agent, &invalid.to_string()).is_err(),
@@ -2168,9 +2178,7 @@ mod tests {
         let target = dir.path().join("limits.rs");
         std::fs::write(&target, "// RAW_ONLY_SENTINEL\nconst TIMEOUT: u64 = 30;\n").unwrap();
         let result = serde_json::json!({
-            "path": target.to_str().unwrap(),
-            "findings": [{"line": 2, "text": "TIMEOUT is 30."}],
-            "gaps": []
+            "markdown": "# limits.rs\n- `limits.rs` — 処理: TIMEOUT を30秒に定める ／ 接続: なし\n## 回答\n- `limits.rs:2` — TIMEOUT is 30.\n"
         });
         let provider = Arc::new(ReadThenAnswer {
             path: target.clone(),
@@ -2207,9 +2215,7 @@ mod tests {
     async fn file_reader_schema_failure_does_not_return_the_rejected_file() {
         let dir = tempfile::tempdir().unwrap();
         let invalid = serde_json::json!({
-            "path": "/fixture/source.rs",
-            "findings": [{"line":1, "text": format!("{}RAW_TAIL_SENTINEL", "文".repeat(4096))}],
-            "gaps": []
+            "markdown": format!("# source.rs\n- `source.rs` — 処理: {}RAW_TAIL_SENTINEL ／ 接続: なし\n", "文".repeat(6000))
         })
         .to_string();
         let returned = run_wave(

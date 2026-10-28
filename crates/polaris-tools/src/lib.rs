@@ -289,7 +289,7 @@ and verification either way."
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read".into(),
-        description: "Read file lines or list direct directory entries before choosing a file; offset 0-based, default limit 2000. Use relevant ranges; prefer file-reader for large files when available.".into(),
+        description: "Read file lines or list direct directory entries before choosing a file; offset 0-based, default limit 2000. Use relevant ranges; prefer file-reader for a folder, several files or a large file when available.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

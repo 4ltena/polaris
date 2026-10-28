@@ -158,11 +158,11 @@ processが動く。
 
 呼び出し側 44件。
 
-- `crates/polaris-cli/src/main.rs:2584`
-- `crates/polaris-cli/src/main.rs:2637`
-- `crates/polaris-cli/src/main.rs:2640`
-- `crates/polaris-cli/src/main.rs:4064`
-- `crates/polaris-cli/src/main.rs:4074`
+- `crates/polaris-cli/src/main.rs:2621`
+- `crates/polaris-cli/src/main.rs:2674`
+- `crates/polaris-cli/src/main.rs:2677`
+- `crates/polaris-cli/src/main.rs:4101`
+- `crates/polaris-cli/src/main.rs:4111`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/environment/native.rs:246`
 - `crates/polaris-core/src/execution_owner.rs:442`

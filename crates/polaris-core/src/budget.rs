@@ -379,7 +379,10 @@ mod tests {
         // that reads the same files to a single delegation, so a second
         // child does not read them again. Worst case with a full rules
         // allowance and the largest environment block: 669 + 100 + 200.
-        const PINNED: usize = 669;
+        // 676 since 2026-10-28: file-reader now maps a folder or several
+        // files, so the read description points at it for those too
+        // (+7). Worst case: 676 + 100 + 200 = 976, under the 990 limit.
+        const PINNED: usize = 676;
         let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert_eq!(
             n, PINNED,
@@ -414,7 +417,8 @@ mod tests {
         // not push the prefix back under the threshold.
         // Removing the legacy Next.js setting recipe saves seven tokens.
         // 1,092 since 2026-10-27: the same sentence, 14 tokens.
-        const PINNED: usize = 1092;
+        // 1,099 since 2026-10-28: the read description (+7, see above).
+        const PINNED: usize = 1099;
         let mut tools = polaris_tools::all_specs();
         tools.push(polaris_tools::mcp_setup_spec());
         tools.push(polaris_tools::setting_spec());
@@ -797,9 +801,9 @@ mod phase_tools {
                 .collect();
             super::always_on_tokens(baseline.system(), &subset)
         };
-        assert_eq!(all, 669);
-        assert_eq!(kept(&["read", "bash", "skill"]), 396, "review");
-        assert_eq!(kept(&["read", "skill"]), 330, "brainstorm");
+        assert_eq!(all, 676);
+        assert_eq!(kept(&["read", "bash", "skill"]), 403, "review");
+        assert_eq!(kept(&["read", "skill"]), 337, "brainstorm");
 
         // Only an authorized Implement phase may expose mutation tools. The
         // runtime gate still checks the current contract at dispatch time.

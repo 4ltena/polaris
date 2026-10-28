@@ -197,7 +197,15 @@ impl Guard {
                         .ok_or_else(|| budget("child result count changed"))?;
                     if array[0]["ok"] != true
                         || array[0]["type"] != "file-reader"
-                        || array[0]["result"]["path"].as_str() != self.case.path.to_str()
+                        || !array[0]["result"]["markdown"].as_str().is_some_and(|text| {
+                            // The index names the target by its path relative to what
+                            // was handed over, so the file name is what must appear.
+                            self.case
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| text.contains(name))
+                        })
                         || message.content.len() > 12_288
                     {
                         return Err(budget("child failed or returned an unexpected result"));

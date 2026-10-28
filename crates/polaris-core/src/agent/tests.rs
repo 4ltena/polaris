@@ -1548,12 +1548,7 @@ async fn first_project_analysis_actually_spawns_file_reader_before_root_request(
             },
             CompletionResponse {
                 text: serde_json::json!({
-                    "path": current,
-                    "findings": [{
-                        "line": 1,
-                        "text": "The current milestone is v1.0.0."
-                    }],
-                    "gaps": []
+                    "markdown": "# CURRENT.md\n- `CURRENT.md` — 処理: 現在のマイルストーンを記録する ／ 接続: なし\n## 回答\n- `CURRENT.md:1` — The current milestone is v1.0.0.\n"
                 })
                 .to_string(),
                 ..Default::default()
@@ -1787,9 +1782,7 @@ async fn a_deep_review_delegates_after_two_files_and_stops_at_the_bound() {
                 assert!(history.contains(&format!("RAW_BODY_{number}")), "{history}");
                 Ok(CompletionResponse {
                     text: serde_json::json!({
-                        "path": path,
-                        "findings": [{"line": 1, "text": format!("EVIDENCE_{number}")}],
-                        "gaps": []
+                        "markdown": format!("# body\n- `body.txt` — 処理: EVIDENCE_{number} ／ 接続: なし\n")
                     })
                     .to_string(),
                     ..Default::default()

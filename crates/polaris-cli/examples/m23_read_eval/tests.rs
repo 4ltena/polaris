@@ -86,7 +86,7 @@ fn spawn(case: &Case, limits: &Bounds) -> CompletionResponse {
 }
 fn child_answer(case: &Case) -> CompletionResponse {
     response(
-        json!({"path":case.path,"findings":[{"line":2,"text":"VALUEは7"}],"gaps":[]}).to_string(),
+        json!({"markdown":format!("# target\n- `{0}` — 処理: VALUEを定める ／ 接続: なし\n## 回答\n- `{0}:2` — VALUEは7\n", case.path.display())}).to_string(),
         vec![],
     )
 }

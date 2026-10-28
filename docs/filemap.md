@@ -27,7 +27,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `agents/file-reader`
 
-- `SKILL.md` — SKILL.md
+- `SKILL.md` — <対象名>
 
 ## `agents/files-md-writer`
 

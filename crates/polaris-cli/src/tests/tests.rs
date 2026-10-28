@@ -1939,6 +1939,95 @@ fn models_built(
     built.into_inner()
 }
 
+/// Records the effort each built provider was told to use.
+struct Efforts(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+#[async_trait::async_trait]
+impl polaris_provider::Provider for Efforts {
+    async fn complete(
+        &self,
+        _: polaris_provider::CompletionRequest,
+    ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
+        unreachable!("only construction is under test")
+    }
+    fn set_effort(&self, effort: Option<&str>) {
+        *self.0.lock().unwrap() = effort.map(str::to_owned);
+    }
+}
+
+/// (model, effort) per built weight, light to heavy.
+fn efforts_built(
+    tiers: &polaris_core::config::TierConfig,
+    session_effort: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    let built = std::cell::RefCell::new(Vec::new());
+    tier_providers(
+        tiers,
+        "parent",
+        session_effort,
+        codex_tier_default,
+        |named| {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            built.borrow_mut().push((named.to_owned(), seen.clone()));
+            Ok(std::sync::Arc::new(Efforts(seen)) as Shared)
+        },
+    )
+    .expect("providers");
+    built
+        .into_inner()
+        .into_iter()
+        .map(|(model, seen)| (model, seen.lock().unwrap().clone()))
+        .collect()
+}
+
+#[test]
+fn the_lightest_model_is_never_run_below_high() {
+    use polaris_core::config::{TierConfig, TierSettings};
+    let luna = |built: &[(String, Option<String>)]| built[0].1.clone();
+    // A missing effort, a low session effort and a low explicit setting are
+    // all raised; a higher one is kept.
+    assert_eq!(
+        luna(&efforts_built(&TierConfig::default(), None)).as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        luna(&efforts_built(&TierConfig::default(), Some("low"))).as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        luna(&efforts_built(&TierConfig::default(), Some("xhigh"))).as_deref(),
+        Some("xhigh")
+    );
+    let explicit_low = TierConfig {
+        dwarf: TierSettings {
+            model: None,
+            effort: Some("low".into()),
+        },
+        ..TierConfig::default()
+    };
+    assert_eq!(
+        luna(&efforts_built(&explicit_low, Some("xhigh"))).as_deref(),
+        Some("high")
+    );
+    // Every other weight keeps what the session said, low included.
+    let built = efforts_built(&TierConfig::default(), Some("low"));
+    assert_eq!(
+        built[1],
+        ("gpt-6.1-terra".to_owned(), Some("low".to_owned()))
+    );
+    assert_eq!(built[2], ("gpt-6.1-sol".to_owned(), Some("low".to_owned())));
+    assert_eq!(built[3], ("gpt-6-astra".to_owned(), Some("low".to_owned())));
+    // A weight a user moved off luna is not held to luna's floor.
+    let moved = TierConfig {
+        dwarf: TierSettings {
+            model: Some("gpt-6.1-terra".into()),
+            effort: Some("low".into()),
+        },
+        ..TierConfig::default()
+    };
+    assert_eq!(luna(&efforts_built(&moved, None)).as_deref(), Some("low"));
+}
+
 #[test]
 fn the_hosted_backend_prices_every_weight_and_a_tier_setting_overrides_it() {
     use polaris_core::config::{TierConfig, TierSettings};

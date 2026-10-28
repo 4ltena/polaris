@@ -100,8 +100,8 @@ fn reader(bounds: &Bounds) -> Result<polaris_skills::AgentType, String> {
         || reader.allowed_tools != ["read"]
         || reader.access != polaris_skills::AgentAccess::Read
         || reader.continuation
-        || reader.wall_seconds != 120
-        || reader.max_turns != 6
+        || reader.wall_seconds != 300
+        || reader.max_turns != 10
     {
         return Err("bundled file-reader contract changed".into());
     }

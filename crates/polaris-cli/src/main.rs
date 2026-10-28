@@ -2324,6 +2324,31 @@ fn codex_tier_default(tier: polaris_skills::Tier) -> Option<&'static str> {
     })
 }
 
+/// Efforts in ascending order, as `--effort` accepts them.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The effort a model is never run below. A smaller model thinking hard costs
+/// less than a larger one thinking little, so the lightest model is not used
+/// at `low` or `medium` however light the job: its floor is `high`.
+fn effort_floor(model: &str) -> Option<&'static str> {
+    (model == "gpt-6-luna").then_some("high")
+}
+
+/// `effort` raised to `model`'s floor. The flag says whether a lower effort
+/// was actually replaced, so the caller can say so; filling in a missing one
+/// is not a replacement.
+fn raised_to_floor(model: &str, effort: Option<&str>) -> (Option<String>, bool) {
+    let Some(floor) = effort_floor(model) else {
+        return (effort.map(str::to_owned), false);
+    };
+    let rank = |name: &str| EFFORTS.iter().position(|known| *known == name);
+    match effort {
+        None => (Some(floor.to_owned()), false),
+        Some(given) if rank(given) < rank(floor) => (Some(floor.to_owned()), true),
+        Some(given) => (Some(given.to_owned()), false),
+    }
+}
+
 /// Builds one provider instance per priced weight. Each gets its own model
 /// and effort at construction and is never retuned afterwards, because the
 /// instances are shared across a wave of concurrent delegations — switching
@@ -2352,11 +2377,23 @@ fn tier_providers(
         }
         // Pricing only an effort is a real choice: the same model, told to
         // think harder for the heavy weight.
-        let provider = build(model.unwrap_or(parent_model))
+        let model = model.unwrap_or(parent_model);
+        let provider = build(model)
             .map_err(|error| format!("Cannot create the provider for [tier.{tier}]: {error}"))?;
         // The session's own `--effort` still applies to a weight that does
-        // not name one, so the flag keeps meaning what it says.
-        if let Some(effort) = settings.effort.as_deref().or(session_effort) {
+        // not name one, so the flag keeps meaning what it says — except
+        // below a model's floor, which is not run.
+        let wanted = settings.effort.as_deref().or(session_effort);
+        let (effort, raised) = raised_to_floor(model, wanted);
+        if raised {
+            eprintln!(
+                "Note: {model} is not run below {}; [tier.{tier}] effort raised from {} to {}.",
+                effort.as_deref().unwrap_or_default(),
+                wanted.unwrap_or_default(),
+                effort.as_deref().unwrap_or_default(),
+            );
+        }
+        if let Some(effort) = effort.as_deref() {
             provider.set_effort(Some(effort));
         }
         held.insert(tier.name().to_owned(), provider);

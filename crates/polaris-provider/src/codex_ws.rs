@@ -179,6 +179,17 @@ impl Continuations {
     }
 }
 
+/// Whether `error` means the socket itself was lost — a failed write, a
+/// failed read or a close — rather than the server answering badly. Only the
+/// first kind is worth one new socket; an idle timeout is not (it already
+/// waited five minutes) and neither is an error frame the server chose to send.
+pub(crate) fn socket_lost(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Decode(text)
+        if text.starts_with("websocket send")
+            || text.starts_with("websocket read")
+            || text.starts_with("websocket closed"))
+}
+
 /// How many distinct request shapes one socket keeps a continuation for.
 /// A root, its tier-routed calls and a wave of subagents fit well inside
 /// this; beyond it the oldest is dropped and that shape simply re-sends.

@@ -435,98 +435,114 @@ impl CodexProvider {
         // is behind a flag.
         let note = |what: &str| eprintln!("[ws] {what}");
         let mut held = self.socket.lock().await;
-        if held.is_none() {
-            match crate::codex_ws::Session::open(&self.base, token).await {
-                Ok(session) => {
-                    note("connected");
-                    *held = Some(session);
+        // One fresh socket is tried before HTTP. A socket that sat idle while
+        // another conversation (a delegated child) ran is often closed by the
+        // time the root comes back, and the very first write then fails. HTTP
+        // cannot continue a response, so falling straight to it resent the
+        // whole history uncached — 13.5K input and 102 s in a measured run. A
+        // new socket resends the same history but keeps the transport, and the
+        // next request continues from it again.
+        let mut reopened = false;
+        loop {
+            if held.is_none() {
+                match crate::codex_ws::Session::open(&self.base, token).await {
+                    Ok(session) => {
+                        note("connected");
+                        *held = Some(session);
+                    }
+                    // The upgrade failed: no socket, no error to the caller.
+                    Err(error) => {
+                        note(&format!("Cannot connect ({error:?}). Falling back to HTTP"));
+                        return None;
+                    }
                 }
-                // The upgrade failed: no socket, no error to the caller.
+            }
+            let session = held.as_mut()?;
+            let shape = crate::codex_ws::Shape::of(body);
+            let input: Vec<serde_json::Value> = body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut frame = body.clone();
+            // Always present on this transport even when empty or absent: the
+            // server reads the frame by shape, and omitting a field it expects
+            // is not the same as sending it empty.
+            frame["tool_choice"] = serde_json::Value::String("auto".into());
+            // Several calls in one reply, because the loop already takes them
+            // that way — `dispatch` walks the list and `siblings_ok` decides
+            // what a failed one does to the rest. Holding it at `false` made
+            // the model spend a whole round trip per file it wanted to read,
+            // and a round trip re-bills the entire conversation. Upstream
+            // sends `true`; nothing here ever recorded a reason not to.
+            frame["parallel_tool_calls"] = serde_json::Value::Bool(true);
+            if frame.get("reasoning").is_none() {
+                frame["reasoning"] = serde_json::Value::Null;
+            }
+            let mut continued = false;
+            let mut sent = input.len();
+            match session.continuation_for(&shape).and_then(|held| {
+                crate::codex_ws::delta(&held.baseline, &input)
+                    .map(|d| (held.response_id.clone(), d))
+            }) {
+                Some((previous, delta)) => {
+                    note(&format!(
+                        "Continuation available. Sending {} items ({} total)",
+                        delta.len(),
+                        input.len()
+                    ));
+                    continued = true;
+                    sent = delta.len();
+                    frame["previous_response_id"] = serde_json::Value::String(previous);
+                    frame["input"] = serde_json::Value::Array(delta);
+                }
+                None => {
+                    note(&format!(
+                        "No continuation ({}). Sending all {} items",
+                        session.why_no_continuation(&shape, &input),
+                        input.len()
+                    ));
+                    frame.as_object_mut()?.remove("previous_response_id");
+                }
+            }
+            // Built from the frame actually put on the wire, not from the HTTP
+            // body: what this arm has to answer for is the delta it sent and
+            // the usage the server billed against the conversation it holds.
+            let mut metric = match metrics::RequestMetric::from_env(&frame, prefix) {
+                Ok(metric) => metric,
+                // A metrics path that cannot be opened is a measurement
+                // failure, not a transport failure. The HTTP path reports it by
+                // failing the request; do the same rather than quietly
+                // producing an unmeasured run that looks like a measured one.
+                Err(error) => return Some(Err(error)),
+            };
+            if let Some(metric) = metric.as_mut() {
+                metric.socket(continued, sent, input.len());
+            }
+            let answer = session.round_trip(frame, input, observer).await;
+            if let Some(metric) = metric.as_mut() {
+                if let Ok((_, usage)) = &answer {
+                    metric.usage = *usage;
+                }
+                metric.finish(&answer);
+            }
+            match answer {
+                Ok((completed, usage)) => {
+                    note(&format!("Response {usage:?}"));
+                    return Some(Ok(completed));
+                }
                 Err(error) => {
-                    note(&format!("Cannot connect ({error:?}). Falling back to HTTP"));
+                    // A broken socket is not reusable: the server's idea of the
+                    // conversation and this one have parted ways.
+                    *held = None;
+                    if !reopened && crate::codex_ws::socket_lost(&error) {
+                        reopened = true;
+                        note(&format!("Socket lost ({error:?}). Reconnecting"));
+                        continue;
+                    }
+                    note(&format!("Failed ({error:?}). Falling back to HTTP"));
                     return None;
                 }
-            }
-        }
-        let session = held.as_mut()?;
-        let shape = crate::codex_ws::Shape::of(body);
-        let input: Vec<serde_json::Value> = body
-            .get("input")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut frame = body.clone();
-        // Always present on this transport even when empty or absent: the
-        // server reads the frame by shape, and omitting a field it expects
-        // is not the same as sending it empty.
-        frame["tool_choice"] = serde_json::Value::String("auto".into());
-        // Several calls in one reply, because the loop already takes them
-        // that way — `dispatch` walks the list and `siblings_ok` decides
-        // what a failed one does to the rest. Holding it at `false` made
-        // the model spend a whole round trip per file it wanted to read,
-        // and a round trip re-bills the entire conversation. Upstream
-        // sends `true`; nothing here ever recorded a reason not to.
-        frame["parallel_tool_calls"] = serde_json::Value::Bool(true);
-        if frame.get("reasoning").is_none() {
-            frame["reasoning"] = serde_json::Value::Null;
-        }
-        let mut continued = false;
-        let mut sent = input.len();
-        match session.continuation_for(&shape).and_then(|held| {
-            crate::codex_ws::delta(&held.baseline, &input).map(|d| (held.response_id.clone(), d))
-        }) {
-            Some((previous, delta)) => {
-                note(&format!(
-                    "Continuation available. Sending {} items ({} total)",
-                    delta.len(),
-                    input.len()
-                ));
-                continued = true;
-                sent = delta.len();
-                frame["previous_response_id"] = serde_json::Value::String(previous);
-                frame["input"] = serde_json::Value::Array(delta);
-            }
-            None => {
-                note(&format!(
-                    "No continuation ({}). Sending all {} items",
-                    session.why_no_continuation(&shape, &input),
-                    input.len()
-                ));
-                frame.as_object_mut()?.remove("previous_response_id");
-            }
-        }
-        // Built from the frame actually put on the wire, not from the HTTP
-        // body: what this arm has to answer for is the delta it sent and
-        // the usage the server billed against the conversation it holds.
-        let mut metric = match metrics::RequestMetric::from_env(&frame, prefix) {
-            Ok(metric) => metric,
-            // A metrics path that cannot be opened is a measurement
-            // failure, not a transport failure. The HTTP path reports it by
-            // failing the request; do the same rather than quietly
-            // producing an unmeasured run that looks like a measured one.
-            Err(error) => return Some(Err(error)),
-        };
-        if let Some(metric) = metric.as_mut() {
-            metric.socket(continued, sent, input.len());
-        }
-        let answer = session.round_trip(frame, input, observer).await;
-        if let Some(metric) = metric.as_mut() {
-            if let Ok((_, usage)) = &answer {
-                metric.usage = *usage;
-            }
-            metric.finish(&answer);
-        }
-        match answer {
-            Ok((completed, usage)) => {
-                note(&format!("Response {usage:?}"));
-                Some(Ok(completed))
-            }
-            Err(error) => {
-                note(&format!("Failed ({error:?}). Falling back to HTTP"));
-                // A broken socket is not reusable: the server's idea of the
-                // conversation and this one have parted ways.
-                *held = None;
-                None
             }
         }
     }

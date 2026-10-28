@@ -2833,13 +2833,13 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
 
     // A judge that routes delegations by weight, over four weights that
     // all resolve to the same provider, changes nothing and says nothing.
-    // `build_tier_providers` skips a weight that names neither a model nor
-    // an effort, so an installation with no `[tier.*]` gets one provider
-    // wearing four names — and the ladder's whole point is that they
-    // differ. Say it once; do not invent model names as defaults, because
-    // which model each weight buys is the project's decision and a wrong
-    // guess here spends its money.
-    if decider.is_some() && config.tiers.is_empty() {
+    // `tier_providers` skips a weight that names neither a model nor an
+    // effort and has no backend default, so a backend without defaults and an
+    // installation with no `[tier.*]` get one provider wearing four names —
+    // and the ladder's whole point is that they differ. Say it once. The
+    // hosted `codex` backend has defaults, so its weights are built and this
+    // stays quiet there.
+    if decider.is_some() && tier_weights.is_empty() {
         eprintln!(
             "Warning: the decider routes delegation across four tiers, but no model or effort is set in [tier.*], so all four resolve to the same provider. Routing has no cost or capability effect until per-tier settings are configured."
         );

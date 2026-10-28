@@ -2143,3 +2143,83 @@ async fn refresh_keeps_state_only_when_the_account_is_unchanged() {
         );
     }
 }
+
+#[test]
+fn only_a_lost_socket_is_worth_a_new_one() {
+    let decode = |text: &str| ProviderError::Decode(text.into());
+    for lost in [
+        "websocket send: Connection reset",
+        "websocket read: Connection reset",
+        "websocket closed before response.completed",
+    ] {
+        assert!(crate::codex_ws::socket_lost(&decode(lost)), "{lost}");
+    }
+    for kept in [
+        "websocket idle timeout",
+        "frame is not JSON: x",
+        "unexpected binary frame",
+    ] {
+        assert!(!crate::codex_ws::socket_lost(&decode(kept)), "{kept}");
+    }
+    assert!(!crate::codex_ws::socket_lost(&ProviderError::Http(
+        "websocket error: {}".into()
+    )));
+}
+
+/// The socket the root left idle while a child ran is closed when it comes
+/// back. That used to fall straight to HTTP and resend the whole history
+/// uncached; it must open one new socket and answer there instead.
+#[tokio::test]
+async fn a_lost_socket_is_replaced_by_a_new_one_before_http_is_tried() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Frame;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let worker = tokio::spawn(async move {
+        // The first socket is upgraded and then dropped: the client's write
+        // may succeed, its read finds the close.
+        let (first, _) = listener.accept().await.unwrap();
+        drop(tokio_tungstenite::accept_async(first).await.unwrap());
+        let (second, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(second).await.unwrap();
+        let Some(Ok(Frame::Text(sent))) = socket.next().await else {
+            panic!("the new socket got no request");
+        };
+        let sent: Value = serde_json::from_str(&sent).unwrap();
+        assert!(
+            sent.get("previous_response_id").is_none(),
+            "a new socket has nothing to continue from"
+        );
+        let mut done = message_item("ok");
+        done["type"] = "response.output_item.done".into();
+        done["output_index"] = 0.into();
+        let completed = serde_json::json!({"type":"response.completed","response":{
+            "id":"resp_1","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}});
+        socket
+            .send(Frame::Text(done.to_string().into()))
+            .await
+            .unwrap();
+        socket
+            .send(Frame::Text(completed.to_string().into()))
+            .await
+            .unwrap();
+        // Keep the socket open until the client has read the reply.
+        let _ = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+    });
+    let provider = CodexProvider::new(endpoint, "fixture".into(), Tokens::new()).unwrap();
+    let request = req();
+    let body = build_body_with_instructions("fixture", &request, "i", None);
+    let token = crate::Token {
+        access_token: "t".into(),
+        account_id: "a".into(),
+        effort: None,
+    };
+    let prefix = provider.cache_prefix.diagnostics("fixture", &request);
+    let answer = provider
+        .over_socket(&body, &token, None, prefix)
+        .await
+        .expect("the transport answers instead of handing over to HTTP");
+    assert!(answer.is_ok(), "{answer:?}");
+    worker.await.unwrap();
+}

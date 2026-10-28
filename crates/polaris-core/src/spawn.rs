@@ -609,98 +609,123 @@ async fn run_one_inner(
         held.insert(remembered, session.messages.clone());
     }
     match result {
-        Ok(outcome) => match validate_output(agent, &outcome.text) {
-            Ok(()) => TaskOutcome::Ok(TaskSuccess::from_agent_outcome(outcome)),
-            Err(first_err) => {
-                let mut first_success = TaskSuccess::from_agent_outcome(outcome);
-                // The "retry once, then stop" rule belongs to the tracker,
-                // not to this function: `observe_schema_mismatch` returns
-                // `None` on the first miss and `StopReason::SchemaMismatch`
-                // on the second. Consulting it is what keeps that rule
-                // single-sourced — counting the retries inline here left
-                // `stop.rs`'s copy of the identical policy with no call
-                // site at all, free to drift away from what actually runs.
-                if let Some(reason) = stop.observe_schema_mismatch() {
-                    return TaskOutcome::Failed(format!("{reason:?}: {first_err}"));
-                }
-                // Retry exactly once, with the validation error attached.
-                session.push_user(&format!(
-                    "Your previous output did not match the required schema: {first_err}. \
+        Ok(mut outcome) => {
+            if let Some(clean) = leading_json_value(&outcome.text) {
+                outcome.text = clean;
+            }
+            match validate_output(agent, &outcome.text) {
+                Ok(()) => TaskOutcome::Ok(TaskSuccess::from_agent_outcome(outcome)),
+                Err(first_err) => {
+                    let mut first_success = TaskSuccess::from_agent_outcome(outcome);
+                    // The "retry once, then stop" rule belongs to the tracker,
+                    // not to this function: `observe_schema_mismatch` returns
+                    // `None` on the first miss and `StopReason::SchemaMismatch`
+                    // on the second. Consulting it is what keeps that rule
+                    // single-sourced — counting the retries inline here left
+                    // `stop.rs`'s copy of the identical policy with no call
+                    // site at all, free to drift away from what actually runs.
+                    if let Some(reason) = stop.observe_schema_mismatch() {
+                        return TaskOutcome::Failed(format!("{reason:?}: {first_err}"));
+                    }
+                    // Retry exactly once, with the validation error attached.
+                    session.push_user(&format!(
+                        "Your previous output did not match the required schema: {first_err}. \
                      Return output matching the schema exactly."
-                ));
-                // The same `stop`, deliberately not a fresh tracker. The
-                // retry is a continuation of this subagent's one run, so
-                // the turns and wall-clock seconds the first attempt
-                // already spent have to count against the same budget —
-                // build a new tracker here and a type declaring
-                // `max-turns: 12` could quietly spend 24. `Gate` and the
-                // approver hold no budget, so those are rebuilt simply
-                // because `ctx` borrowed them mutably above.
-                let mut gate2 = parent_gate.for_subagent();
-                let mut approver2 = UnavailableApprover;
-                let mut ctx2 = ToolContext {
-                    sandbox: &sandbox,
-                    helper,
-                    gate: &mut gate2,
-                    approver: &mut approver2,
-                };
-                let retry = Box::pin(run_loop(
-                    provider.as_ref(),
-                    &mut session,
-                    audit.clone(),
-                    &mut stop,
-                    &agent.body,
-                    &tools,
-                    skills,
-                    &[],
-                    provider.clone(),
-                    DEFAULT_CONCURRENCY,
-                    DEFAULT_WRITE_CONCURRENCY,
-                    &agent.name,
-                    &task.task,
-                    true,
-                    events.clone(),
-                    &mut ctx2,
-                    None,
-                ))
-                .await;
-                match retry {
-                    Ok(outcome2) => match validate_output(agent, &outcome2.text) {
-                        Ok(()) => {
-                            first_success.add_usage(&outcome2.usage_report);
-                            first_success.text = outcome2.text;
-                            first_success.result_refs = vec![format!(
-                                "sha256:{}",
-                                crate::conversation_state::content_hash(
-                                    first_success.text.as_bytes()
-                                )
-                            )];
-                            TaskOutcome::Ok(first_success)
-                        }
-                        // The second miss. The tracker, not a counter
-                        // kept here, is what declares the run over; the
-                        // reason it names is folded into the text the
-                        // model sees. The `None` arm cannot be reached
-                        // with the current rule, and exists so that
-                        // loosening that rule cannot silently turn this
-                        // into an extra attempt the type never budgeted.
-                        Err(second_err) => {
-                            TaskOutcome::Failed(match stop.observe_schema_mismatch() {
-                                Some(reason) => format!(
-                                    "schema mismatch after retry ({reason:?}): {second_err}"
-                                ),
-                                None => {
-                                    format!("schema mismatch after retry: {second_err}")
+                    ));
+                    // The same `stop`, deliberately not a fresh tracker. The
+                    // retry is a continuation of this subagent's one run, so
+                    // the turns and wall-clock seconds the first attempt
+                    // already spent have to count against the same budget —
+                    // build a new tracker here and a type declaring
+                    // `max-turns: 12` could quietly spend 24. `Gate` and the
+                    // approver hold no budget, so those are rebuilt simply
+                    // because `ctx` borrowed them mutably above.
+                    let mut gate2 = parent_gate.for_subagent();
+                    let mut approver2 = UnavailableApprover;
+                    let mut ctx2 = ToolContext {
+                        sandbox: &sandbox,
+                        helper,
+                        gate: &mut gate2,
+                        approver: &mut approver2,
+                    };
+                    let retry = Box::pin(run_loop(
+                        provider.as_ref(),
+                        &mut session,
+                        audit.clone(),
+                        &mut stop,
+                        &agent.body,
+                        &tools,
+                        skills,
+                        &[],
+                        provider.clone(),
+                        DEFAULT_CONCURRENCY,
+                        DEFAULT_WRITE_CONCURRENCY,
+                        &agent.name,
+                        &task.task,
+                        true,
+                        events.clone(),
+                        &mut ctx2,
+                        None,
+                    ))
+                    .await;
+                    match retry {
+                        Ok(mut outcome2) => {
+                            if let Some(clean) = leading_json_value(&outcome2.text) {
+                                outcome2.text = clean;
+                            }
+                            match validate_output(agent, &outcome2.text) {
+                                Ok(()) => {
+                                    first_success.add_usage(&outcome2.usage_report);
+                                    first_success.text = outcome2.text;
+                                    first_success.result_refs = vec![format!(
+                                        "sha256:{}",
+                                        crate::conversation_state::content_hash(
+                                            first_success.text.as_bytes()
+                                        )
+                                    )];
+                                    TaskOutcome::Ok(first_success)
                                 }
-                            })
+                                // The second miss. The tracker, not a counter
+                                // kept here, is what declares the run over; the
+                                // reason it names is folded into the text the
+                                // model sees. The `None` arm cannot be reached
+                                // with the current rule, and exists so that
+                                // loosening that rule cannot silently turn this
+                                // into an extra attempt the type never budgeted.
+                                Err(second_err) => {
+                                    TaskOutcome::Failed(match stop.observe_schema_mismatch() {
+                                        Some(reason) => format!(
+                                            "schema mismatch after retry ({reason:?}): {second_err}"
+                                        ),
+                                        None => {
+                                            format!("schema mismatch after retry: {second_err}")
+                                        }
+                                    })
+                                }
+                            }
                         }
-                    },
-                    Err(e) => TaskOutcome::Failed(e.to_string()),
+                        Err(e) => TaskOutcome::Failed(e.to_string()),
+                    }
                 }
             }
-        },
+        }
         Err(e) => TaskOutcome::Failed(e.to_string()),
     }
+}
+
+/// The first JSON value of `text` when the whole text is not one value but a
+/// value followed by something else (a closing remark, a second object). The
+/// host validates that value against the schema and hands the parent only it,
+/// re-serialized, so nothing the model appended after it travels on. `None`
+/// when the text already parses as a whole, or does not start with a value.
+fn leading_json_value(text: &str) -> Option<String> {
+    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+        return None;
+    }
+    let mut values =
+        serde_json::Deserializer::from_str(text.trim_start()).into_iter::<serde_json::Value>();
+    let first = values.next()?.ok()?;
+    first.is_object().then(|| first.to_string())
 }
 
 fn validate_output(agent: &AgentType, text: &str) -> Result<(), String> {
@@ -1062,6 +1087,22 @@ async fn control_register_and_start(
     Ok(reference)
 }
 
+/// The control plane accepts a terminal reason of at most 512 *bytes*, while a
+/// child's diagnostic is bounded in characters. A Japanese schema error is
+/// three bytes a character, so it overran, the record was refused, and the
+/// refusal replaced the real failure the parent should have been told.
+fn bounded_reason(message: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    if message.len() <= MAX_BYTES {
+        return message.to_owned();
+    }
+    let mut end = MAX_BYTES - '…'.len_utf8();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &message[..end])
+}
+
 async fn control_finish(
     control: &SpawnControlPort,
     reference: &ChildAttemptRefV1,
@@ -1080,7 +1121,7 @@ async fn control_finish(
             ChildStateV1::Failed {
                 class: failure_class(message),
             },
-            message.clone(),
+            bounded_reason(message),
             UsageAttributionV1::Missing,
             Vec::new(),
             Vec::new(),
@@ -2209,6 +2250,58 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
         assert!(log.contains("\"tool\":\"read\""), "{log}");
         assert!(log.contains("\"caller\":\"file-reader\""), "{log}");
+    }
+
+    #[test]
+    fn a_json_value_followed_by_other_text_is_reduced_to_the_value() {
+        assert_eq!(
+            leading_json_value("{\"markdown\": \"# a\\n\"}\n\nDone. Let me know."),
+            Some("{\"markdown\":\"# a\\n\"}".to_owned())
+        );
+        // Nothing to reduce: a whole value, plain prose, or a non-object.
+        assert_eq!(leading_json_value("{\"markdown\": \"x\"}"), None);
+        assert_eq!(leading_json_value("Done."), None);
+        assert_eq!(leading_json_value("[1] trailing"), None);
+    }
+
+    #[tokio::test]
+    async fn file_reader_output_with_a_trailing_remark_still_returns_only_the_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = serde_json::json!({
+            "markdown": "# app\n- `a.py` — 処理: 値を数える ／ 接続: なし\n"
+        })
+        .to_string();
+        let returned = run_wave(
+            vec![SpawnTask {
+                agent_type: "file-reader".into(),
+                task: "Map app/.".into(),
+                write_root: None,
+            }],
+            &[file_reader()],
+            scripted(vec![text(&format!(
+                "{good}\n\nLet me know if you want more."
+            ))]),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            1,
+            1,
+            None,
+        )
+        .await;
+        let entries: serde_json::Value = serde_json::from_str(&returned).unwrap();
+        assert_eq!(entries[0]["ok"], true, "{returned}");
+        assert!(!returned.contains("Let me know"), "{returned}");
+    }
+
+    #[test]
+    fn a_long_japanese_failure_reason_fits_the_control_planes_byte_limit() {
+        let message = "文".repeat(512);
+        assert!(message.len() > 512);
+        let bounded = bounded_reason(&message);
+        assert!(bounded.len() <= 512, "{} bytes", bounded.len());
+        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded_reason("short"), "short");
     }
 
     #[tokio::test]

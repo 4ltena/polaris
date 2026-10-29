@@ -32,6 +32,18 @@ const BETA: &str = "responses_websockets=2026-02-06";
 const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 const CONNECT: std::time::Duration = std::time::Duration::from_secs(15);
 
+// **A socket left idle is closed by the server, and pinging it does not help.**
+// Measured on 2026-10-29: in four benchmark runs a delegated child kept the
+// parent's socket idle for 62 to 104 seconds and the parent's next request
+// failed (`Broken pipe`, or a close without notify), was re-sent in full over a
+// new socket and read 0 cached tokens. A WebSocket ping every 20 seconds was
+// tried (split sink plus a ticking task) and a probe that ran `sleep 100`
+// between two requests failed identically with and without it: the server
+// still closed the socket ("closed before response.completed") and the second
+// request restarted from scratch. The cache is reachable only through a
+// continuation on one socket, so a pause of about a minute costs the whole
+// history uncached; the way around it is to not idle, not to ping.
+
 /// Whether this run uses the socket at all.
 pub(crate) fn enabled() -> bool {
     std::env::var_os("POLARIS_WS").as_deref() == Some(std::ffi::OsStr::new("on"))

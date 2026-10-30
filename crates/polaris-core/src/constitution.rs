@@ -10,6 +10,8 @@ pub(crate) mod reference;
 #[cfg(unix)]
 mod refresh;
 #[cfg(unix)]
+pub mod wrap;
+#[cfg(unix)]
 pub use refresh::AgentsRefresh;
 
 /// The ceiling on the number of tokens allowed for the constitution block.

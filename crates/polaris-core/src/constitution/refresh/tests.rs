@@ -152,3 +152,49 @@ fn refresh_concurrent_readers_have_owned_snapshots_and_do_not_read_copy() {
     assert_eq!(old, "Host.");
     assert_eq!(source.read().unwrap(), "Host changed.");
 }
+
+#[test]
+fn a_current_compressed_copy_stands_in_for_its_section_and_a_stale_one_does_not() {
+    let (_dir, root) = fixture();
+    let home = root.join("home");
+    let project = root.join("project");
+    fs::create_dir_all(home.join(".polaris")).unwrap();
+    fs::create_dir(&project).unwrap();
+    let global = home.join(".polaris/AGENTS.md");
+    rules(
+        &global,
+        "- Reply in Japanese for every string the user sees.\n- Run the checks before saying done.",
+    );
+    let source = AgentsRefresh::new(Some(&global), &project)
+        .unwrap()
+        .with_wraps(home.clone());
+    let (written, _) = source.read_sources().unwrap();
+    // No copy yet: the section as written.
+    assert_eq!(source.read_global().unwrap(), written);
+
+    let (global_wrap, _) = source.wrap_paths().unwrap();
+    let entries = vec![
+        wrap::Entry {
+            from: vec![1],
+            text: "Reply Japanese".into(),
+        },
+        wrap::Entry {
+            from: vec![2],
+            text: "run checks before done".into(),
+        },
+    ];
+    wrap::write(&global_wrap, &wrap::render(&written, "m", &entries)).unwrap();
+    assert_eq!(
+        source.read_global().unwrap(),
+        "Reply Japanese\nrun checks before done"
+    );
+    // read_sources still gives the original, for comparing and regenerating.
+    assert_eq!(source.read_sources().unwrap().0, written);
+
+    // Editing the section makes the copy stale: the new text is read as written.
+    rules(
+        &global,
+        "- Reply in Japanese for every string the user sees.\n- Run the checks before saying done.\n- Third rule.",
+    );
+    assert!(source.read_global().unwrap().contains("Third rule."));
+}

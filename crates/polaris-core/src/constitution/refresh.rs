@@ -1,5 +1,5 @@
 //! Request-boundary reads of two owner-selected files. No polling or model paths.
-use super::{combine, extract_always_on};
+use super::{combine, extract_always_on, wrap};
 use crate::isolated_workspace::RegisteredSecrets;
 use std::{
     ffi::CString,
@@ -25,6 +25,9 @@ fn denied() -> io::Error {
 pub struct AgentsRefresh {
     global: Option<Source>,
     project: Source,
+    /// The home whose compressed copies stand in for the sections, when the
+    /// owner asked for them. `None` reads the sections as written.
+    wraps: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +259,30 @@ impl AgentsRefresh {
                 .map(|p| Source::new(p.to_path_buf()))
                 .transpose()?,
             project: Source::new(project_root.join("AGENTS.md"))?,
+            wraps: None,
         })
+    }
+
+    /// Read each section through its compressed copy under `home` when a
+    /// current, valid one exists (see `wrap`).
+    pub fn with_wraps(mut self, home: PathBuf) -> Self {
+        self.wraps = Some(home);
+        self
+    }
+
+    /// The sections as written, whatever copies exist: what a copy is made
+    /// from and compared with. Global first, then the project's.
+    pub fn read_sources(&self) -> io::Result<(String, String)> {
+        self.read_raw_parts(true, true, || {})
+    }
+
+    /// Where the compressed copies of the two sections live.
+    pub fn wrap_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        let home = self.wraps.as_ref()?;
+        Some((
+            wrap::global_path(home),
+            wrap::project_path(home, self.project.path.parent()?),
+        ))
     }
 
     pub fn from_home(project_root: &Path) -> io::Result<Self> {
@@ -290,6 +316,22 @@ impl AgentsRefresh {
     /// Both scopes are read and verified under one registry lock; a scope not
     /// asked for is neither opened nor reported.
     fn read_parts(
+        &self,
+        want_global: bool,
+        want_project: bool,
+        after_reads: impl FnOnce(),
+    ) -> io::Result<(String, String)> {
+        let (global, project) = self.read_raw_parts(want_global, want_project, after_reads)?;
+        let Some((global_wrap, project_wrap)) = self.wrap_paths() else {
+            return Ok((global, project));
+        };
+        Ok((
+            wrap::lookup(&global, &global_wrap).unwrap_or(global),
+            wrap::lookup(&project, &project_wrap).unwrap_or(project),
+        ))
+    }
+
+    fn read_raw_parts(
         &self,
         want_global: bool,
         want_project: bool,

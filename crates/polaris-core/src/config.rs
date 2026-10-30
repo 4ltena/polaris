@@ -14,6 +14,10 @@ pub struct Config {
     /// Built-in behavior preset for the root system prompt. User-owned: a
     /// project's configuration is refused if it names one.
     pub prompt_profile: crate::prompt::Profile,
+    /// Read each AGENTS.md always-on section through its compressed copy when
+    /// a current, valid one exists, and make one when the section changes.
+    /// On unless `[prompt] agents_wrap = false`; user-owned like the profile.
+    pub agents_wrap: bool,
     /// User-owned presentation preferences. Project configuration is not
     /// allowed to change these values for a shared checkout.
     pub presentation: PresentationConfig,
@@ -321,6 +325,7 @@ impl Default for Config {
                 ..Default::default()
             },
             prompt_profile: crate::prompt::Profile::Default,
+            agents_wrap: true,
             files_md_auto_regenerate: false,
             skills_paths: Vec::new(),
             agents_paths: Vec::new(),
@@ -340,6 +345,7 @@ impl Default for Config {
 #[derive(Debug, Default, Deserialize)]
 struct RawPrompt {
     profile: Option<crate::prompt::Profile>,
+    agents_wrap: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -976,6 +982,9 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
             }
             if raw.prompt.is_some() && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyPromptProfile);
+            }
+            if let Some(wrap) = raw.prompt.as_ref().and_then(|prompt| prompt.agents_wrap) {
+                merged.agents_wrap = wrap;
             }
             if let Some(profile) = raw.prompt.as_ref().and_then(|prompt| prompt.profile) {
                 merged.prompt_profile = profile;

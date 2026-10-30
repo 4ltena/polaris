@@ -27,6 +27,8 @@ use serde::Deserialize;
 mod account;
 #[cfg(unix)]
 mod admission;
+#[cfg(unix)]
+mod agents_wrap;
 mod benchmark_report;
 mod compare;
 mod decided;
@@ -2855,6 +2857,8 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
         prepared_providers.mcp_selection_provider.clone(),
     );
     let tier_weights = prepared_providers.tier_weights.clone();
+    // The weight that makes the AGENTS.md copies, taken before `tier_weights` is handed on.
+    let wrap_maker = tier_weights.get("giant").cloned();
     let provider = prepared_providers.provider.clone();
     let decision_meter = polaris_provider::decision::DecisionMeter::default();
     if config.decision.enabled
@@ -3054,6 +3058,20 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
             eprintln!("Cannot prepare the AGENTS.md read source: {error}");
             return ExitCode::FAILURE;
         }
+    };
+    // Each section is read through its compressed copy when one is current; a
+    // changed section gets a new copy now, before the first request.
+    #[cfg(unix)]
+    let agents_refresh = match std::env::var_os("HOME") {
+        Some(home) if config.agents_wrap => {
+            let refresh = agents_refresh.with_wraps(PathBuf::from(home));
+            let maker = wrap_maker.unwrap_or_else(|| provider.clone());
+            for note in agents_wrap::ensure(&*maker, &refresh, "giant").await {
+                eprintln!("Note: {note}");
+            }
+            refresh
+        }
+        _ => agents_refresh,
     };
     #[cfg(not(unix))]
     let constitution = constitution::load(&project_root);

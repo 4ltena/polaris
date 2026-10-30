@@ -1403,6 +1403,16 @@ pub(crate) async fn run_loop(
     // Every invocation owns its context. Child agents invoke run_loop
     // independently and cannot inherit transport state from their parent.
     let turn_context = polaris_provider::turn_affinity::TurnContext::new();
+    // End-of-turn checks are the root's; a child finishes when it finishes.
+    let gates = if caller == "root" {
+        session
+            .quality
+            .unwrap_or_else(crate::quality::Gates::from_env)
+    } else {
+        crate::quality::Gates::default()
+    };
+    let mut completion_rounds = 0u32;
+    let mut loop_nudged = false;
     loop {
         check_event_delivery(events.as_ref())?;
         if is_adaptive && let Some(turn) = &workflow_turn {
@@ -1777,6 +1787,15 @@ pub(crate) async fn run_loop(
                 false,
             );
             session.check_persistence()?;
+            if gates.completion
+                && completion_rounds == 0
+                && let Some(ask) = crate::quality::completion_request(&session.messages)
+            {
+                completion_rounds += 1;
+                session.push_instruction(&ask);
+                session.check_persistence()?;
+                continue;
+            }
             let usage_report = include_summary_usage(
                 meter.snapshot(),
                 summary_before,
@@ -1819,6 +1838,7 @@ pub(crate) async fn run_loop(
         // Any other tool call discards it before that call runs.
         let mut armed_mcp_capture = None;
         let mut siblings_ok = true;
+        let mut loop_nudge_due = false;
         for (call_index, call) in res.tool_calls.iter().enumerate() {
             if armed_mcp_capture.is_some()
                 && call.name != "spawn"
@@ -2534,6 +2554,18 @@ pub(crate) async fn run_loop(
                     session.push_tool_result(&call.id, &msg);
                     session.check_persistence()?;
                     if let Some(r) = stop.observe_error(&msg) {
+                        if gates.loop_nudge
+                            && !loop_nudged
+                            && matches!(r, StopReason::RepeatedError(_))
+                        {
+                            // One chance to change course before the turn ends;
+                            // the request is sent after this response's tool
+                            // results, so it cannot split them.
+                            loop_nudged = true;
+                            loop_nudge_due = true;
+                            stop.observe_success();
+                            continue;
+                        }
                         flush_directory_changes(
                             &mut pending_changes,
                             agent_types,
@@ -2547,6 +2579,10 @@ pub(crate) async fn run_loop(
                     }
                 }
             }
+            session.check_persistence()?;
+        }
+        if loop_nudge_due {
+            session.push_instruction(&crate::quality::loop_request());
             session.check_persistence()?;
         }
         // A malformed/rejected immediate spawn leaves no child attempt that

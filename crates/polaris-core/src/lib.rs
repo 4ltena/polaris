@@ -60,6 +60,7 @@ pub mod project_analysis;
 pub mod project_git;
 pub mod project_mutation;
 pub mod prompt;
+pub mod quality;
 pub mod recipe;
 pub mod request_input;
 pub mod resume;

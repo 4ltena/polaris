@@ -8743,3 +8743,229 @@ async fn project_agents_file_reaches_the_request_only_as_a_framed_message() {
             .all(|m| !m.content.contains("PROJECT_RULE"))
     );
 }
+
+/// Runs the scripted replies as a root turn with a successful `write`, under
+/// the given gates, and returns the session.
+#[cfg(unix)]
+async fn gated_turn(
+    replies: Vec<CompletionResponse>,
+    gates: crate::quality::Gates,
+) -> (Session, usize) {
+    let root = tempfile::tempdir().expect("temp directory");
+    let helper_dir = tempfile::tempdir().expect("temp directory");
+    let helper = write_helper(helper_dir.path());
+    let sandbox = polaris_sandbox::SandboxPolicy::new(
+        polaris_sandbox::SandboxMode::WorkspaceWrite,
+        &[root.path().to_path_buf()],
+    )
+    .expect("policy");
+    let target = sandbox.writable_roots()[0].join("a.txt");
+    let mut replies = replies;
+    for reply in &mut replies {
+        for call in &mut reply.tool_calls {
+            if call.name == "write" {
+                call.arguments =
+                    serde_json::json!({"path": target.display().to_string(), "content": "x"});
+            }
+        }
+    }
+    let total = replies.len();
+    let p = Scripted {
+        replies: Mutex::new(replies),
+    };
+    let dir = tempfile::tempdir().expect("temp directory");
+    let mut session = Session::new();
+    session.quality = Some(gates);
+    session.push_user("make a.txt");
+    let audit = shared_audit(&dir.path().join("audit.jsonl"));
+    let mut stop = StopTracker::new(20);
+    let always_on = crate::prompt::assemble_always_on("", "", &[]);
+    let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+    let mut approver = AlwaysAllow { asked: 0 };
+    let mut ctx = ToolContext {
+        sandbox: &sandbox,
+        helper: &helper,
+        gate: &mut gate,
+        approver: &mut approver,
+    };
+    run(
+        &p,
+        &mut session,
+        audit,
+        &mut stop,
+        &always_on,
+        &[],
+        &[],
+        unused_provider_pool(),
+        crate::spawn::DEFAULT_CONCURRENCY,
+        crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+        None,
+        &mut ctx,
+    )
+    .await
+    .expect("the loop failed");
+    let left = p.replies.lock().expect("lock").len();
+    (session, total - left)
+}
+
+#[cfg(unix)]
+fn write_then(final_texts: &[&str]) -> Vec<CompletionResponse> {
+    let mut replies = vec![CompletionResponse {
+        tool_calls: vec![ToolCall {
+            id: "w1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+        }],
+        ..Default::default()
+    }];
+    replies.extend(final_texts.iter().map(|text| CompletionResponse {
+        text: (*text).into(),
+        ..Default::default()
+    }));
+    replies
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_completion_gate_sends_an_edited_turn_back_once_before_it_may_finish() {
+    let gates = crate::quality::Gates {
+        completion: true,
+        loop_nudge: false,
+    };
+    let (session, requests) = gated_turn(write_then(&["done", "checked, done"]), gates).await;
+    assert_eq!(
+        requests, 3,
+        "write, first answer sent back, second answer accepted"
+    );
+    let asks = session
+        .messages
+        .iter()
+        .filter(|m| m.content.starts_with("[harness] ") && m.content.contains("each requirement"))
+        .count();
+    assert_eq!(asks, 1, "asked once, not every time the model answers");
+    assert_eq!(session.messages.last().unwrap().content, "checked, done");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn without_the_gate_the_first_answer_ends_the_turn() {
+    let (session, requests) = gated_turn(
+        write_then(&["done", "never asked for"]),
+        crate::quality::Gates::default(),
+    )
+    .await;
+    assert_eq!(requests, 2);
+    assert_eq!(session.messages.last().unwrap().content, "done");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_turn_that_edited_nothing_is_not_sent_back() {
+    let gates = crate::quality::Gates {
+        completion: true,
+        loop_nudge: false,
+    };
+    let replies = vec![CompletionResponse {
+        text: "just an answer".into(),
+        ..Default::default()
+    }];
+    let (session, requests) = gated_turn(replies, gates).await;
+    assert_eq!(requests, 1);
+    assert_eq!(session.messages.last().unwrap().content, "just an answer");
+}
+
+/// Three identical `read` failures in a row, then a final answer.
+#[cfg(unix)]
+async fn failing_turn(gates: crate::quality::Gates) -> Result<Session, AgentError> {
+    let root = tempfile::tempdir().expect("temp directory");
+    let helper_dir = tempfile::tempdir().expect("temp directory");
+    let helper = write_helper(helper_dir.path());
+    let sandbox = polaris_sandbox::SandboxPolicy::new(
+        polaris_sandbox::SandboxMode::WorkspaceWrite,
+        &[root.path().to_path_buf()],
+    )
+    .expect("policy");
+    let missing = sandbox.writable_roots()[0]
+        .join("missing.txt")
+        .display()
+        .to_string();
+    let mut replies: Vec<CompletionResponse> = (0..3)
+        .map(|n| CompletionResponse {
+            tool_calls: vec![ToolCall {
+                id: format!("r{n}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": missing}),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    replies.push(CompletionResponse {
+        text: "changed course".into(),
+        ..Default::default()
+    });
+    let p = Scripted {
+        replies: Mutex::new(replies),
+    };
+    let dir = tempfile::tempdir().expect("temp directory");
+    let mut session = Session::new();
+    session.quality = Some(gates);
+    session.push_user("read it");
+    let audit = shared_audit(&dir.path().join("audit.jsonl"));
+    let mut stop = StopTracker::new(20);
+    let always_on = crate::prompt::assemble_always_on("", "", &[]);
+    let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+    let mut approver = AlwaysAllow { asked: 0 };
+    let mut ctx = ToolContext {
+        sandbox: &sandbox,
+        helper: &helper,
+        gate: &mut gate,
+        approver: &mut approver,
+    };
+    run(
+        &p,
+        &mut session,
+        audit,
+        &mut stop,
+        &always_on,
+        &[],
+        &[],
+        unused_provider_pool(),
+        crate::spawn::DEFAULT_CONCURRENCY,
+        crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+        None,
+        &mut ctx,
+    )
+    .await
+    .map(|_| session)
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_loop_gate_gives_a_third_repeated_error_one_chance_to_change_course() {
+    let on = crate::quality::Gates {
+        completion: false,
+        loop_nudge: true,
+    };
+    let session = failing_turn(on)
+        .await
+        .expect("the turn should get past the third error");
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.content.starts_with("[harness] ") && m.content.contains("three times"))
+            .count(),
+        1
+    );
+    assert_eq!(session.messages.last().unwrap().content, "changed course");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn without_the_loop_gate_a_third_repeated_error_ends_the_turn() {
+    let off = crate::quality::Gates::default();
+    assert!(matches!(
+        failing_turn(off).await,
+        Err(AgentError::Stopped(StopReason::RepeatedError(_)))
+    ));
+}

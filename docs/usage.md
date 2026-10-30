@@ -19,6 +19,8 @@ cargo build --release
 | `POLARIS_BASE_URL` | `https://api.openai.com/v1` | `openai`プロバイダのベースURL。 |
 | `POLARIS_MODEL` | TUI: `gpt-6.1-sol` / 単発: `gpt-6-astra` | 対話画面の推奨はSol。明示した`--model`が優先し、次にこの環境変数を使う。 |
 
+`POLARIS_QUALITY`は、ルートの終了時の確認を有効にする実験設定（既定は無効。カンマ区切りで`completion`・`loop`）。`completion`は、このターンで`write`・`edit`をしたのに終わろうとしたとき、タスクの各要件を実行で確かめ直すよう1回だけ差し戻す（直近の編集後にコマンドが失敗していれば、それを先に直すよう添える）。`loop`は、同じ工具エラーの3連続で停止する前に、別の手を取るよう1回だけ促す。どちらも履歴だけで判定し、モデルを呼ばない。効果は測定で確かめてから残す。サブエージェントには働かない。
+
 `POLARIS_CACHE_PACING`の既定は`off`。`on`は同じCodex providerのモデル要求開始を最低5秒間隔にする実験設定で、完了までの時間が伸びる場合がある。[比較条件と結果](gpt6-cache-pacing-results.md)を参照。
 
 `--web-search`は`disabled`、`cached`、`live`を受け付けるが、現在のChatGPT認証先はResponses形式の上限契約を確認していない。既定の`disabled`だけが利用でき、`cached`と`live`は明示しても開始前に拒否される。`cached`もローカルのオフライン検索を意味しない。動作するlive用コマンドはまだ案内しない。

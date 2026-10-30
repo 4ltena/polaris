@@ -152,6 +152,10 @@ pub struct Session {
     pub compaction_retry_tokens: Option<usize>,
     /// Explicitly configured durable tool-result storage; never serialized as credentials.
     pub tool_memory: Option<crate::tool_memory::ToolMemory>,
+    /// Which end-of-turn checks the root runs. `None` reads `POLARIS_QUALITY`;
+    /// tests set it so they do not depend on the environment.
+    #[doc(hidden)]
+    pub quality: Option<crate::quality::Gates>,
     /// Stops only root-triggered automatic `files.md` regeneration. Manual
     /// `spawn` remains available, and the default preserves legacy behavior.
     pub disable_files_md_auto_regenerate: bool,

@@ -8972,3 +8972,56 @@ async fn without_the_loop_gate_a_third_repeated_error_ends_the_turn() {
         Err(AgentError::Stopped(StopReason::RepeatedError(_)))
     ));
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_blocker_gate_sends_a_blocked_answer_back_once_and_leaves_other_answers_alone() {
+    let gates = crate::quality::Gates {
+        completion: false,
+        loop_nudge: false,
+        blocker: true,
+    };
+    let blocked = vec![
+        CompletionResponse {
+            text: "Blocker: no feasible plan exists.".into(),
+            ..Default::default()
+        },
+        CompletionResponse {
+            text: "Relaxed the reserve; plan made.".into(),
+            ..Default::default()
+        },
+    ];
+    let (session, requests) = gated_turn(blocked, gates).await;
+    assert_eq!(requests, 2);
+    assert_eq!(
+        session.messages.last().unwrap().content,
+        "Relaxed the reserve; plan made."
+    );
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.content.starts_with("[harness] ")
+                && m.content.contains("a choice of your own"))
+            .count(),
+        1
+    );
+    // An answer that does not declare the task blocked ends the turn at once.
+    let fine = vec![CompletionResponse {
+        text: "Done; the plan is feasible.".into(),
+        ..Default::default()
+    }];
+    assert_eq!(gated_turn(fine, gates).await.1, 1);
+    // A second blocked answer is accepted: one challenge, not a loop.
+    let stubborn = vec![
+        CompletionResponse {
+            text: "Infeasible.".into(),
+            ..Default::default()
+        },
+        CompletionResponse {
+            text: "Still infeasible, and here is the check.".into(),
+            ..Default::default()
+        },
+    ];
+    assert_eq!(gated_turn(stubborn, gates).await.1, 2);
+}

@@ -1412,6 +1412,7 @@ pub(crate) async fn run_loop(
         crate::quality::Gates::default()
     };
     let mut completion_rounds = 0u32;
+    let mut review_rounds = 0u32;
     let mut loop_nudged = false;
     loop {
         check_event_delivery(events.as_ref())?;
@@ -1787,6 +1788,15 @@ pub(crate) async fn run_loop(
                 false,
             );
             session.check_persistence()?;
+            if gates.blocker
+                && review_rounds == 0
+                && let Some(ask) = crate::quality::blocker_request(&res.text)
+            {
+                review_rounds += 1;
+                session.push_instruction(&ask);
+                session.check_persistence()?;
+                continue;
+            }
             if gates.completion
                 && completion_rounds == 0
                 && let Some(ask) = crate::quality::completion_request(&session.messages)

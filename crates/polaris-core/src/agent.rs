@@ -1788,9 +1788,24 @@ pub(crate) async fn run_loop(
                 false,
             );
             session.check_persistence()?;
-            if gates.blocker
+            if (gates.blocker || gates.data)
                 && review_rounds == 0
-                && let Some(ask) = crate::quality::blocker_request(&res.text)
+                && let Some(ask) = crate::quality::review_request(
+                    gates,
+                    &res.text,
+                    &session.messages,
+                    &session
+                        .quality_dir
+                        .clone()
+                        .or_else(|| {
+                            session
+                                .request_prompt
+                                .as_ref()
+                                .and_then(crate::prompt::AlwaysOn::project_root)
+                                .map(Path::to_path_buf)
+                        })
+                        .unwrap_or_default(),
+                )
             {
                 review_rounds += 1;
                 session.push_instruction(&ask);

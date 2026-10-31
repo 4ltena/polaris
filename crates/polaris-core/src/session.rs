@@ -156,6 +156,9 @@ pub struct Session {
     /// tests set it so they do not depend on the environment.
     #[doc(hidden)]
     pub quality: Option<crate::quality::Gates>,
+    /// Where the data/code check looks; `None` uses the trusted prompt project root.
+    #[doc(hidden)]
+    pub quality_dir: Option<std::path::PathBuf>,
     /// Stops only root-triggered automatic `files.md` regeneration. Manual
     /// `spawn` remains available, and the default preserves legacy behavior.
     pub disable_files_md_auto_regenerate: bool,

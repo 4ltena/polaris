@@ -38,6 +38,8 @@ const BLOCKED_WORDS: [&str; 10] = [
     "成立しない",
 ];
 
+const DATA: &str = "These keys appear in the input data files but nowhere in your code: {KEYS}. For each, decide from the task text and the key's name whether leaving it out is correct; if it names something the task asks for (a time, a cost, a limit, a step, a rule), implement it. Do not write new test suites.";
+
 const LOOP: &str = "The same tool error has now happened three times in a row. Do not repeat it. State in one sentence why it keeps failing, then try a different approach; if nothing else can work, stop and explain what blocks you.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +98,30 @@ pub fn completion_request(messages: &[Message]) -> Option<String> {
         String::new()
     };
     Some(format!("{MARK}{COMPLETION}{tail}"))
+}
+
+/// The one message that replaces a final answer when it needs a second look:
+/// it declares the task blocked (`blocker`), or the turn changed files and
+/// input data keys exist that the code never mentions (`data`). Both go in a
+/// single message, so the model reconsiders once, not twice. `dir` is where
+/// the data and code are looked for.
+pub fn review_request(
+    gates: Gates,
+    answer: &str,
+    messages: &[Message],
+    dir: &Path,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if gates.blocker && declares_blocked(answer) {
+        parts.push(BLOCKER.to_owned());
+    }
+    if gates.data && edited_turn(messages).is_some() {
+        let keys = unused_keys(dir);
+        if !keys.is_empty() {
+            parts.push(DATA.replace("{KEYS}", &keys.join(", ")));
+        }
+    }
+    (!parts.is_empty()).then(|| format!("{MARK}{}", parts.join("\n\n")))
 }
 
 const SKIP_DIRS: [&str; 9] = [
@@ -311,6 +337,42 @@ mod tests {
         )
         .unwrap();
         assert!(unused_keys(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn one_review_message_carries_the_blocked_challenge_and_the_unused_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("d.json"), r#"{"turnaround_time_min": 25}"#).unwrap();
+        let edited = vec![
+            Message::user("fix it"),
+            call("a", "edit"),
+            Message::tool_result("a", "ok"),
+        ];
+        let both = Gates {
+            blocker: true,
+            data: true,
+            ..Default::default()
+        };
+        let ask =
+            review_request(both, "Blocker: infeasible.", &edited, dir.path()).expect("both apply");
+        assert!(ask.contains("a choice of your own") && ask.contains("turnaround_time_min"));
+        assert_eq!(ask.matches(MARK).count(), 1, "one message, not two");
+        // Only the keys, when the answer is not blocked; only the challenge, when no key is unused.
+        let keys_only = review_request(both, "Done.", &edited, dir.path()).unwrap();
+        assert!(
+            !keys_only.contains("a choice of your own")
+                && keys_only.contains("turnaround_time_min")
+        );
+        std::fs::write(dir.path().join("c.py"), "x = 'turnaround_time_min'").unwrap();
+        assert!(review_request(both, "Done.", &edited, dir.path()).is_none());
+        assert!(
+            review_request(both, "Infeasible.", &edited, dir.path())
+                .unwrap()
+                .contains("a choice of your own")
+        );
+        // A turn that changed nothing is not asked about keys.
+        std::fs::remove_file(dir.path().join("c.py")).unwrap();
+        assert!(review_request(both, "Done.", &[Message::user("explain")], dir.path()).is_none());
     }
 
     #[test]

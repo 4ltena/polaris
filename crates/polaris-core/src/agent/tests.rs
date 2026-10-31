@@ -8751,6 +8751,16 @@ async fn gated_turn(
     replies: Vec<CompletionResponse>,
     gates: crate::quality::Gates,
 ) -> (Session, usize) {
+    gated_turn_in(replies, gates, None).await
+}
+
+/// `gated_turn` with a `data.json` in the directory the gates look at.
+#[cfg(unix)]
+async fn gated_turn_in(
+    replies: Vec<CompletionResponse>,
+    gates: crate::quality::Gates,
+    data: Option<&str>,
+) -> (Session, usize) {
     let root = tempfile::tempdir().expect("temp directory");
     let helper_dir = tempfile::tempdir().expect("temp directory");
     let helper = write_helper(helper_dir.path());
@@ -8776,6 +8786,11 @@ async fn gated_turn(
     let dir = tempfile::tempdir().expect("temp directory");
     let mut session = Session::new();
     session.quality = Some(gates);
+    let looked_at = tempfile::tempdir().expect("temp directory");
+    if let Some(data) = data {
+        std::fs::write(looked_at.path().join("data.json"), data).expect("write data");
+    }
+    session.quality_dir = Some(looked_at.path().to_path_buf());
     session.push_user("make a.txt");
     let audit = shared_audit(&dir.path().join("audit.jsonl"));
     let mut stop = StopTracker::new(20);
@@ -9025,4 +9040,31 @@ async fn the_blocker_gate_sends_a_blocked_answer_back_once_and_leaves_other_answ
         },
     ];
     assert_eq!(gated_turn(stubborn, gates).await.1, 2);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_data_gate_asks_an_edited_turn_once_which_input_keys_its_code_never_mentions() {
+    let gates = crate::quality::Gates {
+        data: true,
+        ..Default::default()
+    };
+    let (session, requests) = gated_turn_in(
+        write_then(&["done", "all fields used"]),
+        gates,
+        Some(r#"{"turnaround_time_min": 25}"#),
+    )
+    .await;
+    assert_eq!(requests, 3);
+    let asks: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.content.starts_with("[harness] ") && m.content.contains("turnaround_time_min")
+        })
+        .collect();
+    assert_eq!(asks.len(), 1, "named the unused key, once");
+    // No unused key: the first answer ends the turn.
+    let (_, none) = gated_turn_in(write_then(&["done"]), gates, Some(r#"{"x": 1}"#)).await;
+    assert_eq!(none, 2);
 }

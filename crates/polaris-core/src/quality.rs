@@ -2,12 +2,14 @@
 //! corrections it makes before an error loop ends a turn.
 //!
 //! Each is a switch, off unless named in `POLARIS_QUALITY` (a comma list of
-//! `completion`, `loop` and `blocker`), because neither is shown to help yet: they are
+//! `completion`, `loop`, `blocker` and `data`), because neither is shown to help yet: they are
 //! measured against runs without them before they are kept. They apply to the
 //! root only; a subagent finishes when it finishes.
 //!
 //! Both only decide from the message history and add one fixed user message;
 //! nothing here calls a model.
+
+use std::path::Path;
 
 use polaris_provider::{Message, Role};
 
@@ -43,6 +45,7 @@ pub struct Gates {
     pub completion: bool,
     pub loop_nudge: bool,
     pub blocker: bool,
+    pub data: bool,
 }
 
 impl Gates {
@@ -53,6 +56,7 @@ impl Gates {
                 "completion" => gates.completion = true,
                 "loop" => gates.loop_nudge = true,
                 "blocker" => gates.blocker = true,
+                "data" => gates.data = true,
                 _ => {}
             }
         }
@@ -123,6 +127,102 @@ pub fn completion_request(messages: &[Message]) -> Option<String> {
     Some(format!("{MARK}{COMPLETION}{tail}"))
 }
 
+const SKIP_DIRS: [&str; 9] = [
+    ".git",
+    "target",
+    "node_modules",
+    "output",
+    "__pycache__",
+    ".polaris",
+    "tools",
+    "tmp",
+    ".venv",
+];
+const CODE_EXTENSIONS: [&str; 14] = [
+    "py", "rs", "js", "ts", "go", "java", "rb", "c", "cc", "cpp", "h", "sh", "kt", "swift",
+];
+const MAX_KEYS: usize = 30;
+const MAX_CODE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DATA_BYTES: u64 = 256 * 1024;
+
+/// Lowercase identifier keys of the JSON files under `dir` that no code file
+/// there mentions. Keys written in capitals are identifiers of things (an
+/// airport, a product), not fields, and a key starting with `_` is a note.
+pub fn unused_keys(dir: &Path) -> Vec<String> {
+    let (mut data, mut code) = (Vec::new(), String::new());
+    let mut spent = 0u64;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((path, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let (name, file) = (entry.file_name(), entry.path());
+            if polaris_tools::path_policy::is_denied(&file) {
+                continue;
+            }
+            if kind.is_dir() {
+                if depth < 4 && !SKIP_DIRS.iter().any(|skip| name == *skip) {
+                    stack.push((file, depth + 1));
+                }
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !kind.is_file() {
+                continue;
+            }
+            match file.extension().and_then(|e| e.to_str()) {
+                Some("json") if meta.len() <= MAX_DATA_BYTES => {
+                    if let Ok(text) = std::fs::read_to_string(&file) {
+                        data.push(text);
+                    }
+                }
+                Some(ext)
+                    if CODE_EXTENSIONS.contains(&ext) && spent + meta.len() <= MAX_CODE_BYTES =>
+                {
+                    if let Ok(text) = std::fs::read_to_string(&file) {
+                        spent += meta.len();
+                        code.push_str(&text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    fn collect(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    keys.insert(key.clone());
+                    collect(inner, keys);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, keys)),
+            _ => {}
+        }
+    }
+    for text in &data {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            collect(&value, &mut keys);
+        }
+    }
+    keys.into_iter()
+        .filter(|key| {
+            key.len() >= 3
+                && key.starts_with(|c: char| c.is_ascii_lowercase())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !code.contains(key.as_str())
+        })
+        .take(MAX_KEYS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +270,39 @@ mod tests {
         assert!(blocker_request("No feasible tour exists at this altitude.").is_some());
         assert!(blocker_request("Done. All 24 tests pass and the plan is feasible.").is_none());
         assert!(blocker_request("").is_none());
+    }
+
+    #[test]
+    fn keys_the_code_never_mentions_are_listed_and_identifiers_and_notes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("aircraft.json"),
+            r#"{"fuel_flow_gph": 60, "turnaround_time_min": 25, "_note": "x", "NAN": {"elevation_ft": 5}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("plan.py"), "rate = a['fuel_flow_gph']").unwrap();
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            r#"{"private_credential_field": 1}"#,
+        )
+        .unwrap();
+        // Output and tooling directories are not read.
+        std::fs::create_dir(dir.path().join("output")).unwrap();
+        std::fs::write(
+            dir.path().join("output/plan.json"),
+            r#"{"turnaround_time_min": 1, "extra_key": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unused_keys(dir.path()),
+            ["elevation_ft", "turnaround_time_min"]
+        );
+        std::fs::write(
+            dir.path().join("plan.py"),
+            "a['fuel_flow_gph'] + a['turnaround_time_min'] + a['elevation_ft']",
+        )
+        .unwrap();
+        assert!(unused_keys(dir.path()).is_empty());
     }
 
     #[test]

@@ -8980,6 +8980,7 @@ async fn the_blocker_gate_sends_a_blocked_answer_back_once_and_leaves_other_answ
         completion: false,
         loop_nudge: false,
         blocker: true,
+        data: false,
     };
     let blocked = vec![
         CompletionResponse {

@@ -8831,6 +8831,7 @@ async fn the_completion_gate_sends_an_edited_turn_back_once_before_it_may_finish
     let gates = crate::quality::Gates {
         completion: true,
         loop_nudge: false,
+        ..Default::default()
     };
     let (session, requests) = gated_turn(write_then(&["done", "checked, done"]), gates).await;
     assert_eq!(
@@ -8864,6 +8865,7 @@ async fn a_turn_that_edited_nothing_is_not_sent_back() {
     let gates = crate::quality::Gates {
         completion: true,
         loop_nudge: false,
+        ..Default::default()
     };
     let replies = vec![CompletionResponse {
         text: "just an answer".into(),
@@ -8945,6 +8947,7 @@ async fn the_loop_gate_gives_a_third_repeated_error_one_chance_to_change_course(
     let on = crate::quality::Gates {
         completion: false,
         loop_nudge: true,
+        ..Default::default()
     };
     let session = failing_turn(on)
         .await

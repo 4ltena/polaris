@@ -2,7 +2,7 @@
 //! corrections it makes before an error loop ends a turn.
 //!
 //! Each is a switch, off unless named in `POLARIS_QUALITY` (a comma list of
-//! `completion` and `loop`), because neither is shown to help yet: they are
+//! `completion`, `loop` and `blocker`), because neither is shown to help yet: they are
 //! measured against runs without them before they are kept. They apply to the
 //! root only; a subagent finishes when it finishes.
 //!
@@ -20,12 +20,29 @@ const COMPLETION: &str = "You changed files this turn and are about to finish. B
 const COMPLETION_AFTER_FAILURE: &str =
     "The last command you ran after your edit failed. Resolve that first.";
 
+const BLOCKER: &str = "Your answer says the task cannot be satisfied or is blocked. The task asks for a correct result, so a contradiction like that usually comes from a choice of your own, not from the data. Do not change anything the data or the task gives as fixed (settings, limits, speeds, altitudes, capacities, prescribed values). Look instead at what you decided yourself: a quantity you held fixed that could be adjusted within the limits (an amount to load or carry, a margin, a reserve, an order), or a requirement you added that the task does not state. For each such choice, test whether adjusting it removes the contradiction, and apply the one that does. Be economical: reuse the checks you already have instead of writing new test suites. If every limit truly cannot be met by any choice of yours, say so with the one check that shows it.";
+
+/// Words by which a final answer declares the whole task blocked.
+const BLOCKED_WORDS: [&str; 10] = [
+    "blocker",
+    "infeasible",
+    "no feasible",
+    "not feasible",
+    "impossible",
+    "ブロッカー",
+    "実行不能",
+    "実行不可能",
+    "不可能",
+    "成立しない",
+];
+
 const LOOP: &str = "The same tool error has now happened three times in a row. Do not repeat it. State in one sentence why it keeps failing, then try a different approach; if nothing else can work, stop and explain what blocks you.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gates {
     pub completion: bool,
     pub loop_nudge: bool,
+    pub blocker: bool,
 }
 
 impl Gates {
@@ -35,6 +52,7 @@ impl Gates {
             match name {
                 "completion" => gates.completion = true,
                 "loop" => gates.loop_nudge = true,
+                "blocker" => gates.blocker = true,
                 _ => {}
             }
         }
@@ -46,6 +64,17 @@ impl Gates {
             .map(|v| Self::parse(&v))
             .unwrap_or_default()
     }
+}
+
+/// The message to send instead of ending the turn, when the final answer
+/// declares the task blocked or infeasible.
+pub fn blocker_request(answer: &str) -> Option<String> {
+    declares_blocked(answer).then(|| format!("{MARK}{BLOCKER}"))
+}
+
+fn declares_blocked(answer: &str) -> bool {
+    let lowered = answer.to_lowercase();
+    BLOCKED_WORDS.iter().any(|word| lowered.contains(word))
 }
 
 pub fn loop_request() -> String {
@@ -116,18 +145,31 @@ mod tests {
             Gates::parse("completion, loop"),
             Gates {
                 completion: true,
-                loop_nudge: true
+                loop_nudge: true,
+                ..Default::default()
             }
         );
         assert_eq!(
             Gates::parse("loop"),
             Gates {
                 completion: false,
-                loop_nudge: true
+                loop_nudge: true,
+                ..Default::default()
             }
         );
         assert_eq!(Gates::parse("nonsense"), Gates::default());
         assert_eq!(Gates::parse(""), Gates::default());
+    }
+
+    #[test]
+    fn only_an_answer_that_declares_the_task_blocked_is_challenged() {
+        assert!(Gates::parse("blocker").blocker);
+        let ask =
+            blocker_request("Operational blocker: all 24 tours are infeasible.").expect("blocked");
+        assert!(ask.starts_with(MARK) && ask.contains("a choice of your own"));
+        assert!(blocker_request("No feasible tour exists at this altitude.").is_some());
+        assert!(blocker_request("Done. All 24 tests pass and the plan is feasible.").is_none());
+        assert!(blocker_request("").is_none());
     }
 
     #[test]

@@ -25,7 +25,7 @@ const COMPLETION_AFTER_FAILURE: &str =
 const BLOCKER: &str = "Your answer says the task cannot be satisfied or is blocked. The task asks for a correct result, so a contradiction like that usually comes from a choice of your own, not from the data. Do not change anything the data or the task gives as fixed (settings, limits, speeds, altitudes, capacities, prescribed values). Look instead at what you decided yourself: a quantity you held fixed that could be adjusted within the limits (an amount to load or carry, a margin, a reserve, an order), or a requirement you added that the task does not state. For each such choice, test whether adjusting it removes the contradiction, and apply the one that does. Be economical: reuse the checks you already have instead of writing new test suites. If every limit truly cannot be met by any choice of yours, say so with the one check that shows it.";
 
 /// Words by which a final answer declares the whole task blocked.
-const BLOCKED_WORDS: [&str; 10] = [
+const BLOCKED_WORDS: [&str; 24] = [
     "blocker",
     "infeasible",
     "no feasible",
@@ -36,6 +36,20 @@ const BLOCKED_WORDS: [&str; 10] = [
     "実行不可能",
     "不可能",
     "成立しない",
+    "not dispatchable",
+    "0 feasible",
+    "cannot be satisfied",
+    "cannot be met",
+    "not possible",
+    "cannot be done",
+    "no safe",
+    "no valid",
+    "no viable",
+    "exceed",
+    "violat",
+    "unsatisf",
+    "not achievable",
+    "route_feasible: false",
 ];
 
 const DATA: &str = "These keys appear in the input data files but nowhere in your code: {KEYS}. For each, decide from the task text and the key's name whether leaving it out is correct; if it names something the task asks for (a time, a cost, a limit, a step, a rule), implement it. Do not write new test suites.";
@@ -380,6 +394,18 @@ mod tests {
         // A turn that changed nothing is not asked about keys.
         std::fs::remove_file(dir.path().join("c.py")).unwrap();
         assert!(review_request(both, "Done.", &[Message::user("explain")], dir.path()).is_none());
+    }
+
+    #[test]
+    fn wording_that_reports_a_limit_as_broken_also_counts_as_declaring_the_task_blocked() {
+        assert!(
+            blocker_request("No safe tour exists; takeoff weight exceeds the 8,600 lb limit.")
+                .is_some()
+        );
+        assert!(blocker_request("The plan reports `route_feasible: false`.").is_some());
+        assert!(blocker_request("All 24 tests pass and the plan is feasible.").is_none());
+        assert!(blocker_request("The supplied operation is not dispatchable.").is_some());
+        assert!(blocker_request("24 single tours, 0 feasible").is_some());
     }
 
     #[test]

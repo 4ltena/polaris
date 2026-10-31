@@ -2,7 +2,7 @@
 //! corrections it makes before an error loop ends a turn.
 //!
 //! Each is a switch, off unless named in `POLARIS_QUALITY` (a comma list of
-//! `completion`, `loop`, `blocker` and `data`), because neither is shown to help yet: they are
+//! `completion`, `loop`, `blocker`, `data` and `lean`), because neither is shown to help yet: they are
 //! measured against runs without them before they are kept. They apply to the
 //! root only; a subagent finishes when it finishes.
 //!
@@ -48,6 +48,9 @@ pub struct Gates {
     pub loop_nudge: bool,
     pub blocker: bool,
     pub data: bool,
+    /// Adds one line to the unattended profile: check with throwaway scripts
+    /// and write no test files of its own.
+    pub lean: bool,
 }
 
 impl Gates {
@@ -59,6 +62,7 @@ impl Gates {
                 "loop" => gates.loop_nudge = true,
                 "blocker" => gates.blocker = true,
                 "data" => gates.data = true,
+                "lean" => gates.lean = true,
                 _ => {}
             }
         }
@@ -82,6 +86,9 @@ fn declares_blocked(answer: &str) -> bool {
     let lowered = answer.to_lowercase();
     BLOCKED_WORDS.iter().any(|word| lowered.contains(word))
 }
+
+/// The extra unattended-profile line that `lean` adds.
+pub const LEAN_LINE: &str = "- Check your work with throwaway commands or scripts; do not add test files unless the task asks for them.";
 
 pub fn loop_request() -> String {
     format!("{MARK}{LOOP}")
@@ -373,6 +380,13 @@ mod tests {
         // A turn that changed nothing is not asked about keys.
         std::fs::remove_file(dir.path().join("c.py")).unwrap();
         assert!(review_request(both, "Done.", &[Message::user("explain")], dir.path()).is_none());
+    }
+
+    #[test]
+    fn lean_is_a_named_switch_whose_line_stays_short() {
+        assert!(Gates::parse("blocker,data,lean").lean);
+        assert!(!Gates::parse("blocker,data").lean);
+        assert!(crate::budget::count_tokens(LEAN_LINE) <= 30);
     }
 
     #[test]

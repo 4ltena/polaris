@@ -103,7 +103,13 @@ impl Profile {
 /// profile comes first and the rules get what is left, so the worst case
 /// stays where it was.
 pub(crate) fn build_system(profile: Profile, constitution: &str, environment: &str) -> String {
-    let preset = profile.text();
+    let lean;
+    let preset = if profile == Profile::Unattended && crate::quality::Gates::from_env().lean {
+        lean = format!("{}\n{}", profile.text(), crate::quality::LEAN_LINE);
+        lean.as_str()
+    } else {
+        profile.text()
+    };
     let room =
         crate::constitution::CONSTITUTION_LIMIT.saturating_sub(crate::budget::count_tokens(preset));
     let rules = crate::constitution::cap(constitution, room);

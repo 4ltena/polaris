@@ -89,36 +89,7 @@ pub fn loop_request() -> String {
 /// (`write` or `edit`) and so has something to check. `None` when it changed
 /// none. The user's input starts the turn; the harness's own messages do not.
 pub fn completion_request(messages: &[Message]) -> Option<String> {
-    let start = messages
-        .iter()
-        .rposition(|m| m.role == Role::User && !m.content.starts_with(MARK))
-        .unwrap_or(0);
-    let turn = &messages[start..];
-    let last_edit = turn.iter().rposition(|m| {
-        m.role == Role::Assistant
-            && m.tool_calls
-                .iter()
-                .any(|c| c.name == "write" || c.name == "edit")
-    })?;
-    // A command after the last edit whose result says it failed.
-    let mut failed = false;
-    let mut commands = std::collections::HashSet::new();
-    for m in &turn[last_edit..] {
-        if m.role == Role::Assistant {
-            commands = m
-                .tool_calls
-                .iter()
-                .filter(|c| c.name == "bash")
-                .map(|c| c.id.as_str())
-                .collect();
-        } else if m.role == Role::Tool
-            && m.tool_call_id
-                .as_deref()
-                .is_some_and(|id| commands.contains(id))
-        {
-            failed = m.content.starts_with("the command failed with exit code");
-        }
-    }
+    let failed = edited_turn(messages)?;
     let tail = if failed {
         format!(" {COMPLETION_AFTER_FAILURE}")
     } else {
@@ -221,6 +192,43 @@ pub fn unused_keys(dir: &Path) -> Vec<String> {
         })
         .take(MAX_KEYS)
         .collect()
+}
+
+/// `Some(failed)` when the turn since the user's last input changed files
+/// (`write` or `edit`), where `failed` says the last command after the last
+/// edit failed; `None` when it changed none.
+fn edited_turn(messages: &[Message]) -> Option<bool> {
+    let start = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.content.starts_with(MARK))
+        .unwrap_or(0);
+    let turn = &messages[start..];
+    let last_edit = turn.iter().rposition(|m| {
+        m.role == Role::Assistant
+            && m.tool_calls
+                .iter()
+                .any(|c| c.name == "write" || c.name == "edit")
+    })?;
+    // A command after the last edit whose result says it failed.
+    let mut failed = false;
+    let mut commands = std::collections::HashSet::new();
+    for m in &turn[last_edit..] {
+        if m.role == Role::Assistant {
+            commands = m
+                .tool_calls
+                .iter()
+                .filter(|c| c.name == "bash")
+                .map(|c| c.id.as_str())
+                .collect();
+        } else if m.role == Role::Tool
+            && m.tool_call_id
+                .as_deref()
+                .is_some_and(|id| commands.contains(id))
+        {
+            failed = m.content.starts_with("the command failed with exit code");
+        }
+    }
+    Some(failed)
 }
 
 #[cfg(test)]

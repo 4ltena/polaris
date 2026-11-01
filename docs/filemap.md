@@ -141,6 +141,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `account.rs` — 複数アカウントの登録操作と、1つのrunを1つの登録へ固定する束縛。
 - `admission.rs` — One-shot CLI admission owner. The manager commit precedes MCP prompt
+- `agents_wrap.rs` — Makes the compressed copies of the AGENTS.md always-on sections.
 - `benchmark_report.rs` — Opt-in, machine-readable observations for the offline comparison harness.
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
 - `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
@@ -258,6 +259,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `project_git.rs` — A read-only git call against the user's own repository.
 - `project_mutation.rs` — One project-wide lock for turns, owned children and workspace mutations.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
+- `quality.rs` — Checks the harness makes when the root agent is about to stop, and
 - `recipe.rs` — M7c: the build recipes Polaris ships. A recipe is a fixed definition, not
 - `request_input.rs` — Ephemeral raw-event identity and request slots for lossless input preparation.
 - `resume.rs` — M6-2b: whether a finished run should be continued without being asked.
@@ -354,6 +356,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `reference.rs` — The project's AGENTS.md as quoted data, never as part of the system prompt.
 - `refresh.rs` — Request-boundary reads of two owner-selected files. No polling or model paths.
+- `wrap.rs` — A compressed copy of an AGENTS.md always-on section, used in its place.
 
 ## `crates/polaris-core/src/constitution/refresh`
 

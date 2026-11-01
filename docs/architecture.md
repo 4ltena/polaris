@@ -73,11 +73,12 @@ crate 14件、依存 47件。名前の`polaris-`は省いた。開発用の依�
 
 実装: `crates/polaris-provider/src/lib.rs`、`crates/polaris-provider/src/openai.rs`、`crates/polaris-provider/src/codex.rs`、`crates/polaris-provider/src/role.rs`、`crates/polaris-provider/src/local_inference.rs`
 
-呼び出し側 29件。
+呼び出し側 30件。
 
-- `crates/polaris-core/src/agent.rs:1734`
-- `crates/polaris-core/src/agent.rs:1768`
-- `crates/polaris-core/src/agent.rs:1771`
+- `crates/polaris-cli/src/agents_wrap.rs:38`
+- `crates/polaris-core/src/agent.rs:1735`
+- `crates/polaris-core/src/agent.rs:1769`
+- `crates/polaris-core/src/agent.rs:1772`
 - `crates/polaris-core/src/agent/skill_catalog.rs:45`
 - `crates/polaris-core/src/audit/arbitration.rs:76`
 - `crates/polaris-core/src/audit/arbitration.rs:77`
